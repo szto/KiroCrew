@@ -67,6 +67,25 @@ class ResolvedAccount:
     config_dir: Path
     logged_in: bool
 
+    @property
+    def config_dir_env(self) -> str | None:
+        """``CLAUDE_CONFIG_DIR`` for this account, or ``None`` to leave it unset.
+
+        Pointing the variable AT Claude Code's default directory is not equivalent to
+        leaving it unset. Once the variable is set, Claude Code reads its state file
+        from ``$CLAUDE_CONFIG_DIR/.claude.json``; the default layout instead keeps that
+        file at ``~/.claude.json`` and only credentials in ``~/.claude``. Setting it to
+        the default directory therefore boots a session that reports its configuration
+        file missing, so an account on that directory must inherit Claude Code's own
+        resolution.
+
+        Keyed on the resolved path rather than on whether the field was left blank, so
+        a profile that spells ``~/.claude`` out is suppressed too.
+        """
+        if self.config_dir == Path(DEFAULT_CLAUDE_CONFIG_DIR).expanduser():
+            return None
+        return str(self.config_dir)
+
 
 def _config_dir_for(raw: str) -> Path:
     """Expand a profile's configured directory, defaulting to Claude Code's own."""

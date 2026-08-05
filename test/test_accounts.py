@@ -166,6 +166,39 @@ def test_list_accounts_with_no_block_reports_the_implicit_default(tmp_path, monk
     assert [r.name for r in rows] == ["default"]
 
 
+def test_default_dir_account_sets_no_config_dir_env(tmp_path, monkeypatch):
+    """The default account must inherit Claude Code's own resolution, not override it.
+
+    Claude Code reads its state file from ``$CLAUDE_CONFIG_DIR/.claude.json`` once the
+    variable is set, but the default layout keeps that file at ``~/.claude.json`` while
+    credentials stay in ``~/.claude``. Setting the variable to the default directory
+    therefore boots a session that reports its configuration file missing.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _login(tmp_path / ".claude")
+
+    assert resolve_account(_Cfg(_Agent())).config_dir_env is None
+
+
+def test_config_dir_naming_the_default_dir_sets_no_env(tmp_path, monkeypatch):
+    """Spelling the default directory out explicitly hits the same trap, so it is
+    suppressed by comparing the resolved path, not by remembering whether the user
+    left the field blank."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _login(tmp_path / ".claude")
+    cfg = _Cfg(_Agent(account="spelled", accounts={"spelled": _Acct("~/.claude")}))
+
+    assert resolve_account(cfg).config_dir_env is None
+
+
+def test_custom_dir_account_sets_config_dir_env(tmp_path):
+    work = tmp_path / "work"
+    _login(work)
+    cfg = _Cfg(_Agent(account="work", accounts={"work": _Acct(str(work))}))
+
+    assert resolve_account(cfg).config_dir_env == str(work)
+
+
 def test_not_logged_in_code_is_available_for_callers():
     """The API layer reports this code; keep it exported from one place."""
     assert CODE_ACCOUNT_NOT_LOGGED_IN == "account_not_logged_in"

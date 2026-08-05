@@ -87,7 +87,7 @@ config.json  agent.provider = "claude_code"
    │
    └─ claude_code_factory.py
         AcpProvider(acp_backend=ACP_BACKEND_CLAUDE,
-                    extra_env={"CLAUDE_CONFIG_DIR": <dir>},
+                    extra_env={"CLAUDE_CONFIG_DIR": <dir>},   # 기본 dir이면 생략
                     permission_mode=CC_PERMISSION_MODE_*,
                     model=<cc_model 해석>)
               │
@@ -100,6 +100,15 @@ config.json  agent.provider = "claude_code"
 
 계정은 새 인증 체계가 아니라 **Claude Code config 디렉터리에 붙인 이름**이다.
 Claude Code는 `CLAUDE_CONFIG_DIR`로 상태를 격리하므로 그것을 그대로 활용한다.
+
+단, `CLAUDE_CONFIG_DIR`을 **기본 디렉터리(`~/.claude`)로 지정하는 것은 변수를
+설정하지 않는 것과 동등하지 않다.** 변수가 설정되면 Claude Code는 상태 파일을
+`$CLAUDE_CONFIG_DIR/.claude.json`에서 읽지만, 기본 레이아웃은 그 파일을
+`~/.claude.json`에 두고 `~/.claude`에는 credential만 둔다. 그래서 기본 디렉터리를
+명시하면 세션이 `configuration file not found`로 부팅된다. 기본 디렉터리로 해석된
+계정은 변수를 **주입하지 않고** Claude Code 자신의 해석을 물려받아야 한다
+(`ResolvedAccount.config_dir_env` → `None`). 빈 문자열 여부가 아니라 해석된 경로로
+판정하므로 `config_dir: "~/.claude"`라고 적은 프로필도 함께 걸러진다.
 
 ```json
 "agent": {
