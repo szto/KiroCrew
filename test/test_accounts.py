@@ -1,0 +1,153 @@
+"""Account-profile resolution: name -> CLAUDE_CONFIG_DIR."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from kiro_crew.accounts import (
+    CODE_ACCOUNT_NOT_LOGGED_IN,
+    CODE_ACCOUNT_UNKNOWN,
+    AccountError,
+    list_accounts,
+    resolve_account,
+)
+
+
+class _Agent:
+    def __init__(self, account: str = "", accounts: dict | None = None) -> None:
+        self.account = account
+        self.accounts = accounts or {}
+
+
+class _Cfg:
+    def __init__(self, agent: _Agent) -> None:
+        self.agent = agent
+
+
+class _Acct:
+    def __init__(self, config_dir: str) -> None:
+        self.config_dir = config_dir
+
+
+def _login(dir_path: Path) -> None:
+    """Write a credentials file shaped like a logged-in Claude Code config dir."""
+    dir_path.mkdir(parents=True, exist_ok=True)
+    (dir_path / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "x", "refreshToken": "y"}})
+    )
+
+
+def test_no_accounts_block_resolves_implicit_default(tmp_path, monkeypatch):
+    """A config with no accounts block still works: one implicit profile on ~/.claude."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _login(tmp_path / ".claude")
+
+    resolved = resolve_account(_Cfg(_Agent()))
+
+    assert resolved.name == "default"
+    assert resolved.config_dir == tmp_path / ".claude"
+    assert resolved.logged_in is True
+
+
+def test_named_account_resolves_its_config_dir(tmp_path):
+    work = tmp_path / "work"
+    _login(work)
+    cfg = _Cfg(_Agent(account="work", accounts={"work": _Acct(str(work))}))
+
+    resolved = resolve_account(cfg)
+
+    assert resolved.name == "work"
+    assert resolved.config_dir == work
+    assert resolved.logged_in is True
+
+
+def test_explicit_name_argument_outranks_config(tmp_path):
+    """The per-session pick wins over agent.account."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    _login(a)
+    _login(b)
+    cfg = _Cfg(_Agent(account="a", accounts={"a": _Acct(str(a)), "b": _Acct(str(b))}))
+
+    assert resolve_account(cfg, "b").config_dir == b
+
+
+def test_unknown_account_raises_with_code(tmp_path):
+    cfg = _Cfg(_Agent(accounts={"work": _Acct(str(tmp_path / "work"))}))
+
+    with pytest.raises(AccountError) as exc:
+        resolve_account(cfg, "nope")
+
+    assert exc.value.code == CODE_ACCOUNT_UNKNOWN
+
+
+def test_missing_credentials_is_not_logged_in(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    cfg = _Cfg(_Agent(account="empty", accounts={"empty": _Acct(str(empty))}))
+
+    assert resolve_account(cfg).logged_in is False
+
+
+def test_credentials_without_oauth_key_is_not_logged_in(tmp_path):
+    """An MCP-only credentials file is not an account login."""
+    d = tmp_path / "mcp-only"
+    d.mkdir()
+    (d / ".credentials.json").write_text(json.dumps({"mcpOAuth": {"slack": {}}}))
+    cfg = _Cfg(_Agent(account="mcp-only", accounts={"mcp-only": _Acct(str(d))}))
+
+    assert resolve_account(cfg).logged_in is False
+
+
+def test_corrupt_credentials_is_not_logged_in(tmp_path):
+    d = tmp_path / "corrupt"
+    d.mkdir()
+    (d / ".credentials.json").write_text("{not json")
+    cfg = _Cfg(_Agent(account="corrupt", accounts={"corrupt": _Acct(str(d))}))
+
+    assert resolve_account(cfg).logged_in is False
+
+
+def test_empty_config_dir_falls_back_to_claude_default(tmp_path, monkeypatch):
+    """A profile that names no directory means the default login, not an error."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _login(tmp_path / ".claude")
+    cfg = _Cfg(_Agent(account="bare", accounts={"bare": _Acct("")}))
+
+    assert resolve_account(cfg).config_dir == tmp_path / ".claude"
+
+
+def test_tilde_in_config_dir_is_expanded(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _login(tmp_path / "custom")
+    cfg = _Cfg(_Agent(account="c", accounts={"c": _Acct("~/custom")}))
+
+    assert resolve_account(cfg).config_dir == tmp_path / "custom"
+
+
+def test_list_accounts_reports_every_profile(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    _login(a)
+    b.mkdir()
+    cfg = _Cfg(_Agent(accounts={"a": _Acct(str(a)), "b": _Acct(str(b))}))
+
+    rows = list_accounts(cfg)
+
+    assert {r.name for r in rows} == {"a", "b"}
+    assert {r.name: r.logged_in for r in rows} == {"a": True, "b": False}
+
+
+def test_list_accounts_with_no_block_reports_the_implicit_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _login(tmp_path / ".claude")
+
+    rows = list_accounts(_Cfg(_Agent()))
+
+    assert [r.name for r in rows] == ["default"]
+
+
+def test_not_logged_in_code_is_available_for_callers():
+    """The API layer reports this code; keep it exported from one place."""
+    assert CODE_ACCOUNT_NOT_LOGGED_IN == "account_not_logged_in"
