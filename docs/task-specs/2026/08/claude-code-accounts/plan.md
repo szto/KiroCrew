@@ -541,10 +541,12 @@ git commit -m "feat: resolve named Claude account profiles to config dirs"
 
 **Files:**
 - Modify: `src/kiro_crew/config/loader.py`
+  - `PROVIDER_ACP` / `PROVIDER_CLAUDE_CODE` 상수 + `AccountConfig` 데이터클래스 신규 — **`@dataclass class AgentConfig`(약 730행) 바로 앞**에 둔다. `DEFAULT_CWD_ALLOWED_ROOTS` 블록 뒤가 자리다.
   - `AgentConfig.provider` 필드 (현재 `enum=["acp"]`, 약 754행)
   - `AgentConfig`에 `account` / `accounts` 필드 추가
-  - `AccountConfig` 데이터클래스 신규 (`WorkspaceConfig` 근처, 약 2012행)
   - `AgentConfig(...)` 생성 지점 (약 4318행)
+
+**배치가 중요하다.** `provider` 필드가 `default=PROVIDER_ACP`를 쓰는데, 필드 default는 클래스 본문 실행 시점에 **런타임으로 평가**된다. 상수를 `AgentConfig` 뒤(예: `WorkspaceConfig` 근처)에 두면 import 시점에 `NameError`가 난다. `from __future__ import annotations`(12행)는 어노테이션만 지연시키고 default 표현식은 지연시키지 않는다. `AccountConfig`도 같은 자리에 함께 둔다 — 어노테이션은 지연 평가되어 뒤에 있어도 동작하지만, 한 기능의 config 표면을 흩뿌리지 않는다.
 - Test: `test/test_claude_code_config.py`
 
 **Interfaces:**
@@ -648,7 +650,7 @@ python -m pytest test/test_claude_code_config.py -v -n0
 
 - [ ] **Step 3: `AccountConfig`와 상수를 추가**
 
-`src/kiro_crew/config/loader.py`, `WorkspaceConfig`(약 2012행) 바로 뒤에 삽입:
+`src/kiro_crew/config/loader.py`, `DEFAULT_CWD_ALLOWED_ROOTS` 블록 뒤 · `@dataclass class AgentConfig`(약 730행) **바로 앞**에 삽입 (위 "배치가 중요하다" 참조):
 
 ```python
 # Provider ids. ``claude_code`` drives claude-agent-acp through the ACP client's
