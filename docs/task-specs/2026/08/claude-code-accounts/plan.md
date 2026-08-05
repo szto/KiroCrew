@@ -1757,7 +1757,7 @@ npm run build
 - [ ] **Step 10: 빌드 산출물을 패키지로 스테이징하고 실물 확인**
 
 ```bash
-cd /Users/soon/Projects/Code/KiroCrew
+cd "$(git rev-parse --show-toplevel)"
 rm -rf src/kiro_crew/static/dist
 mkdir -p src/kiro_crew/static
 cp -R website/dist src/kiro_crew/static/dist
