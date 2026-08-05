@@ -94,7 +94,12 @@ def resolve_account(cfg: KiroCrewConfig, name: str | None = None) -> ResolvedAcc
 
     1. *name* — the caller's explicit per-session pick.
     2. ``cfg.agent.account`` — the configured default.
-    3. the implicit ``default`` profile on Claude Code's own config dir.
+    3. the first declared profile in declaration order when accounts exist but
+       both *name* and ``cfg.agent.account`` are empty. A config that declares
+       profiles should have a sensible default; falling through to ``~/.claude``
+       when profiles are declared would silently ignore the user's selections.
+    4. the implicit ``default`` profile on Claude Code's own config dir when no
+       profiles are declared.
 
     Raises :class:`AccountError` with ``CODE_ACCOUNT_UNKNOWN`` when a name is
     given that no profile declares. A resolved-but-not-logged-in profile is

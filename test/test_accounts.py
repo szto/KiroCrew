@@ -74,6 +74,24 @@ def test_explicit_name_argument_outranks_config(tmp_path):
     assert resolve_account(cfg, "b").config_dir == b
 
 
+def test_first_declared_profile_when_no_explicit_choice(tmp_path):
+    """Declaration order is the contract when accounts exist but no account is set.
+
+    Dict iteration order is the mechanism; first-declared is the documented
+    default so users don't get surprising behavior when they declare profiles.
+    """
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _login(first)
+    _login(second)
+    cfg = _Cfg(_Agent(accounts={"first": _Acct(str(first)), "second": _Acct(str(second))}))
+
+    resolved = resolve_account(cfg)
+
+    assert resolved.name == "first"
+    assert resolved.config_dir == first
+
+
 def test_unknown_account_raises_with_code(tmp_path):
     cfg = _Cfg(_Agent(accounts={"work": _Acct(str(tmp_path / "work"))}))
 
