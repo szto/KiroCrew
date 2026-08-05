@@ -1699,8 +1699,10 @@ kirocrew gateway
 
 - [ ] **Step 11: 커밋**
 
+빌드 산출물은 커밋하지 않는다 — `src/kiro_crew/static/dist`와 `website/dist`는 둘 다 gitignore 대상이고(`.gitignore:55`, `website/.gitignore:2`), Vite가 콘텐츠 해시 파일명을 뿜기 때문에 의도적으로 추적하지 않는다. 패키징 시점에 `setup.py`의 `BuildWithFrontend`가 스테이징한다. Step 10의 복사는 로컬 실물 확인용일 뿐이다.
+
 ```bash
-git add website/src src/kiro_crew/static/dist
+git add website/src
 git commit -m "feat: pick a Claude account from the dashboard before a session starts"
 ```
 
