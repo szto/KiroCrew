@@ -5231,10 +5231,18 @@ class KiroCrewConfig:
     def create_provider_factory(self) -> Callable:
         """Return a factory that creates LLMProvider instances from config.
 
-        KiroCrew is KiroACP-only: the sole provider is the ACP adapter driving
-        the kiro-cli backend. The factory accepts an optional ``session_key`` to
-        create a per-session subdirectory under ``workspace_root()``.
+        ``agent.provider`` selects the backend: ``acp`` drives kiro-cli, and
+        ``claude_code`` drives claude-agent-acp through the same AcpProvider with
+        a different ``acp_backend``. The factory accepts an optional
+        ``session_key`` to create a per-session subdirectory under
+        ``workspace_root()``.
         """
+        if self.agent.provider == PROVIDER_CLAUDE_CODE:
+            # circular import: providers.claude_code_factory -> providers.acp -> ... -> config
+            from kiro_crew.providers.claude_code_factory import build_claude_code_factory
+
+            return build_claude_code_factory(self)
+
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )

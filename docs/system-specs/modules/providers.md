@@ -118,8 +118,29 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 }
 ```
 
-- `agent.provider` is fixed to `"acp"` (enum `["acp"]`); there is no provider to choose.
-- `create_provider_factory()` returns a `Callable` that creates the kiro-cli `AcpProvider`.
+- `agent.provider` selects the backend (enum `["acp", "claude_code"]`). `acp` drives
+  kiro-cli; `claude_code` drives claude-agent-acp through the SAME `AcpProvider` with
+  `acp_backend=ACP_BACKEND_CLAUDE` — a second backend behind one transport, not a
+  second transport.
+- `create_provider_factory()` returns a `Callable`: the kiro-cli `AcpProvider` factory
+  by default, or `providers.claude_code_factory.build_claude_code_factory(self)` when
+  the provider is `claude_code`.
+- **The claude_code factory turns an account profile into one env var.** It resolves
+  the profile (`accounts.resolve_account`, with the per-session `account` kwarg
+  outranking `agent.account`) and injects `CLAUDE_CONFIG_DIR` from
+  `ResolvedAccount.config_dir_env`. That property is `None` for an account on Claude
+  Code's own default directory, and the factory then omits the variable entirely —
+  setting it to the default directory is NOT equivalent to leaving it unset, because
+  Claude Code would read its state file from `$CLAUDE_CONFIG_DIR/.claude.json` while
+  the default layout keeps that file at `~/.claude.json`. The caller's `extra_env` is
+  merged, never replaced. A resolved-but-not-logged-in account raises `AccountError`
+  with `CODE_ACCOUNT_NOT_LOGGED_IN` at session start rather than letting the adapter
+  surface an opaque mid-turn auth failure. `agent.approval_mode` maps onto the
+  backend's permission mode (`auto` → `CC_PERMISSION_MODE_AUTO`, `interactive` →
+  `CC_PERMISSION_MODE_DEFAULT`); either way Kiro Crew's own PreToolUse gate still
+  evaluates every call, so the backend's mode is not the security boundary. The model
+  goes through `model_registry.to_provider_id(model, "claude_code")` so a canonical
+  registry key never reaches the backend unresolved.
 
 ### MCP Server Registration
 
