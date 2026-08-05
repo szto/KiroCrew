@@ -140,9 +140,16 @@ Claude Code는 `CLAUDE_CONFIG_DIR`로 상태를 격리하므로 그것을 그대
 `.kube/config`가 이미 리프 단위인 선례를 따른다.
 
 ```
-.claude/.credentials.json          _SENSITIVE_HOME_DIRS
-accounts/*/.credentials.json       _CREW_SECRET_LEAVES (두 data-home 표기 모두 커버)
+.claude/.credentials.json    _SENSITIVE_HOME_DIRS   리프 (.docker/config.json 선례)
+accounts                     _CREW_SECRET_LEAVES    디렉터리 (profiles 선례)
 ```
+
+`_CREW_SECRET_LEAVES`는 `{prefix}/{leaf}`로 결합되는 **정확 경로 리프만** 받고 glob을
+쓰지 않는다. 따라서 data-home 쪽은 `accounts` 디렉터리 전체를 분류한다 — 이미
+디렉터리 엔트리인 `profiles`와 같은 형태이며, `_CREW_HOME_PREFIXES` 덕분에
+`.kiro/crew`와 레거시 `.kirocrew` 양쪽이 커버된다. 계정 디렉터리는 credential을 담는
+Claude Code config dir이므로 디렉터리 단위 분류가 오히려 안전하다(`.midway`가 같은
+이유로 디렉터리 단위다).
 
 `.local/share/kiro-cli` 항목의 주석이 명시하듯 **sandbox bind-mount 목록은 별개**다.
 따라서 이 분류는 `claude-agent-acp` 자신의 인증을 깨지 않고, 차단 대상은 에이전트의
