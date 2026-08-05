@@ -103,9 +103,10 @@ git commit -m "docs: record Claude credential isolation spike result"
 
 ### 결과
 
-**판정: 격리 성공. GO.**
+**판정: read/fallback 방향은 격리 성공. write 방향은 미검증. 조건부 GO.**
 
-Step 2 (`CLAUDE_CONFIG_DIR`을 새 `mktemp -d` 디렉터리로 지정하고 실행):
+**증명된 것 (read/fallback 방향):** Step 2 (`CLAUDE_CONFIG_DIR`을 새 `mktemp -d`
+디렉터리로 지정하고 실행):
 
 ```
 Not logged in · Please run /login
@@ -125,18 +126,52 @@ ok
 유지했고, probe 디렉터리 재조회에서도 credentials 파일은 없었다 — 실제 로그인은
 건드리지 않았다.
 
-**결론:** macOS Keychain 항목 `Claude Code-credentials`는 `CLAUDE_CONFIG_DIR`이
-지정한 디렉터리에 `.credentials.json`이 없을 때 fallback으로 소비되지 않는다.
-`CLAUDE_CONFIG_DIR`이 이 설치(Claude Code 2.1.222)에서 credential 격리의
-authoritative 경계다. Task 2~8은 계획대로 진행한다. 계정 프로필을 API 키 주입으로
-재정의하는 스펙 개정은 불필요하다.
+이 두 결과는 **empty `CLAUDE_CONFIG_DIR`이 Keychain의 로그인을 조용히 물려받지
+않는다**는 것만 증명한다: 격리된 디렉터리를 읽을 때 전역 Keychain으로 fallback하지
+않는다는 read 방향.
 
-관찰된 이탈(판정에는 영향 없음): Step 1의 `npm i -g @agentclientprotocol/claude-agent-acp`
-전역 설치는 `/usr/local`이 root 소유라 `EACCES`로 실패했고, 세션 스코프 임시
-prefix(`--prefix`)로 설치해 바이너리 해석만 확인했다. `claude-agent-acp`를 상시
-`PATH`에 두려면(Task 5+ 실행 시 필요) `/usr/local` 소유권 수정 또는 사용자 소유
-Node 툴체인(nvm 등) 도입이 별도로 필요하다. 전체 명령/출력은
-`.superpowers/sdd/plan/task-1-report.md`에 기록했다.
+**증명되지 않은 것 (write 방향):** 두 번째 `CLAUDE_CONFIG_DIR` 아래에서 실제로
+`claude login`을 수행했을 때, 그 로그인이 공유 Keychain 서비스 항목
+(`Claude Code-credentials`)에 쓰여서 첫 번째 계정의 로그인을 덮어쓰거나 두 계정이
+같은 Keychain 항목을 공유(aliasing)하게 되는지는 이 스파이크로 확인하지 못했다.
+실제 로그인을 건드리지 말라는 명시적 제약 때문에 이 방향은 두 번째 실계정 없이는
+안전하게 실행할 수 없다 — 이번 스코프에서 달성 가능한 최선은 read 방향까지다.
+멀티 계정 설계 전체가 의존하는 전제("두 계정이 동시에 독립적으로 로그인 상태를
+유지한다")는 바로 이 미검증 절반이다.
+
+**GO의 범위:** Task 2, 3, 4, 6 (순수 config/해석/API 로직, 실제 동시 로그인을
+요구하지 않음)은 무조건 진행한다. **두 계정이 동시에 로그인된 상태로 동작한다는
+것에 의존하는 어떤 작업도**, 아래 write 방향 테스트가 통과하기 전에는 그 결과를
+전제로 삼지 않는다.
+
+**후속 필수 테스트 (사람이 두 번째 Claude 계정을 확보했을 때 실행):**
+
+```bash
+# 1) 첫 번째 계정으로 이미 로그인된 상태를 확인 (기존 ~/.claude 또는 profile A)
+CLAUDE_CONFIG_DIR="$DIR_A" claude -p "reply with the single word: ok"   # 기대: ok
+
+# 2) 두 번째 config dir에서 별도 계정으로 실제 로그인
+CLAUDE_CONFIG_DIR="$DIR_B" claude login    # 두 번째 계정으로 인터랙티브 로그인
+CLAUDE_CONFIG_DIR="$DIR_B" claude -p "reply with the single word: ok"   # 기대: ok
+
+# 3) 첫 번째 디렉터리가 여전히 독립적으로 인증되는지 재확인
+CLAUDE_CONFIG_DIR="$DIR_A" claude -p "reply with the single word: ok"   # 기대: 여전히 ok, 계정 A로
+```
+
+판정: 3번이 계속 계정 A로 `ok`를 반환하면 write 방향도 격리된다 (GO 무조건 확정).
+3번이 실패하거나, 계정 A의 신원이 계정 B로 바뀌어 응답하면, 공유 Keychain 항목이
+두 번째 로그인에 덮어써졌다는 뜻이다 — 이 경우 멀티 계정 설계는 계정 프로필을
+API 키 주입으로 재정의하는 스펙 개정이 필요하다.
+
+**Step 1 관련 기록된 전제조건 (Task 5 차단):** `npm i -g
+@agentclientprotocol/claude-agent-acp` 전역 설치는 `/usr/local`이 root 소유라
+`EACCES`로 실패했다. 이 스파이크는 세션 스코프 임시 `--prefix`로 설치해 바이너리
+해석만 확인했고, 그 prefix는 세션 종료와 함께 이미 사라졌다 — `claude-agent-acp`는
+현재 이 머신에서 상시 `PATH`에 있지 않다. Task 5의 live-boot 검증은 `/usr/local`
+소유권을 사용자에게 넘기거나 사용자 소유 Node 툴체인(nvm 등)을 도입해 durable
+global install을 확보하기 전에는 진행할 수 없다.
+
+전체 명령/출력은 `.superpowers/sdd/plan/task-1-report.md`에 기록했다.
 
 ---
 
