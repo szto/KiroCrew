@@ -726,6 +726,30 @@ DEFAULT_CWD_ALLOWED_ROOTS = [
     "~/workplaces",
 ]
 
+# Provider ids. ``claude_code`` drives claude-agent-acp through the ACP client's
+# ``ACP_BACKEND_CLAUDE`` seam — it is not a second transport, just a second backend
+# behind the same AcpProvider.
+PROVIDER_ACP = "acp"
+PROVIDER_CLAUDE_CODE = "claude_code"
+
+
+@dataclass
+class AccountConfig:
+    """One Claude account profile.
+
+    ``config_dir`` becomes ``CLAUDE_CONFIG_DIR`` for sessions on this account, which
+    is what isolates its credentials and history. Empty means Claude Code's own
+    default directory, so a profile can name an account without relocating it.
+    """
+
+    config_dir: str = field(
+        default="",
+        metadata=_meta(
+            "Config Directory",
+            "CLAUDE_CONFIG_DIR for this account. Empty uses Claude Code's default.",
+        ),
+    )
+
 
 @dataclass
 class AgentConfig:
@@ -751,8 +775,24 @@ class AgentConfig:
         ),
     )
     provider: str = field(
-        default="acp",
-        metadata=_meta("Provider", "LLM provider backend (KiroACP / kiro-cli).", enum=["acp"]),
+        default=PROVIDER_ACP,
+        metadata=_meta(
+            "Provider",
+            "LLM provider backend (KiroACP / kiro-cli, or Claude Code via claude-agent-acp).",
+            enum=[PROVIDER_ACP, PROVIDER_CLAUDE_CODE],
+        ),
+    )
+    account: str = field(
+        default="",
+        metadata=_meta(
+            "Account",
+            "Named account profile for the claude_code provider. Empty uses the first "
+            "declared profile, or Claude Code's default login when none are declared.",
+        ),
+    )
+    accounts: dict[str, AccountConfig] = field(
+        default_factory=dict,
+        metadata=_meta("Accounts", "Named Claude account profiles."),
     )
     default_agent: str = field(
         default="",
@@ -2783,6 +2823,23 @@ def _migrate_workspaces(raw_workspaces: dict) -> dict[str, WorkspaceConfig]:
     return result
 
 
+def _parse_accounts(raw_accounts: dict) -> dict[str, AccountConfig]:
+    """Build ``AccountConfig`` entries, skipping malformed ones.
+
+    A hand-edited config must not abort boot: a non-dict entry is dropped with a
+    warning rather than raised, matching how the rest of the loader degrades.
+    """
+    parsed: dict[str, AccountConfig] = {}
+    if not isinstance(raw_accounts, dict):
+        return parsed
+    for name, entry in raw_accounts.items():
+        if not isinstance(entry, dict):
+            logger.warning("config: dropping malformed account profile %r", name)
+            continue
+        parsed[name] = AccountConfig(config_dir=str(entry.get("config_dir", "")))
+    return parsed
+
+
 def resolve_memory_store_config(
     top_level_memory: dict,
     store_overrides: dict,
@@ -4320,7 +4377,9 @@ class KiroCrewConfig:
                 streaming=agent_data.get("streaming", True),
                 model=agent_data.get("model", DEFAULT_MODEL),
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
-                provider=agent_data.get("provider", "acp"),
+                provider=agent_data.get("provider", PROVIDER_ACP),
+                account=agent_data.get("account", ""),
+                accounts=_parse_accounts(agent_data.get("accounts", {})),
                 default_agent=agent_data.get("default_agent", ""),
                 sandbox=agent_data.get("sandbox", "off"),
                 sandbox_allow_no_isolation=bool(
