@@ -35,7 +35,7 @@ CLAUDE_CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
 
 # ``approval_mode`` value that means "do not stop for per-tool approval". The other
 # enum value, ``interactive``, keeps the backend's per-tool prompt. Either way
-# KiroCrew's OWN PreToolUse gate still evaluates the call — the backend's mode is
+# Kiro Crew's OWN PreToolUse gate still evaluates the call — the backend's mode is
 # not the security boundary.
 _APPROVAL_MODE_AUTO = "auto"
 
@@ -45,7 +45,7 @@ _REGISTRY_PROVIDER = "claude_code"
 
 
 def _permission_mode(approval_mode: str) -> str:
-    """Map KiroCrew's approval mode onto the backend's permission mode."""
+    """Map Kiro Crew's approval mode onto the backend's permission mode."""
     if approval_mode == _APPROVAL_MODE_AUTO:
         return CC_PERMISSION_MODE_AUTO
     return CC_PERMISSION_MODE_DEFAULT

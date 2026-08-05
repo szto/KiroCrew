@@ -142,7 +142,7 @@ def test_auto_approval_maps_to_the_auto_permission_mode(cfg, monkeypatch):
 
 def test_interactive_approval_maps_to_the_default_permission_mode(cfg, monkeypatch):
     """``approval_mode`` enum is ["auto", "interactive"] — interactive keeps per-tool
-    approval, which KiroCrew's own PreToolUse gate still evaluates independently."""
+    approval, which Kiro Crew's own PreToolUse gate still evaluates independently."""
     cfg.agent.approval_mode = "interactive"
     seen = _captured(monkeypatch)
 

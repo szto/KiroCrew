@@ -141,6 +141,14 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
   evaluates every call, so the backend's mode is not the security boundary. The model
   goes through `model_registry.to_provider_id(model, "claude_code")` so a canonical
   registry key never reaches the backend unresolved.
+- **`GET /api/accounts`** (`dashboard/handlers/accounts.py`) returns
+  `{"provider", "active", "accounts": [{"name", "logged_in"}]}` in declaration order.
+  It is read-only and name-only by design: authenticating an account is a
+  `claude login` in a terminal, so there is no POST counterpart, and the body carries
+  **no config dir and no credential bytes** — the dropdown only needs a name and
+  whether a session can start. An `agent.account` that does not resolve degrades
+  `active` to `""` while still listing the rows, because a user who cannot see the
+  profiles cannot pick a working one.
 
 ### MCP Server Registration
 

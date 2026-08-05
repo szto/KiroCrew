@@ -900,6 +900,9 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/browser/command-result", handlers.api_browser_command_result)
     app.router.add_get("/api/browser/config", handlers.api_browser_config_get)
     app.router.add_put("/api/browser/config", handlers.api_browser_config_save)
+    # Claude account profiles. Read-only by design: authenticating an account is a
+    # ``claude login`` in a terminal, so there is no POST counterpart to add here.
+    app.router.add_get("/api/accounts", handlers.api_accounts_get)
     # Computer use: the thin ``kirocrew-computer`` stdio shim's only call. Lives
     # HERE (rather than in the dashboard-only block, where the browser-called
     # config pair sits) so the headless ``--slack-only`` server exposes it too —
