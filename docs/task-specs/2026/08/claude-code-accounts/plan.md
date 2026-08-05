@@ -56,7 +56,7 @@
 - Consumes: 없음
 - Produces: go/no-go 판정. `CLAUDE_CONFIG_DIR`이 credential을 격리하면 Task 2~8을 계획대로 진행. 격리하지 않으면 **중단하고 사용자에게 보고** — 계정 프로필의 의미를 API 키 주입으로 재정의하는 스펙 개정이 필요하다.
 
-- [ ] **Step 1: 전제조건 설치 확인**
+- [x] **Step 1: 전제조건 설치 확인**
 
 ```bash
 command -v claude && claude --version
@@ -66,7 +66,7 @@ command -v claude-agent-acp
 
 기대: `claude`와 `claude-agent-acp` 둘 다 경로가 나온다.
 
-- [ ] **Step 2: 빈 config dir로 인증 상태를 관찰**
+- [x] **Step 2: 빈 config dir로 인증 상태를 관찰**
 
 기존 로그인을 절대 건드리지 않도록 임시 디렉터리를 쓴다.
 
@@ -82,7 +82,7 @@ ls -la "$PROBE"
 - **격리 성공** = 인증을 요구하거나 미로그인으로 실패한다 (기존 `~/.claude` 토큰을 쓰지 않았다는 증거)
 - **격리 실패** = `ok`를 정상 응답한다 → Keychain 또는 다른 전역 소스에서 토큰을 가져왔다는 뜻
 
-- [ ] **Step 3: 대조군 — 기본 config dir은 정상 동작하는지**
+- [x] **Step 3: 대조군 — 기본 config dir은 정상 동작하는지**
 
 ```bash
 claude -p "reply with the single word: ok" 2>&1 | head -5
@@ -90,11 +90,11 @@ claude -p "reply with the single word: ok" 2>&1 | head -5
 
 기대: `ok`. Step 2가 실패했는데 이것도 실패하면 판정이 아니라 환경 문제다.
 
-- [ ] **Step 4: 결과를 이 파일에 기록**
+- [x] **Step 4: 결과를 이 파일에 기록**
 
 아래 "결과" 절에 판정과 Step 2 출력의 핵심 줄을 적는다. 추가 마크다운 파일을 만들지 않는다(`AGENTS.md` 규칙).
 
-- [ ] **Step 5: 커밋**
+- [x] **Step 5: 커밋**
 
 ```bash
 git add docs/task-specs/2026/08/claude-code-accounts/plan.md
@@ -103,7 +103,40 @@ git commit -m "docs: record Claude credential isolation spike result"
 
 ### 결과
 
-<!-- Task 1 실행자가 채운다. 판정(격리 성공/실패) + 근거 출력 + go/no-go. -->
+**판정: 격리 성공. GO.**
+
+Step 2 (`CLAUDE_CONFIG_DIR`을 새 `mktemp -d` 디렉터리로 지정하고 실행):
+
+```
+Not logged in · Please run /login
+```
+
+probe 디렉터리에는 `.credentials.json`이 전혀 생성되지 않았다 (`.claude.json`,
+`backups/`, `projects/`, `sessions/`만 존재) — Keychain에서 토큰을 끌어와 로컬에
+백필하지도 않았다는 뜻이다.
+
+Step 3 (대조군, 기본 `~/.claude`):
+
+```
+ok
+```
+
+`~/.claude/.credentials.json`의 mtime은 이 스파이크의 모든 명령 실행 이전 시각을
+유지했고, probe 디렉터리 재조회에서도 credentials 파일은 없었다 — 실제 로그인은
+건드리지 않았다.
+
+**결론:** macOS Keychain 항목 `Claude Code-credentials`는 `CLAUDE_CONFIG_DIR`이
+지정한 디렉터리에 `.credentials.json`이 없을 때 fallback으로 소비되지 않는다.
+`CLAUDE_CONFIG_DIR`이 이 설치(Claude Code 2.1.222)에서 credential 격리의
+authoritative 경계다. Task 2~8은 계획대로 진행한다. 계정 프로필을 API 키 주입으로
+재정의하는 스펙 개정은 불필요하다.
+
+관찰된 이탈(판정에는 영향 없음): Step 1의 `npm i -g @agentclientprotocol/claude-agent-acp`
+전역 설치는 `/usr/local`이 root 소유라 `EACCES`로 실패했고, 세션 스코프 임시
+prefix(`--prefix`)로 설치해 바이너리 해석만 확인했다. `claude-agent-acp`를 상시
+`PATH`에 두려면(Task 5+ 실행 시 필요) `/usr/local` 소유권 수정 또는 사용자 소유
+Node 툴체인(nvm 등) 도입이 별도로 필요하다. 전체 명령/출력은
+`.superpowers/sdd/plan/task-1-report.md`에 기록했다.
 
 ---
 
