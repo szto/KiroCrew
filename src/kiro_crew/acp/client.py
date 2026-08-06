@@ -1448,9 +1448,7 @@ class AcpClient:
         servers — nothing is written to the user's project or to
         ``~/.kiro/agents/``. Empty when the shared gateway is disabled.
         """
-        return pooled_session_servers(
-            self._mcp_gateway_overlay, self._agent, self._channel_id
-        )
+        return pooled_session_servers(self._mcp_gateway_overlay, self._agent, self._channel_id)
 
     def _claude_session_mcp_servers(self) -> list:
         """MCP server array passed to a claude ``session/new`` / ``session/load``.
@@ -1584,8 +1582,44 @@ class AcpClient:
             self._available_models = captured
 
     def available_models(self) -> list[dict[str, str]]:
-        """Models advertised by the backend at session init (may be empty)."""
-        return list(self._available_models)
+        """Models advertised by the backend, in the order it reported them.
+
+        Two wire shapes, checked in that order:
+
+        1. ``models.availableModels`` — the dict-shaped payload kiro-cli sends,
+           captured by :meth:`_capture_available_models`.
+        2. the ``configOptions`` entry with ``id="model"`` — what
+           claude-agent-acp sends. It advertises no ``models`` key at all, so
+           reading only (1) leaves the Claude list permanently empty and the
+           dashboard falls back to a static registry that drifts out of date the
+           moment Claude Code ships a model.
+
+        (2)'s ``value`` is the id ``set_config_option("model", …)`` takes, which
+        is the same id ``set_model`` sends on the claude backend, so the values
+        round-trip without translation.
+        """
+        if self._available_models:
+            return list(self._available_models)
+        return self._config_option_models()
+
+    def _config_option_models(self) -> list[dict[str, str]]:
+        """Model rows from the ``model`` config option, or ``[]`` if absent."""
+        for opt in self._acp_config_options:
+            if not isinstance(opt, dict) or opt.get("id") != "model":
+                continue
+            options = opt.get("options")
+            if not isinstance(options, list):
+                return []
+            return [
+                {
+                    "modelId": str(o["value"]),
+                    "name": str(o.get("name") or o["value"]),
+                    "description": str(o.get("description") or ""),
+                }
+                for o in options
+                if isinstance(o, dict) and o.get("value")
+            ]
+        return []
 
     async def set_config_option(self, config_id: str, value: str) -> None:
         """Set a session config option (e.g. effort level) via session/set_config_option."""
@@ -1821,8 +1855,7 @@ class AcpClient:
             env=env,
             start_new_session=platform_compat.IS_POSIX,
             creationflags=(
-                platform_compat.CREATE_NEW_PROCESS_GROUP
-                | platform_compat._SUBPROCESS_NO_WINDOW
+                platform_compat.CREATE_NEW_PROCESS_GROUP | platform_compat._SUBPROCESS_NO_WINDOW
             ),
             profile=RLIMIT_PROFILE_SESSION_HOST,
         )
@@ -2220,9 +2253,7 @@ class AcpClient:
                 session_file = ""
                 file_ok = True
             else:
-                session_file = str(
-                    kiro_sessions_dir() / f"{resume_sid}.json"
-                )
+                session_file = str(kiro_sessions_dir() / f"{resume_sid}.json")
                 file_ok = Path(session_file).exists()
             if file_ok:
                 try:
@@ -4504,9 +4535,7 @@ class AcpClient:
             # Trusted tool name recovered from the preceding tool_call, mirroring
             # mcp_server_name — lets the app-own-server auto-approve govern the
             # canonical mcp__<server>__<tool> on this permission path.
-            tool_name=(
-                self._tool_call_tool_name.get(tool_call_id, "") if tool_call_id else ""
-            ),
+            tool_name=(self._tool_call_tool_name.get(tool_call_id, "") if tool_call_id else ""),
         )
 
     def _backfill_context_window(self, pct: float) -> None:

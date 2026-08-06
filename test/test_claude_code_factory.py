@@ -151,11 +151,39 @@ def test_interactive_approval_maps_to_the_default_permission_mode(cfg, monkeypat
     assert seen["permission_mode"] == CC_PERMISSION_MODE_DEFAULT
 
 
-def test_model_override_is_translated_to_a_claude_provider_id(cfg, monkeypatch):
-    """Canonical registry keys must not reach the backend unresolved."""
+def test_auto_defers_the_model_choice_to_the_backend(cfg, monkeypatch):
+    """``auto`` is a sentinel, not a model — it must reach the backend as ""."""
     seen = _captured(monkeypatch)
 
     build_claude_code_factory(cfg)("slot-1", model_override="auto")
+
+    assert seen["model"] == ""
+
+
+def test_a_backend_model_id_is_passed_through_verbatim(cfg, monkeypatch):
+    """The dropdown serves the adapter's own vocabulary, so nothing translates it.
+
+    The ids are versionless (``opus`` is whatever Opus is today); rewriting one
+    through the registry would pin it to the model that was current when the row
+    was authored and hand the backend an id it rejects.
+    """
+    seen = _captured(monkeypatch)
+
+    build_claude_code_factory(cfg)("slot-1", model_override="opus[1m]")
+
+    assert seen["model"] == "opus[1m]"
+
+
+def test_a_stale_registry_key_degrades_to_the_backend_default(cfg, monkeypatch):
+    """A model stored before the dropdown served backend ids must not be sent.
+
+    The registry cannot say which live model ``opus-4.8-1m`` corresponds to, and
+    booting on the backend's default is recoverable where a rejected id is a
+    failed session.
+    """
+    seen = _captured(monkeypatch)
+
+    build_claude_code_factory(cfg)("slot-1", model_override="opus-4.8-1m")
 
     assert seen["model"] == ""
 

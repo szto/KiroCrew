@@ -173,14 +173,36 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
   `**extra_factory_kwargs` — the kiro-cli factory ignores it, so `chat_runner` threads
   it unconditionally.
 - **`GET /api/models` is provider-dispatched** (`dashboard/handlers/agents.py`). On
-  `claude_code` it answers from `_cc_models()` — the canonical registry rows
-  (`model_registry.display_list("claude_code")`) intersected with what the live
-  backend advertises, `auto` always first — and returns **before** the kiro
+  `claude_code` it answers from `_cc_models()` and returns **before** the kiro
   readiness gate and the `kiro chat --list-models` spawn: both gate on kiro login
   state, which a claude_code gateway neither has nor needs, so falling through
   would 503 a healthy dashboard (or pop a kiro-cli browser login) on every poll.
   Rows carry `context_window`; the kiro branch's rows carry
   `context_window_tokens` — the frontend ACP adapter reads both.
+- **The backend is the single source of truth for the claude_code model list.**
+  claude-agent-acp sends **no** `models.availableModels` payload; it advertises its
+  vocabulary as the `configOptions` entry with `id="model"`, the same channel the
+  effort selector uses. `AcpClient.available_models()` therefore falls back to that
+  option, and `model_registry` supplies no ids on this path at all. The values
+  (`default`, `opus`, `opus[1m]`, `sonnet`, `haiku`, `claude-fable-5[1m]`) are used
+  **verbatim** end to end — they are what `session/set_config_option("model", …)`
+  accepts, and they are versionless, so `opus` tracks whatever Opus is current. The
+  registry's aliases pin the same words to whichever model was current when the row
+  was authored, so folding through `from_provider_id` would both rename the live
+  Opus to `opus-4.8-1m` and then hand the backend an id it rejects. The backend's
+  own `default` choice folds onto `auto`, which already means "let the backend pick".
+- **A cold gateway probes rather than guessing.** The vocabulary is only reported at
+  `session/new`, so with no live session `claude_code_factory.probe_available_models`
+  runs one throwaway `initialize` + `session/new` handshake (no MCP servers, no
+  agent config, not registered with the SessionManager) and caches the answer per
+  account config dir for `_MODEL_PROBE_TTL_SECS`. The cache is what keeps the
+  dashboard's 8s degraded-list poll from spawning an adapter per poll. Any failure —
+  adapter missing, profile signed out, timeout — returns `[]`, and the static
+  registry is shown, which is the pre-existing degraded path.
+- A stored model that is a registry canonical key (`opus-4.8-1m`, written before the
+  dropdown served backend ids) is degraded to `""` by `_backend_model_id` instead of
+  being sent: the registry cannot say which live model it meant, and booting on the
+  backend default is recoverable where a rejected id is a failed session.
 
 ### MCP Server Registration
 
