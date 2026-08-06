@@ -222,6 +222,26 @@ progress lands on the normal `ingestion_jobs` row. `404 source_unknown`,
   relation with it. A control labelled "rebuild graph" must not be able to delete
   the source.
 
+### An empty extraction is stored as a success — so it must be logged
+
+`EntityExtractor` degrades to `_empty_result()` on three paths: a pool exception
+in `extract`, a pool exception in `extract_batch`, and an unparseable response in
+`_parse_response`. Degrading is correct — one bad chunk must not fail an ingest —
+but an empty result is **indistinguishable from a genuinely entity-free chunk**,
+so the item is stored with a heading-derived title, a NULL summary and no
+entities, and the job reports `completed` with `items_failed=0`. Nothing in the
+data says extraction ever ran.
+
+All three paths therefore log a WARNING, and `extract_batch` additionally warns
+when the WHOLE batch came back empty — the signal that separates "this text has
+no entities" from "extraction is broken", and the one that would have caught the
+`CCWorker` outage immediately instead of after a database audit. The unparseable
+path logs the response **length only**: the body is model output over untrusted
+document text and must never reach the log.
+
+Keep these. A silent `except Exception: return _empty_result()` here reads as a
+working ingest.
+
 ### `tags` on the wire is a JSON array STRING
 
 `items.tags` round-trips through `json.dumps`, so the list/detail APIs serve it as
