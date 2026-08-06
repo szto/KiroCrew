@@ -1,4 +1,5 @@
 """Unit tests for the unified LLM pool."""
+
 from __future__ import annotations
 
 import asyncio
@@ -40,6 +41,7 @@ def _config_dir_tracks_patched_home(monkeypatch):
     monkeypatch.setattr(
         "kiro_crew.knowledge.llm_pool.config_dir", lambda: Path.home() / ".kirocrew"
     )
+
 
 # ---------------------------------------------------------------------------
 # Fixtures — mock workers that don't spawn real processes
@@ -96,9 +98,7 @@ class DeadOnSecondCallWorker(Worker):
         return self._alive
 
 
-def _make_pool_with_fake_workers(
-    pool_size: int = 3, responses: list[str] | None = None
-) -> LLMPool:
+def _make_pool_with_fake_workers(pool_size: int = 3, responses: list[str] | None = None) -> LLMPool:
     """Create a pool pre-loaded with FakeWorkers (skips real process spawn)."""
     pool = LLMPool(pool_size=pool_size)
     pool._started = True
@@ -395,7 +395,9 @@ class TestSandboxMode:
         """Pure-parser path: a passed dict is used without touching disk.
         Present-but-invalid fails secure to 'auto'; absent takes 'off'."""
         assert _get_sandbox_mode({"agent": {"sandbox": "strict"}}) == "strict"
-        assert _get_sandbox_mode({"agent": {"sandbox": "nope"}}) == "auto"  # malformed → fail secure
+        assert (
+            _get_sandbox_mode({"agent": {"sandbox": "nope"}}) == "auto"
+        )  # malformed → fail secure
         assert _get_sandbox_mode({}) == "off"  # unset → intended default
 
 
@@ -475,8 +477,10 @@ class TestReadConfig:
         config.write_text('{"agent": {"sandbox": "off"}}')
         mock_client = AsyncMock()
         mock_client.is_ready = True
-        with patch("pathlib.Path.home", return_value=tmp_path), \
-             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=mock_client) as mk:
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=mock_client) as mk,
+        ):
             worker = AcpWorker()
             await worker.start()
         assert mk.call_args.kwargs["sandbox_mode"] == "off"
@@ -487,8 +491,10 @@ class TestReadConfig:
         # isolation to kiro-cli's internal agent sandbox (kiro-cli >= 2.13).
         mock_client = AsyncMock()
         mock_client.is_ready = True
-        with patch("pathlib.Path.home", return_value=tmp_path), \
-             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=mock_client) as mk:
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=mock_client) as mk,
+        ):
             worker = AcpWorker()
             await worker.start()
         assert mk.call_args.kwargs["sandbox_mode"] == "off"
@@ -631,8 +637,10 @@ class TestAcpWorker:
         stale = AsyncMock()
         fresh = AsyncMock()
         fresh.is_ready = True
-        with patch("pathlib.Path.home", return_value=tmp_path), \
-             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=fresh):
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=fresh),
+        ):
             worker = AcpWorker()
             worker._client = stale
             await worker.start()
@@ -646,8 +654,10 @@ class TestAcpWorker:
         stale.shutdown.side_effect = RuntimeError("boom")
         fresh = AsyncMock()
         fresh.is_ready = True
-        with patch("pathlib.Path.home", return_value=tmp_path), \
-             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=fresh):
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=fresh),
+        ):
             worker = AcpWorker()
             worker._client = stale
             await worker.start()
@@ -664,12 +674,17 @@ class TestAcpWorker:
         fresh._pid = 7777
         registered: list[int] = []
         unregistered: list[int] = []
-        with patch("pathlib.Path.home", return_value=tmp_path), \
-             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=fresh), \
-             patch("kiro_crew.knowledge.llm_pool.register_protected_pid",
-                   side_effect=registered.append), \
-             patch("kiro_crew.knowledge.llm_pool.unregister_protected_pid",
-                   side_effect=unregistered.append):
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=fresh),
+            patch(
+                "kiro_crew.knowledge.llm_pool.register_protected_pid", side_effect=registered.append
+            ),
+            patch(
+                "kiro_crew.knowledge.llm_pool.unregister_protected_pid",
+                side_effect=unregistered.append,
+            ),
+        ):
             worker = AcpWorker()
             await worker.start()
             assert registered == [7777], "worker did not shield its PID on start"
@@ -688,15 +703,20 @@ class TestAcpWorker:
         second._pid = 200
         registered: list[int] = []
         unregistered: list[int] = []
-        with patch("pathlib.Path.home", return_value=tmp_path), \
-             patch("kiro_crew.knowledge.llm_pool.AcpClient", side_effect=[first, second]), \
-             patch("kiro_crew.knowledge.llm_pool.register_protected_pid",
-                   side_effect=registered.append), \
-             patch("kiro_crew.knowledge.llm_pool.unregister_protected_pid",
-                   side_effect=unregistered.append):
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient", side_effect=[first, second]),
+            patch(
+                "kiro_crew.knowledge.llm_pool.register_protected_pid", side_effect=registered.append
+            ),
+            patch(
+                "kiro_crew.knowledge.llm_pool.unregister_protected_pid",
+                side_effect=unregistered.append,
+            ),
+        ):
             worker = AcpWorker()
-            await worker.start()     # register 100
-            await worker.start()     # stale-drop: unregister 100, then register 200
+            await worker.start()  # register 100
+            await worker.start()  # stale-drop: unregister 100, then register 200
         assert registered == [100, 200]
         assert unregistered == [100]
 
@@ -735,9 +755,17 @@ class TestFetchUrlContent:
     async def test_fetch_returns_stripped_content(self):
         from kiro_crew.knowledge.agent_fetch import fetch_url_content
 
-        pool = _make_pool_with_fake_workers(pool_size=1, responses=["  This is a document with enough content to pass the minimum length validation check.  "])
+        pool = _make_pool_with_fake_workers(
+            pool_size=1,
+            responses=[
+                "  This is a document with enough content to pass the minimum length validation check.  "
+            ],
+        )
         result = await fetch_url_content("https://example.com/doc", pool)
-        assert result == "This is a document with enough content to pass the minimum length validation check."
+        assert (
+            result
+            == "This is a document with enough content to pass the minimum length validation check."
+        )
 
     @pytest.mark.asyncio
     async def test_fetch_raises_on_empty(self):
@@ -950,3 +978,77 @@ class TestIdleReaper:
         assert all(not w.is_alive() for w in live)  # live set drained too
         assert pool._reaping_workers is None
         assert pool._started is False
+
+
+class TestCCWorkerResponseCollection:
+    """``result`` carries the final text as a STRING on this CLI.
+
+    Treating it as a content-block dict raised ``'str' object has no attribute
+    'get'`` on every single message. ``send_batch`` catches per item and
+    ``extract_batch`` swallows the batch, so the failure was silent: ingestion
+    reported "completed", every item stored with no summary, and the entity graph
+    stayed permanently empty on the claude_code provider.
+    """
+
+    def _worker_with_events(self, events: list[dict]) -> CCWorker:
+        worker = CCWorker()
+        queue: asyncio.Queue = asyncio.Queue()
+        for event in events:
+            queue.put_nowait(event)
+        worker._event_queue = queue
+        return worker
+
+    @pytest.mark.asyncio
+    async def test_streamed_assistant_text_is_collected(self):
+        worker = self._worker_with_events(
+            [
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "OK"}]}},
+                {"type": "result", "result": "OK", "is_error": False},
+            ]
+        )
+
+        assert await worker._collect_response() == "OK"
+
+    @pytest.mark.asyncio
+    async def test_string_result_is_used_when_nothing_streamed(self):
+        # No assistant event (the CLI may only emit the terminal result), so the
+        # string result is the whole answer rather than a duplicate.
+        worker = self._worker_with_events(
+            [{"type": "result", "result": '{"entities": []}', "is_error": False}]
+        )
+
+        assert await worker._collect_response() == '{"entities": []}'
+
+    @pytest.mark.asyncio
+    async def test_string_result_does_not_duplicate_streamed_text(self):
+        # `result` repeats the assistant text; appending both would hand the JSON
+        # parser two concatenated objects.
+        worker = self._worker_with_events(
+            [
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "{}"}]}},
+                {"type": "result", "result": "{}", "is_error": False},
+            ]
+        )
+
+        assert await worker._collect_response() == "{}"
+
+    @pytest.mark.asyncio
+    async def test_thinking_blocks_are_not_collected(self):
+        # Extended thinking is not part of the answer; folding it in would break
+        # the JSON parse the extractor does on the response.
+        worker = self._worker_with_events(
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "thinking", "thinking": "hmm"},
+                            {"type": "text", "text": "{}"},
+                        ]
+                    },
+                },
+                {"type": "result", "result": "{}", "is_error": False},
+            ]
+        )
+
+        assert await worker._collect_response() == "{}"
