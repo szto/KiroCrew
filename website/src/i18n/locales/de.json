@@ -6691,7 +6691,9 @@
         "unarchive": "Aus dem Archiv holen",
         "action_failed": "Aktion fehlgeschlagen",
         "copied": "Kopiert!",
-        "copy_content": "Inhalt kopieren"
+        "copy_content": "Inhalt kopieren",
+        "rendered": "Gerendert",
+        "source": "Quelltext"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} eingebettet ({{pct}}%)",
@@ -6840,7 +6842,11 @@
         "this_folder_will_be_watched_any_supported_files": "Dieser Ordner wird überwacht. Alle hier hinzugefügten unterstützten Dateien werden im nächsten Scan-Zyklus (~5 Min.) automatisch eingelesen.",
         "this_folder_will_be_watched_continuously_new_fil": "Dieser Ordner wird kontinuierlich überwacht. Neue hier hinzugefügte Dateien werden im nächsten Scan-Zyklus (~5 Min.) automatisch eingelesen.",
         "watch_anyway": "Trotzdem überwachen",
-        "watching_folder": "Ordner wird überwacht"
+        "watching_folder": "Ordner wird überwacht",
+        "rebuild_graph": "Graph neu aufbauen",
+        "rebuild_entity_graph": "Entitätsgraphen neu aufbauen",
+        "re_extract_entities_from_the_items_already_store": "Extrahiert Entitäten erneut aus den bereits gespeicherten Einträgen. Die Quelle wird nicht neu gelesen.",
+        "rebuild_failed": "Neuaufbau fehlgeschlagen"
       },
       "itemCard": {
         "copied": "Kopiert!",

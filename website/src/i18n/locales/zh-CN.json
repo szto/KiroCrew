@@ -6610,7 +6610,9 @@
         "unarchive": "取消归档",
         "action_failed": "操作失败",
         "copied": "已复制！",
-        "copy_content": "复制内容"
+        "copy_content": "复制内容",
+        "rendered": "渲染",
+        "source": "源码"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} 已嵌入 ({{pct}}%)",
@@ -6758,7 +6760,11 @@
         "this_folder_will_be_watched_any_supported_files": "将监视此文件夹。在此添加的任何受支持文件都会在下一个扫描周期（约 5 分钟）自动导入。",
         "this_folder_will_be_watched_continuously_new_fil": "将持续监视此文件夹。在此添加的新文件会在下一个扫描周期（约 5 分钟）自动导入。",
         "watch_anyway": "仍然监视",
-        "watching_folder": "正在监视文件夹"
+        "watching_folder": "正在监视文件夹",
+        "rebuild_graph": "重建图谱",
+        "rebuild_entity_graph": "重建实体图谱",
+        "re_extract_entities_from_the_items_already_store": "从已存储的条目重新提取实体，不会重新读取来源。",
+        "rebuild_failed": "重建失败"
       },
       "itemCard": {
         "copied": "已复制！",

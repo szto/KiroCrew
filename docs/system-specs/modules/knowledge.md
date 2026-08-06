@@ -191,6 +191,52 @@ Returns the item count per source **under the active filters**:
 - The list view derives its rows from these counts, which is what guarantees
   every source is visible at once regardless of relative size.
 
+### `POST /api/knowledge/sources/{id}/rebuild-graph`
+
+Re-runs entity extraction over a source's **already-stored** items
+(`IngestionPipeline.rebuild_entities`). Returns
+`{"status": "rebuilding", "source_id", "items"}` and runs in the background;
+progress lands on the normal `ingestion_jobs` row. `404 source_unknown`,
+`503 pipeline_unconfigured`, `400 source_empty`.
+
+- **Why it is not sync.** Sync re-reads the origin and skips files whose content
+  is unchanged — which is every file when the text is fine and only the
+  extraction was lost. That is the normal state after an extraction outage,
+  because a failed batch still stores the item (heading-derived title, NULL
+  summary, no entities) and reports the job `completed`. Re-reading is also the
+  expensive half: file IO and chunking redo work that is already correct.
+- **Content is never rewritten** — only mentions, relations and the summary.
+- **Idempotent, not additive.** Each item's old `mentions` and its
+  `entity_relations` rows are deleted before the fresh extraction is stored;
+  without that, a second run doubles every mention and inflates the degree
+  ranking the graph view sorts on. Entities themselves are left alone — another
+  source may still mention them.
+- **Reloads the graph once at the end.** Deleting relation ROWS does not remove
+  the matching edges from the in-memory `SimpleDiGraph` (only the `add_*` methods
+  mutate it), so a rebuild that drops a relation would keep serving it until the
+  next gateway start. Per item would be O(n) full-graph loads.
+- **Never runs dedup.** `_maybe_dedup` collapses a NEWLY INGESTED document
+  against the corpus and hard-deletes the loser through `delete_source_cascade`.
+  A rebuild adds no document, so there is nothing to judge — and calling it there
+  cascade-deleted a real 7-item folder source, taking every item, mention and
+  relation with it. A control labelled "rebuild graph" must not be able to delete
+  the source.
+
+### `tags` on the wire is a JSON array STRING
+
+`items.tags` round-trips through `json.dumps`, so the list/detail APIs serve it as
+`'["content_type:markdown"]'` — not a comma-separated string and not an array. A
+reader that only comma-splits gets one element still wrapped in its brackets and
+quotes, so `content_type:markdown` never matches: that is why markdown from every
+folder-ingested document rendered as raw source in the dashboard rather than as
+prose. `pages/knowledge/DetailView.tsx:parseTags` parses JSON first and falls back
+to the comma form; anything reading a marker tag must go through it.
+
+`content_type:markdown` is set by the ingest path for `MARKDOWN_EXTS`
+(`.md`, `.docx`) and is what the detail view's rendered/source toggle keys on.
+Entity highlighting exists only in the source view — injecting marks into rendered
+markdown would mean rewriting the AST.
+
 ## Invariants
 
 - **Sensitive paths never ingested** — `FileReader.read`, `FolderWatcher._walk`, `_hash_file`, and `_ingest_file` all gate on `is_sensitive_path()` (with symlink re-resolution at ingest time for TOCTOU).

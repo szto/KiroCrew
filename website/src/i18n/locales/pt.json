@@ -6772,7 +6772,9 @@
         "unarchive": "Desarquivar",
         "action_failed": "Falha na ação",
         "copied": "Copiado!",
-        "copy_content": "Copiar conteúdo"
+        "copy_content": "Copiar conteúdo",
+        "rendered": "Renderizado",
+        "source": "Código"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} com embeddings ({{pct}}%)",
@@ -6922,7 +6924,11 @@
         "this_folder_will_be_watched_any_supported_files": "Esta pasta será monitorada. Qualquer arquivo compatível adicionado aqui será ingerido automaticamente no próximo ciclo de varredura (~5 min).",
         "this_folder_will_be_watched_continuously_new_fil": "Esta pasta será monitorada continuamente. Novos arquivos adicionados aqui serão ingeridos automaticamente no próximo ciclo de varredura (~5 min).",
         "watch_anyway": "Monitorar mesmo assim",
-        "watching_folder": "Monitorando a pasta"
+        "watching_folder": "Monitorando a pasta",
+        "rebuild_graph": "Reconstruir grafo",
+        "rebuild_entity_graph": "Reconstruir o grafo de entidades",
+        "re_extract_entities_from_the_items_already_store": "Extrai novamente as entidades dos itens já armazenados. Não relê a fonte.",
+        "rebuild_failed": "Falha na reconstrução"
       },
       "itemCard": {
         "copied": "Copiado!",
