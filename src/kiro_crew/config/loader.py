@@ -2475,7 +2475,12 @@ _SECURITY_BOUNDED_FIELDS: tuple[tuple[str, str, int, int], ...] = (
     ("agent", "max_subagents", 0, SUBAGENT_AUTO_MAX_CEILING),
     ("agent", "subagent_max_turns", 1, SUBAGENT_MAX_TURNS_CEILING),
     ("agent", "chat_turn_timeout_secs", CHAT_TURN_TIMEOUT_MIN, CHAT_TURN_TIMEOUT_MAX),
-    ("dashboard", "loop_stall_exit_after_secs", LOOP_STALL_EXIT_AFTER_MIN, LOOP_STALL_EXIT_AFTER_MAX),
+    (
+        "dashboard",
+        "loop_stall_exit_after_secs",
+        LOOP_STALL_EXIT_AFTER_MIN,
+        LOOP_STALL_EXIT_AFTER_MAX,
+    ),
     ("session", "pool_size", 0, POOL_SIZE_MAX),
 )
 
@@ -4416,12 +4421,8 @@ class KiroCrewConfig:
                 subagent_spawn_stagger_secs=_safe_float(
                     agent_data.get("subagent_spawn_stagger_secs", 2.0), 2.0
                 ),
-                resource_pressure_gb=_safe_float(
-                    agent_data.get("resource_pressure_gb", 4.0), 4.0
-                ),
-                resource_critical_gb=_safe_float(
-                    agent_data.get("resource_critical_gb", 2.0), 2.0
-                ),
+                resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
+                resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
                 subagent_max_turns=agent_data.get("subagent_max_turns", 100),
                 subagent_timeout_secs=agent_data.get("subagent_timeout_secs", 1800),
                 subagent_stall_idle_secs=_safe_int(
@@ -5749,7 +5750,8 @@ def resolve_effective_model(
     2. the bound kiro agent's pinned ``model`` (skipped for the built-in
        ``kirocrew`` agent, which tracks the global by design)
     3. the global ``agent.model`` default
-    4. the installed ``kirocrew.json`` / bundled ``defaults.json`` model
+    4. the installed ``kirocrew.json`` / bundled ``defaults.json`` model —
+       **kiro (``acp``) only**, since that file's model is a kiro id
 
     A per-session pick outranks all of these and is NOT considered here — the
     caller holds it. Returns ``""`` when every tier defers, meaning the backend
@@ -5768,6 +5770,20 @@ def resolve_effective_model(
     configured = normalize_agent_model(config.agent.model)
     if configured:
         return configured
+    if config.agent.provider == PROVIDER_CLAUDE_CODE:
+        # Tier 4 is a kiro-cli artifact: ``~/.kiro/agents/kirocrew.json`` is
+        # written by kiro tooling, so its ``model`` is a kiro id by construction
+        # (and it sits outside KIROCREW_HOME, so even an isolated instance reads
+        # the real one). Handing that to claude-agent-acp is a category error —
+        # it rejects the session outright, which surfaces far from here (a task
+        # runner reporting "Could not generate a plan").
+        #
+        # The registry cannot filter these out instead: ``opus`` and ``sonnet``
+        # are registry aliases AND real backend values, so dropping "ids the
+        # registry knows" would break the two most common picks. Skipping the
+        # tier by provider is the safe cut. "" means the backend picks, which is
+        # what "auto" should have meant here all along.
+        return ""
     # agent.model is "auto"/unset: fall through to the installed agent file the
     # factory would read, so the chip shows what will actually be used.
     return normalize_agent_model(config._resolve_agent_model())

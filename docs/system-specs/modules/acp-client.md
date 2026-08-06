@@ -6,6 +6,35 @@ The ACP layer spans **five** modules: the legacy per-session client (`acp/client
 
 ## Backend Selection
 
+**`AcpRuntime(acp_backend=...)` takes the same seam**, so the multiplexed path is
+not kiro-only. It had no backend parameter at all, which made every consumer of
+`SessionManager.open_task_session` — the task runner — spawn kiro-cli regardless
+of `agent.provider`: on a claude_code host the run failed with kiro's
+`The model 'claude-opus-4.8' is not available`, surfacing as
+`Could not generate a plan. Try rephrasing.` Multiplexing holds on both backends
+(two `session/new` calls on one `claude-agent-acp` process return distinct session
+ids), so one process per run is still the shape.
+
+Differences from the kiro branch, all verified against the real adapter:
+
+- **No `--agent` / `--model` flags.** Those are kiro-cli's. The claude adapter
+  takes the agent from its own config and the model through
+  `session/set_config_option`, and exits before the handshake on an unknown flag.
+- **`protocolVersion` is an integer**, not kiro's date string
+  (`_protocol_version` / `PROTOCOL_VERSION_CLAUDE`). A string is rejected with
+  `expected number, received string` during `initialize`, so the runtime dies
+  before any session exists.
+- **`CLAUDE_CODE_EXECUTABLE`** is set when unset, for the same SDK reason as the
+  client path below. `is_kiro_cli=False` reaches `wrap_argv`.
+
+Which backend a runtime gets: the parent provider's, when one can be resolved
+(`_parent_runtime_kwargs` inherits `client.backend` alongside the sandbox/MCP
+posture, and the parent's `extra_env` already carries `CLAUDE_CONFIG_DIR`, so the
+runtime lands on the same account). A task-runner parent key names a *runtime*
+rather than a registered session, so there is nothing to inherit from — those fall
+back to `session._configured_acp_backend()`, which reads `agent.provider`. An
+unreadable config falls back to kiro-cli, the historical behaviour.
+
 `AcpClient(acp_backend=...)` selects which subprocess to launch:
 
 - `""` (default): `kiro-cli acp --agent <name>` (resolved by `_resolve_kiro_bin`). Per-session kiro settings are layered in via the workspace overlay `<work_dir>/.kiro/settings/cli.json` (written by `AcpProvider`, not the client): reasoning **effort** (`chat.modelDefaults`) and **MCP Tool Search** (`toolSearch.enabled` + zeroed thresholds, gated by `agent.tool_search`, default on) — see providers.md.

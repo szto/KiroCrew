@@ -203,6 +203,17 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
   dropdown served backend ids) is degraded to `""` by `_backend_model_id` instead of
   being sent: the registry cannot say which live model it meant, and booting on the
   backend default is recoverable where a rejected id is a failed session.
+- **`resolve_effective_model` skips its last tier on `claude_code`.** That tier reads
+  the installed `~/.kiro/agents/kirocrew.json`, a kiro-cli artifact whose `model` is a
+  kiro id by construction — and it lives **outside `KIROCREW_HOME`**, so even an
+  isolated instance reads the real one. On this provider it is a category error: the
+  backend rejects the session, and the failure surfaces far from its cause (a task
+  runner reporting `Could not generate a plan. Try rephrasing.` while the log carries
+  `The model 'claude-opus-4.8' is not available`). `agent.model = "auto"` therefore
+  resolves to `""` — let the backend pick — rather than to whatever kiro pinned.
+  Filtering by registry membership instead would NOT work: `opus` and `sonnet` are
+  registry aliases *and* real backend values, so dropping "ids the registry knows"
+  breaks the two most common picks. The cut has to be by provider.
 
 ### MCP Server Registration
 
