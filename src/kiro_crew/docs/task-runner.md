@@ -54,7 +54,7 @@ Task specs are markdown files with structured steps:
 
 Approval depends on how the run was launched:
 
-- **Dashboard / chat `run` / Slack `run`** (inside the gateway): tool calls that aren't allow/deny-listed **prompt** interactively.
+- **Dashboard / chat `run` / Slack `run`** (inside the gateway): tool calls that aren't allow/deny-listed **prompt** interactively. A prompt that is declined — or that goes unanswered until the background-approval window lapses, which an unattended run hits after 3 minutes — is rejected and logged with `reason: interactive_not_approved`. The handler reports a bare yes/no, so the reason does not claim which of the two it was.
 - **`kirocrew run TASK.md`** (standalone CLI): no interactive channel, so it's **deny-by-default** — a tool runs only if it matches `hooks.auto_approve_tools`; otherwise it's rejected and logged with `reason: headless_no_authorization`. (`TOOL_DENY` / `auto_deny_tools` always wins; the allowlist works with or without a handler.)
 
 To let `kirocrew run` use tools, allowlist them in `~/.kiro/crew/config.json`:
