@@ -1003,6 +1003,17 @@ export const api = {
   models: () => fetch('/api/models').then(j),
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
+  // Applies to the slot's NEXT session: the account is a config dir handed to the
+  // backend at spawn, so a running session keeps the account it started on.
+  chatSlotAccount: (slot: string, account: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/account', { account }).then(j) as Promise<{ ok: boolean; account: string }>,
+  // Names and login state only — the endpoint deliberately returns no config dir.
+  accounts: () =>
+    fetch('/api/accounts').then(j) as Promise<{
+      provider: string
+      active: string
+      accounts: { name: string; logged_in: boolean }[]
+    }>,
   slashCommands: () => fetch('/api/slash-commands').then(j),
   chatSlotAgent: (slot: string, agent: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', { agent }).then(j),

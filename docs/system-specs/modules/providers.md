@@ -149,6 +149,20 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
   whether a session can start. An `agent.account` that does not resolve degrades
   `active` to `""` while still listing the rows, because a user who cannot see the
   profiles cannot pick a working one.
+- **`POST /api/chat/slots/{slot}/account`** (`dashboard/chat_handlers.py`) picks the
+  profile for that slot's **next** session. Body `{"account": "<name>"}`; `""` returns
+  to the config's own choice. Unlike `reasoning_effort` there is deliberately no live
+  apply and no session reset: the account is a `CLAUDE_CONFIG_DIR` handed to the
+  backend process at spawn, so a running session keeps the account it started on and
+  the dashboard dropdown locks once the slot has one. A name no profile declares is a
+  400 with `code=account_unknown`; a declared profile with no Claude login is a 400
+  with `code=account_not_logged_in` — refused here, where the remedy (`claude login`
+  for that profile) can be named, not as an opaque adapter auth error mid-turn. The
+  pick lands on `slot.account`, is serialized into the slots stream (a successful
+  switch pushes a slots update so every open dashboard sees it), and reaches the
+  factory's `account` kwarg through `SessionManager.get_or_create`'s
+  `**extra_factory_kwargs` — the kiro-cli factory ignores it, so `chat_runner` threads
+  it unconditionally.
 
 ### MCP Server Registration
 

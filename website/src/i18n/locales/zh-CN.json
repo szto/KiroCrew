@@ -2878,6 +2878,12 @@
     }
   },
   "components": {
+    "accountDropdown": {
+      "account_aria": "账户：{{name}}",
+      "locked_tooltip": "开始新会话以切换账户",
+      "needs_login_tooltip": "请先为此账户运行 claude login",
+      "switch_tooltip": "切换账户"
+    },
     "agentDropdownList": {
       "active_in_this_session": "在此会话中使用",
       "could_not_change_the_default_agent": "无法更改默认代理",

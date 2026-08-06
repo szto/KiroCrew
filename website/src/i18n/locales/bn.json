@@ -2916,6 +2916,12 @@
     }
   },
   "components": {
+    "accountDropdown": {
+      "account_aria": "অ্যাকাউন্ট: {{name}}",
+      "locked_tooltip": "অ্যাকাউন্ট বদলাতে নতুন সেশন শুরু করুন",
+      "needs_login_tooltip": "এই অ্যাকাউন্টের জন্য আগে claude login চালান",
+      "switch_tooltip": "অ্যাকাউন্ট বদলান"
+    },
     "agentDropdownList": {
       "active_in_this_session": "এই সেশনে সক্রিয়",
       "could_not_change_the_default_agent": "ডিফল্ট এজেন্ট বদলানো গেল না",

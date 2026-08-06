@@ -497,6 +497,12 @@
     }
   },
   "components": {
+    "accountDropdown": {
+      "account_aria": "Account: {{name}}",
+      "locked_tooltip": "Start a new session to switch account",
+      "needs_login_tooltip": "Run claude login for this account first",
+      "switch_tooltip": "Switch account"
+    },
     "agentImportFlow": {
       "choose_sources": "Choose sources",
       "could_not_save_onboarding_state": "Could not save onboarding state.",

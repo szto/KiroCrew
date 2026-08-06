@@ -769,6 +769,7 @@ class _ChatSlot:
         "agent",
         "model",
         "reasoning_effort",
+        "account",
         "mode",
         "workspace",
         "project",
@@ -875,6 +876,11 @@ class _ChatSlot:
         # Reasoning effort: "" = provider default, else one of low/medium/high/max.
         # Currently consumed by an alternate ACP backend (--effort flag); ACP wired later.
         self.reasoning_effort: str = ""
+        # Claude account profile for this slot's NEXT session ("" = the config's
+        # own choice). Unlike reasoning_effort there is no live apply: the account
+        # is a CLAUDE_CONFIG_DIR handed to the backend process at spawn, so a
+        # running session keeps the account it started on.
+        self.account: str = ""
         # "" = default chat, "orchestrator" = orchestrated chat
         self.mode = mode
         self.workspace = workspace
@@ -1595,6 +1601,7 @@ class _ChatSlot:
             "agent": self.agent,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "account": self.account,
             "mode": self.mode,
             # Forward-compat alias of `mode` for the frontend's surface
             # registry. Today every slot's surface is identical to its mode

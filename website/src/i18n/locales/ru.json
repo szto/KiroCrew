@@ -2992,6 +2992,12 @@
     }
   },
   "components": {
+    "accountDropdown": {
+      "account_aria": "Аккаунт: {{name}}",
+      "locked_tooltip": "Начните новый сеанс, чтобы сменить аккаунт",
+      "needs_login_tooltip": "Сначала выполните claude login для этого аккаунта",
+      "switch_tooltip": "Сменить аккаунт"
+    },
     "agentDropdownList": {
       "active_in_this_session": "Активен в этой сессии",
       "could_not_change_the_default_agent": "Не удалось изменить агента по умолчанию",

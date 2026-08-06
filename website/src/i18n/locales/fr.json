@@ -2954,6 +2954,12 @@
     }
   },
   "components": {
+    "accountDropdown": {
+      "account_aria": "Compte : {{name}}",
+      "locked_tooltip": "Démarrez une nouvelle session pour changer de compte",
+      "needs_login_tooltip": "Exécutez d'abord claude login pour ce compte",
+      "switch_tooltip": "Changer de compte"
+    },
     "agentDropdownList": {
       "active_in_this_session": "Actif dans cette session",
       "could_not_change_the_default_agent": "Impossible de changer l’agent par défaut",
