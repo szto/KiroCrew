@@ -18,6 +18,7 @@ from aiohttp import web
 from kiro_crew import agent_state, model_registry
 from kiro_crew.agent_discovery import clear_list_agents_cache, list_agents
 from kiro_crew.config.loader import (
+    PROVIDER_CLAUDE_CODE,
     ConfigReadError,
     KiroCrewAgentConfig,
     KiroCrewConfig,
@@ -751,8 +752,11 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
             # After "auto", never before it: "auto" is the configured default in
             # the general case and leads the list.
             merged.insert(
-                1 if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
-                else 0,
+                (
+                    1
+                    if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
+                    else 0
+                ),
                 {
                     "model_name": canonical_default,
                     "display_name": canonical_default,
@@ -772,7 +776,17 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
 
 
 async def api_models(request: web.Request) -> web.Response:
-    """GET /api/models — list available models from the live kiro-cli ACP session."""
+    """GET /api/models — list models for the configured provider.
+
+    claude_code is answered entirely from :func:`_cc_models` (registry ∩ what the
+    live backend advertises) and must branch BEFORE the kiro readiness gate and
+    the kiro-cli spawn below: both gate on kiro login state, which a claude_code
+    gateway neither has nor needs, so falling through would 503 a healthy
+    dashboard (or spawn a browser-opening kiro-cli login) on every 8s poll.
+    """
+    cfg = KiroCrewConfig.load()
+    if cfg.agent.provider == PROVIDER_CLAUDE_CODE:
+        return web.json_response(_cc_models(request, cfg.agent.model))
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
     # an interactive browser login for ANY subcommand run unauthenticated
     # (--no-interactive does not suppress it, and there is no opt-out env var),

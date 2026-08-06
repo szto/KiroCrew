@@ -7150,7 +7150,8 @@
         "named_workspace_directories_each_agent_binds_to": "নাম দেওয়া ওয়ার্কস্পেস ডিরেক্টরি। প্রতিটি এজেন্ট একটি ওয়ার্কস্পেসের সাথে বাঁধা থাকে।",
         "save": "সেভ করো",
         "saving": "সেভ হচ্ছে…",
-        "tool_call_budget_per_subagent_1_200_default_100": "প্রতি সাবএজেন্টের টুল-কল বাজেট (1–200)। ডিফল্ট: 100।"
+        "tool_call_budget_per_subagent_1_200_default_100": "প্রতি সাবএজেন্টের টুল-কল বাজেট (1–200)। ডিফল্ট: 100।",
+        "backend_for_new_sessions_switching_clears_slot_m": "নতুন সেশনের ব্যাকএন্ড। পরিবর্তন করলে স্লট মডেল মুছে যায়।"
       },
       "mcpTab": {
         "actions": "অ্যাকশন",
@@ -7999,7 +8000,13 @@
         "product_manager": "প্রোডাক্ট ম্যানেজার",
         "somewhat": "কিছুটা",
         "tail_preserve_end_final_summary": "টেইল (শেষটা / চূড়ান্ত সারসংক্ষেপ রাখে)",
-        "ux_designer": "UX ডিজাইনার"
+        "ux_designer": "UX ডিজাইনার",
+        "provider": "প্রোভাইডার",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "নতুন সেশন কোন ব্যাকএন্ডে চলবে।",
+        "switching_provider_affects_new_sessions_only_run": "শুধু নতুন সেশনে প্রযোজ্য। নির্বাচিত CLI-তে সাইন ইন করুন: kiro login বা claude login।",
+        "failed_to_save_provider": "প্রোভাইডার সেভ করা যায়নি"
       },
       "computerUsePanel": {
         "accessibility": "অ্যাক্সেসিবিলিটি",

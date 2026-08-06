@@ -2180,7 +2180,8 @@
         "named_workspace_directories_each_agent_binds_to": "Named workspace directories. Each agent binds to one workspace.",
         "save": "Save",
         "saving": "Saving…",
-        "tool_call_budget_per_subagent_1_200_default_100": "Tool-call budget per subagent (1–200). Default: 100."
+        "tool_call_budget_per_subagent_1_200_default_100": "Tool-call budget per subagent (1–200). Default: 100.",
+        "backend_for_new_sessions_switching_clears_slot_m": "Backend for new sessions. Switching clears slot models."
       },
       "mcpTab": {
         "mcp_servers_count": "MCP Servers ({{count}})",
@@ -2561,7 +2562,13 @@
         "product_manager": "Product Manager",
         "somewhat": "Somewhat",
         "tail_preserve_end_final_summary": "Tail (preserve end / final summary)",
-        "ux_designer": "UX Designer"
+        "ux_designer": "UX Designer",
+        "provider": "Provider",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "Which backend new sessions run on.",
+        "switching_provider_affects_new_sessions_only_run": "Applies to new sessions only. Sign in to the CLI you pick: kiro login or claude login.",
+        "failed_to_save_provider": "Failed to save provider"
       },
       "displayPanel": {
         "create_theme": "Create Theme",

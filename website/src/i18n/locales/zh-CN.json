@@ -7068,7 +7068,8 @@
         "named_workspace_directories_each_agent_binds_to": "具名工作区目录。每个代理绑定到一个工作区。",
         "save": "保存",
         "saving": "保存中…",
-        "tool_call_budget_per_subagent_1_200_default_100": "每个子代理的工具调用预算（1–200）。默认值：100。"
+        "tool_call_budget_per_subagent_1_200_default_100": "每个子代理的工具调用预算（1–200）。默认值：100。",
+        "backend_for_new_sessions_switching_clears_slot_m": "新会话使用的后端。切换会清除会话槽的模型。"
       },
       "mcpTab": {
         "actions": "操作",
@@ -7912,7 +7913,13 @@
         "product_manager": "产品经理",
         "somewhat": "略懂",
         "tail_preserve_end_final_summary": "尾部（保留结尾 / 最终摘要）",
-        "ux_designer": "UX 设计师"
+        "ux_designer": "UX 设计师",
+        "provider": "提供方",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "新会话运行所使用的后端。",
+        "switching_provider_affects_new_sessions_only_run": "仅对新会话生效。请登录所选的 CLI：kiro login 或 claude login。",
+        "failed_to_save_provider": "保存提供方失败"
       },
       "computerUsePanel": {
         "accessibility": "辅助功能",

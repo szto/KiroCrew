@@ -7232,7 +7232,8 @@
         "named_workspace_directories_each_agent_binds_to": "Directory di workspace denominate. Ogni agente è associato a un solo workspace.",
         "save": "Salva",
         "saving": "Salvataggio…",
-        "tool_call_budget_per_subagent_1_200_default_100": "Budget di chiamate a strumenti per subagente (1–200). Predefinito: 100."
+        "tool_call_budget_per_subagent_1_200_default_100": "Budget di chiamate a strumenti per subagente (1–200). Predefinito: 100.",
+        "backend_for_new_sessions_switching_clears_slot_m": "Backend per le nuove sessioni. Il cambio azzera i modelli degli slot."
       },
       "mcpTab": {
         "actions": "Azioni",
@@ -8086,7 +8087,13 @@
         "product_manager": "Product Manager",
         "somewhat": "In parte",
         "tail_preserve_end_final_summary": "Fine (conserva la parte finale / il riepilogo conclusivo)",
-        "ux_designer": "Designer UX"
+        "ux_designer": "Designer UX",
+        "provider": "Provider",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "Su quale backend vengono eseguite le nuove sessioni.",
+        "switching_provider_affects_new_sessions_only_run": "Si applica solo alle nuove sessioni. Accedi alla CLI scelta: kiro login o claude login.",
+        "failed_to_save_provider": "Impossibile salvare il provider"
       },
       "computerUsePanel": {
         "accessibility": "Accessibilità",

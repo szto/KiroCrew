@@ -121,7 +121,16 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 - `agent.provider` selects the backend (enum `["acp", "claude_code"]`). `acp` drives
   kiro-cli; `claude_code` drives claude-agent-acp through the SAME `AcpProvider` with
   `acp_backend=ACP_BACKEND_CLAUDE` — a second backend behind one transport, not a
-  second transport.
+  second transport. The enum is mirrored by `handlers/core._EDITABLE_CONFIG`, the
+  allowlist `PATCH /api/config/kirocrew` validates against; both are written in terms
+  of the `PROVIDER_*` constants because a schema that accepts a value the dashboard
+  allowlist rejects reads to the user as a broken settings control.
+- **Switching provider is a dashboard control**, on Settings → Chat → Model and in the
+  Overview config summary. The PATCH handler's `agent.provider` branch rebuilds the
+  agent artifacts, calls `SessionManager.reload_provider_factory()`, and **clears every
+  slot's `model`** — model aliases are provider-specific, so a kiro id left on a slot
+  would reach the claude backend unresolved. Live sessions keep the provider they
+  started on; the switch applies to new ones.
 - `create_provider_factory()` returns a `Callable`: the kiro-cli `AcpProvider` factory
   by default, or `providers.claude_code_factory.build_claude_code_factory(self)` when
   the provider is `claude_code`.
@@ -163,6 +172,15 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
   factory's `account` kwarg through `SessionManager.get_or_create`'s
   `**extra_factory_kwargs` — the kiro-cli factory ignores it, so `chat_runner` threads
   it unconditionally.
+- **`GET /api/models` is provider-dispatched** (`dashboard/handlers/agents.py`). On
+  `claude_code` it answers from `_cc_models()` — the canonical registry rows
+  (`model_registry.display_list("claude_code")`) intersected with what the live
+  backend advertises, `auto` always first — and returns **before** the kiro
+  readiness gate and the `kiro chat --list-models` spawn: both gate on kiro login
+  state, which a claude_code gateway neither has nor needs, so falling through
+  would 503 a healthy dashboard (or pop a kiro-cli browser login) on every poll.
+  Rows carry `context_window`; the kiro branch's rows carry
+  `context_window_tokens` — the frontend ACP adapter reads both.
 
 ### MCP Server Registration
 

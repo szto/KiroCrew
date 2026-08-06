@@ -7232,7 +7232,8 @@
         "named_workspace_directories_each_agent_binds_to": "Répertoires d’espaces de travail nommés. Chaque agent est associé à un espace de travail.",
         "save": "Enregistrer",
         "saving": "Enregistrement…",
-        "tool_call_budget_per_subagent_1_200_default_100": "Budget d’appels d’outils par sous-agent (1–200). Par défaut : 100."
+        "tool_call_budget_per_subagent_1_200_default_100": "Budget d’appels d’outils par sous-agent (1–200). Par défaut : 100.",
+        "backend_for_new_sessions_switching_clears_slot_m": "Backend des nouvelles sessions. Le changer efface les modèles des emplacements."
       },
       "mcpTab": {
         "actions": "Actions",
@@ -8086,7 +8087,13 @@
         "product_manager": "Chef de produit",
         "somewhat": "Un peu",
         "tail_preserve_end_final_summary": "Fin (conserver la fin / le résumé final)",
-        "ux_designer": "Designer UX"
+        "ux_designer": "Designer UX",
+        "provider": "Fournisseur",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "Le backend sur lequel les nouvelles sessions s’exécutent.",
+        "switching_provider_affects_new_sessions_only_run": "S’applique uniquement aux nouvelles sessions. Connectez-vous à la CLI choisie : kiro login ou claude login.",
+        "failed_to_save_provider": "Échec de l’enregistrement du fournisseur"
       },
       "computerUsePanel": {
         "accessibility": "Accessibilité",

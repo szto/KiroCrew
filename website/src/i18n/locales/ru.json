@@ -7314,7 +7314,8 @@
         "named_workspace_directories_each_agent_binds_to": "Именованные каталоги рабочих областей. Каждый агент привязан к одной рабочей области.",
         "save": "Сохранить",
         "saving": "Сохранение...",
-        "tool_call_budget_per_subagent_1_200_default_100": "Бюджет вызовов инструментов на субагента (1–200). По умолчанию: 100."
+        "tool_call_budget_per_subagent_1_200_default_100": "Бюджет вызовов инструментов на субагента (1–200). По умолчанию: 100.",
+        "backend_for_new_sessions_switching_clears_slot_m": "Бэкенд для новых сессий. Переключение сбрасывает модели слотов."
       },
       "mcpTab": {
         "actions": "Действия",
@@ -8173,7 +8174,13 @@
         "product_manager": "Продакт-менеджер",
         "somewhat": "Немного",
         "tail_preserve_end_final_summary": "Конец (сохранить конец / итоговую сводку)",
-        "ux_designer": "UX-дизайнер"
+        "ux_designer": "UX-дизайнер",
+        "provider": "Провайдер",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "Бэкенд, на котором запускаются новые сессии.",
+        "switching_provider_affects_new_sessions_only_run": "Применяется только к новым сессиям. Войдите в выбранный CLI: kiro login или claude login.",
+        "failed_to_save_provider": "Не удалось сохранить провайдера"
       },
       "computerUsePanel": {
         "accessibility": "Универсальный доступ",

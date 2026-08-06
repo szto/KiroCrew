@@ -27,6 +27,8 @@ from kiro_crew.computer_use.types import MIN_SCREENSHOT_MAX_PX as _CU_MIN_SCREEN
 from kiro_crew.config.loader import (
     _VALID_STT_PROVIDERS,
     MAX_SUBAGENTS_FIXED_FLOOR,
+    PROVIDER_ACP,
+    PROVIDER_CLAUDE_CODE,
     SUBAGENT_AUTO_MAX_CEILING,
     SUBAGENT_MAX_TURNS_CEILING,
     KiroCrewConfig,
@@ -860,9 +862,7 @@ def _build_stt_install_script(provider: str = "whisper") -> str:
     """
     prelude = _stt_install_path_prelude()
     if provider == "mlx":
-        return (
-            prelude
-            + r"""
+        return prelude + r"""
 [ -d "$HOME/ffmpeg" ] && export PATH="$HOME/ffmpeg:$PATH"
 
 if ! command -v brew >/dev/null 2>&1; then
@@ -883,10 +883,7 @@ pipx install --force mlx-whisper 2>&1 || { echo "ERROR: pipx install mlx-whisper
 
 echo "Done. mlx_whisper=$(command -v mlx_whisper 2>/dev/null || echo 'check PATH') ffmpeg=$(command -v ffmpeg 2>/dev/null || echo 'MISSING')"
 """
-        )
-    return (
-        prelude
-        + r"""
+    return prelude + r"""
 # Pick up ffmpeg from ~/ffmpeg if installed there
 [ -d "$HOME/ffmpeg" ] && export PATH="$HOME/ffmpeg:$PATH"
 
@@ -922,7 +919,6 @@ echo "Installing openai-whisper..."
 
 echo "Done. whisper=$(command -v whisper 2>/dev/null || echo 'check PATH') ffmpeg=$(command -v ffmpeg 2>/dev/null || echo 'MISSING')"
 """
-    )
 
 
 async def api_stt_transcribe(request: web.Request) -> web.Response:
@@ -1212,7 +1208,11 @@ def _agent_values() -> set[str]:
 
 
 _EDITABLE_CONFIG: dict[str, dict] = {
-    "agent.provider": {"type": "enum", "values": ["acp"]},
+    # Mirrors the config schema's own provider enum. Kept in terms of the loader
+    # constants rather than string literals so opening a provider is one edit, not
+    # two that can silently drift apart (the schema accepting a value the dashboard
+    # allowlist rejects reads to the user as a broken settings control).
+    "agent.provider": {"type": "enum", "values": [PROVIDER_ACP, PROVIDER_CLAUDE_CODE]},
     # Default model for new sessions. Membership can NOT be validated against a
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
     # (/api/models spawns it to find out), and it spans both canonical registry

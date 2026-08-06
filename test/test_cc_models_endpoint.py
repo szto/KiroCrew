@@ -11,13 +11,18 @@ sentinel, not a served model.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from kiro_crew import model_registry
+from kiro_crew.dashboard.handlers import agents
 from kiro_crew.dashboard.handlers.agents import (
     _advertised_cc_models,
     _cc_models,
+    api_models,
 )
 
 # Canonical registry rows now lead the dropdown (replaces _CC_CURATED_MODELS).
@@ -229,3 +234,47 @@ class TestCcModelsMerge:
         assert all(m["model_name"] for m in out)
         # the canonical "auto" row is still present, exactly once.
         assert names.count("auto") == 1
+
+
+def _cc_cfg(model: str = "auto") -> SimpleNamespace:
+    return SimpleNamespace(agent=SimpleNamespace(provider="claude_code", model=model))
+
+
+class TestApiModelsClaudeCodeDispatch:
+    """On the claude_code provider /api/models serves _cc_models and never
+    touches kiro: no readiness gate, no kiro-cli subprocess. Those paths gate on
+    kiro login state, which a claude_code gateway does not have."""
+
+    @pytest.mark.asyncio
+    async def test_serves_cc_rows_without_kiro_gate_or_spawn(self):
+        with (
+            patch.object(agents.KiroCrewConfig, "load", return_value=_cc_cfg()),
+            patch.object(
+                agents,
+                "reject_if_kiro_unverified",
+                side_effect=AssertionError("kiro readiness gate must not run on claude_code"),
+            ),
+        ):
+            resp = await api_models(_request_with_providers({}))
+        assert resp.status == 200
+        body = json.loads(resp.text)
+        names = [e["model_name"] for e in body]
+        # "auto" leads; the claude_code registry rows are what is offered.
+        assert names[0] == "auto"
+        assert set(_REGISTRY_NAMES) <= set(names)
+        # Every row carries the context_window the frontend picker reads.
+        assert all("context_window" in e for e in body)
+
+    @pytest.mark.asyncio
+    async def test_configured_default_flows_into_dropdown(self):
+        with (
+            patch.object(agents.KiroCrewConfig, "load", return_value=_cc_cfg("custom-model-xyz")),
+            patch.object(
+                agents,
+                "reject_if_kiro_unverified",
+                side_effect=AssertionError("kiro readiness gate must not run on claude_code"),
+            ),
+        ):
+            resp = await api_models(_request_with_providers({}))
+        body = json.loads(resp.text)
+        assert "custom-model-xyz" in [e["model_name"] for e in body]
