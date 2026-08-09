@@ -24,6 +24,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.dashboard.cf_access import CF_ACCESS_HEADER, validate_cf_access_jwt
 from kiro_crew.dashboard.origin import (
     is_https_request,
     is_loopback,
@@ -1279,6 +1280,8 @@ def token_auth_middleware(
     port: int = 5476,
     local_only: bool = True,
     spa_shell_handler: Callable[..., Any] | None = None,
+    cf_access_team_domain: str = "",
+    cf_access_aud: str = "",
 ) -> Callable[..., Any]:
     """Factory returning aiohttp middleware for token-based dashboard auth.
 
@@ -1297,6 +1300,14 @@ def token_auth_middleware(
     of hard-denying, so DCV/SSH-forwarded browsers polling these routes
     (e.g. ``/api/spawn`` every 5s) don't trigger false session-expired
     banners.  Use this for any internal-path that the browser polls.
+
+    *cf_access_team_domain* + *cf_access_aud* (both required to enable)
+    turn on Cloudflare Access trust: a request with no valid token/cookie
+    that carries a ``Cf-Access-Jwt-Assertion`` header signed by the team
+    domain for that audience is authenticated as the JWT's ``email`` and
+    minted the normal access + refresh cookies — no token-URL paste. A
+    failed assertion never widens access: it falls through to the exact
+    deny/SPA-shell handling that runs when the header is absent.
 
     """
 
@@ -1323,6 +1334,63 @@ def token_auth_middleware(
         if not token:
             return False, "", "no token", ""
         return validate_token_with_app(token, use_session_exp=True)
+
+    async def _try_cf_access(request: web.Request) -> tuple[str, str, float] | None:
+        """Authenticate via a Cloudflare Access assertion, if configured.
+
+        Returns ``(email, session_token, session_exp)`` on success, else
+        ``None`` so the caller falls through to the normal deny/SPA-shell
+        handling. The minted session token is IP-bound like a token-URL
+        session; ``register_nonce=False`` because there is no link nonce.
+        """
+        if not (cf_access_team_domain and cf_access_aud):
+            return None
+        assertion = request.headers.get(CF_ACCESS_HEADER, "")
+        if not assertion:
+            return None
+        valid, email, reason = await validate_cf_access_jwt(
+            assertion, cf_access_team_domain, cf_access_aud
+        )
+        if not valid:
+            # Log the rejected assertion (forged / expired / wrong app) but do
+            # NOT deny here — the request is handled exactly as if the header
+            # were absent, so a bad assertion never changes the auth surface.
+            _log_auth(request, "", "cf_denied", reason)
+            return None
+        session_exp = time.time() + MAX_SESSION_TTL_SECS
+        session_token = generate_token(
+            email, ttl_seconds=MAX_SESSION_TTL_SECS, register_nonce=False
+        )
+        bind_token_ip(
+            session_token,
+            request.remote or "unknown",
+            session_exp,
+            is_proxied_request(request),
+        )
+        return email, session_token, session_exp
+
+    async def _serve_cf_access(
+        request: web.Request,
+        handler: object,
+        user_id: str,
+        session_token: str,
+        session_exp: float,
+    ) -> web.StreamResponse:
+        """Serve an Access-authenticated request and mint its session cookies."""
+        request["user"] = user_id
+        request["app"] = ""
+        resp = await handler(request)  # type: ignore[operator]
+        _attach_auth_cookies(
+            resp,
+            request,
+            cookie_name=f"mc_token_{_cookie_port_from_host(request, port)}",
+            session_token=session_token,
+            session_exp=session_exp,
+            user_id=user_id,
+            port=port,
+        )
+        _log_auth(request, user_id, "ok", "cf_access")
+        return resp  # type: ignore[return-value]
 
     @web.middleware
     async def middleware(request: web.Request, handler: object) -> web.StreamResponse:
@@ -1565,6 +1633,14 @@ def token_auth_middleware(
             from_cookie = bool(token)
 
         if not token:
+            # Cloudflare Access trust: a signed team-domain assertion
+            # authenticates the request outright — the CF-vetted browser never
+            # sees the token-paste banner. Checked before the SPA-shell bypass
+            # so an Access-authenticated navigation gets real content plus a
+            # minted session, not the unauthenticated shell.
+            _cf = await _try_cf_access(request)
+            if _cf is not None:
+                return await _serve_cf_access(request, handler, *_cf)
             # Cold-start (no token — e.g. the access cookie expired over a
             # weekend). Serve the shell directly (not the matched handler) so
             # the app boots and self-recovers via the refresh cookie. Default-
@@ -1580,6 +1656,13 @@ def token_auth_middleware(
             token, use_session_exp=from_cookie
         )
         if not valid:
+            # Expired/forged token but a valid Access assertion: re-mint the
+            # session transparently (the fresh cookies overwrite the stale
+            # ones). This is what lets a CF-fronted browser recover from a
+            # lapsed session without ever seeing the session-expired banner.
+            _cf = await _try_cf_access(request)
+            if _cf is not None:
+                return await _serve_cf_access(request, handler, *_cf)
             # Cold-start variant: an expired/forged token is present (cookie
             # survived but its token lapsed). Same rationale — serve the shell
             # so the SPA can boot and silently refresh.
@@ -1727,87 +1810,113 @@ def token_auth_middleware(
 
         # Set cookie after handler (needs response object)
         if not from_cookie:
-            cookie_max_age = MAX_SESSION_TTL_SECS
-            if session_exp:
-                remaining = int(session_exp - time.time())
-                if 0 < remaining <= MAX_SESSION_TTL_SECS:
-                    cookie_max_age = remaining
-            resp.set_cookie(
-                cookie_name,
-                session_token,
-                httponly=True,
-                samesite="Lax",
-                # Secure only when over HTTPS (direct or via a
-                # TLS-terminating tunnel/proxy — see is_https_request).
-                # Localhost plain HTTP must not set it or the browser
-                # refuses to send it back.
-                secure=is_https_request(request),
-                path="/",
-                max_age=cookie_max_age,
+            _attach_auth_cookies(
+                resp,
+                request,
+                cookie_name=cookie_name,
+                session_token=session_token,
+                session_exp=session_exp,
+                user_id=user_id,
+                port=port,
             )
-            # Clean up legacy cookie from pre-port-specific era
-            resp.set_cookie("mc_token", "", max_age=0, path="/")
-
-            # Trim other-port auth cookies from the shared 127.0.0.1 jar so it
-            # can't grow past aiohttp's header limit (see
-            # refresh_tokens.foreign_port_cookies). Gated on jar size so live
-            # co-existing gateways keep their sessions until accumulation
-            # genuinely threatens overflow. This page request only carries
-            # other-port ACCESS cookies (path "/"); other-port refresh cookies
-            # (path "/api/auth") are trimmed on the next refresh call.
-            if cookie_jar_needs_pruning(request.cookies):
-                for _stale_name, _stale_path in foreign_port_cookies(
-                    request.cookies, _cookie_port_from_host(request, port)
-                ):
-                    resp.set_cookie(_stale_name, "", max_age=0, path=_stale_path)
-
-            # Initial mint via token URL: also attach a refresh cookie so
-            # the user does not have to re-mint via URL every ~20h. Inlined
-            # here (rather than calling handlers.auth_refresh) to keep the
-            # import top-level and the cycle direction one-way:
-            # token_auth → refresh_tokens, never the reverse.
-            try:
-                refresh_token, chain_id, _jti, refresh_exp = generate_refresh_token(user_id)
-                refresh_remaining = int(refresh_exp - time.time())
-                if refresh_remaining > 0:
-                    resp.set_cookie(
-                        refresh_cookie_name(_cookie_port_from_host(request, port)),
-                        refresh_token,
-                        httponly=True,
-                        samesite="Lax",
-                        secure=is_https_request(request),
-                        path=REFRESH_COOKIE_PATH,
-                        max_age=min(refresh_remaining, MAX_REFRESH_TTL_SECS),
-                    )
-                    # Audit the initial-mint event so forensics can trace any
-                    # subsequent chain revocation back to the user it was issued to.
-                    try:
-                        _sel_fn().log_api_access(
-                            caller=user_id,
-                            operation="refresh_token_initial_mint",
-                            outcome="ok",
-                            source="refresh_tokens",
-                            resources=chain_id,
-                        )
-                    except Exception as exc:  # pragma: no cover
-                        # SEL must never block auth flows, but log the failure
-                        # so it's observable.
-                        logger.debug("token_auth: SEL audit failed: %s", exc)
-            except Exception as _refresh_err:
-                # Refresh cookie is best-effort. If something goes wrong
-                # here, the access cookie still works as before — the
-                # user just won't get the refresh upgrade until next mint.
-                logger.warning(
-                    "token_auth: failed to attach refresh cookie (%s); "
-                    "access cookie still set, user can re-mint as before",
-                    _refresh_err,
-                )
 
         _log_auth(request, user_id, "ok", "")
         return resp  # type: ignore[return-value]
 
     middleware._is_token_auth = True  # type: ignore[attr-defined]  # sentinel for server.py security gate
     return middleware
+
+
+def _attach_auth_cookies(
+    resp: web.StreamResponse,
+    request: web.Request,
+    *,
+    cookie_name: str,
+    session_token: str,
+    session_exp: float,
+    user_id: str,
+    port: int,
+) -> None:
+    """Attach the freshly-minted access cookie + paired refresh cookie.
+
+    Shared by the token-URL exchange and the Cloudflare Access auto-login —
+    both mint a brand-new session and must issue identical cookie material.
+    """
+    cookie_max_age = MAX_SESSION_TTL_SECS
+    if session_exp:
+        remaining = int(session_exp - time.time())
+        if 0 < remaining <= MAX_SESSION_TTL_SECS:
+            cookie_max_age = remaining
+    resp.set_cookie(
+        cookie_name,
+        session_token,
+        httponly=True,
+        samesite="Lax",
+        # Secure only when over HTTPS (direct or via a
+        # TLS-terminating tunnel/proxy — see is_https_request).
+        # Localhost plain HTTP must not set it or the browser
+        # refuses to send it back.
+        secure=is_https_request(request),
+        path="/",
+        max_age=cookie_max_age,
+    )
+    # Clean up legacy cookie from pre-port-specific era
+    resp.set_cookie("mc_token", "", max_age=0, path="/")
+
+    # Trim other-port auth cookies from the shared 127.0.0.1 jar so it
+    # can't grow past aiohttp's header limit (see
+    # refresh_tokens.foreign_port_cookies). Gated on jar size so live
+    # co-existing gateways keep their sessions until accumulation
+    # genuinely threatens overflow. This page request only carries
+    # other-port ACCESS cookies (path "/"); other-port refresh cookies
+    # (path "/api/auth") are trimmed on the next refresh call.
+    if cookie_jar_needs_pruning(request.cookies):
+        for _stale_name, _stale_path in foreign_port_cookies(
+            request.cookies, _cookie_port_from_host(request, port)
+        ):
+            resp.set_cookie(_stale_name, "", max_age=0, path=_stale_path)
+
+    # Initial mint via token URL: also attach a refresh cookie so
+    # the user does not have to re-mint via URL every ~20h. Inlined
+    # here (rather than calling handlers.auth_refresh) to keep the
+    # import top-level and the cycle direction one-way:
+    # token_auth → refresh_tokens, never the reverse.
+    try:
+        refresh_token, chain_id, _jti, refresh_exp = generate_refresh_token(user_id)
+        refresh_remaining = int(refresh_exp - time.time())
+        if refresh_remaining > 0:
+            resp.set_cookie(
+                refresh_cookie_name(_cookie_port_from_host(request, port)),
+                refresh_token,
+                httponly=True,
+                samesite="Lax",
+                secure=is_https_request(request),
+                path=REFRESH_COOKIE_PATH,
+                max_age=min(refresh_remaining, MAX_REFRESH_TTL_SECS),
+            )
+            # Audit the initial-mint event so forensics can trace any
+            # subsequent chain revocation back to the user it was issued to.
+            try:
+                _sel_fn().log_api_access(
+                    caller=user_id,
+                    operation="refresh_token_initial_mint",
+                    outcome="ok",
+                    source="refresh_tokens",
+                    resources=chain_id,
+                )
+            except Exception as exc:  # pragma: no cover
+                # SEL must never block auth flows, but log the failure
+                # so it's observable.
+                logger.debug("token_auth: SEL audit failed: %s", exc)
+    except Exception as _refresh_err:
+        # Refresh cookie is best-effort. If something goes wrong
+        # here, the access cookie still works as before — the
+        # user just won't get the refresh upgrade until next mint.
+        logger.warning(
+            "token_auth: failed to attach refresh cookie (%s); "
+            "access cookie still set, user can re-mint as before",
+            _refresh_err,
+        )
 
 
 def _deny(request: web.Request, reason: str) -> web.Response:
