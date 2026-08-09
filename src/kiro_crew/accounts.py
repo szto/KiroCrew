@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from kiro_crew import platform_compat
 
 if TYPE_CHECKING:  # circular import: config.loader -> providers -> accounts
     from kiro_crew.config.loader import KiroCrewConfig
@@ -40,6 +43,14 @@ CREDENTIALS_LEAF = ".credentials.json"
 # holding only ``mcpOAuth`` entries is an MCP-server login, NOT an account login,
 # so presence of the file alone is not a sufficient signal.
 _OAUTH_KEY = "claudeAiOauth"
+
+# macOS keeps the account OAuth grant in the login Keychain under this generic-
+# password service name; ``.credentials.json`` there carries only MCP-server
+# OAuth entries. This holds regardless of ``CLAUDE_CONFIG_DIR``: a custom config
+# dir relocates settings and (on Linux/Windows) credentials, but macOS
+# credentials stay in the one Keychain — see the CLAUDE_CONFIG_DIR entry of
+# Claude Code's environment-variable reference (code.claude.com/docs).
+_KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 # Machine-readable reasons for a non-2xx body. Backend-owned strings have no i18n
 # catalog path, so the code is what the dashboard branches on.
@@ -92,6 +103,30 @@ def _config_dir_for(raw: str) -> Path:
     return Path(raw or DEFAULT_CLAUDE_CONFIG_DIR).expanduser()
 
 
+def _keychain_has_login() -> bool:
+    """Whether the macOS login Keychain holds a Claude Code account grant.
+
+    Existence probe only: ``find-generic-password`` WITHOUT ``-w`` and with all
+    output discarded, so the token bytes never enter this process. ``security``
+    resolves through :func:`platform_compat.trusted_system_bin` (a gateway PATH
+    can lead with agent-writable dirs); an unresolvable binary, a non-zero exit,
+    or a hang all mean "not logged in" — the remedy is the same ``claude login``.
+    """
+    security = platform_compat.trusted_system_bin("security")
+    if security is None:
+        return False
+    try:
+        proc = subprocess.run(
+            [security, "find-generic-password", "-s", _KEYCHAIN_SERVICE],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 def _is_logged_in(config_dir: Path) -> bool:
     """Whether *config_dir* holds an account OAuth grant.
 
@@ -99,13 +134,23 @@ def _is_logged_in(config_dir: Path) -> bool:
     unreadable, or non-JSON file means "not logged in" rather than an error: the
     caller's job is to tell the user to run ``claude login``, not to distinguish
     the ways a credentials file can be absent.
+
+    On macOS the file check alone is a false negative for every logged-in user:
+    the account grant lives in the login Keychain, and ``.credentials.json``
+    holds only MCP-server entries. The Keychain is shared across config dirs, so
+    every profile on a macOS host reports the same login state — truthful, since
+    a session on any profile authenticates from that same Keychain item.
     """
     path = config_dir / CREDENTIALS_LEAF
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
-        return False
-    return isinstance(data, dict) and bool(data.get(_OAUTH_KEY))
+        data = None
+    if isinstance(data, dict) and bool(data.get(_OAUTH_KEY)):
+        return True
+    if platform_compat.IS_MACOS:
+        return _keychain_has_login()
+    return False
 
 
 def resolve_account(cfg: KiroCrewConfig, name: str | None = None) -> ResolvedAccount:

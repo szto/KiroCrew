@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from kiro_crew import accounts
+
+# _keychain_has_login is bound at import time, BEFORE the conftest autouse
+# fixture patches the module attribute — so the probe's own tests below exercise
+# the real function while every other test sees the pinned stub.
 from kiro_crew.accounts import (
     CODE_ACCOUNT_NOT_LOGGED_IN,
     CODE_ACCOUNT_UNKNOWN,
     AccountError,
+    _keychain_has_login,
     list_accounts,
     resolve_account,
 )
@@ -202,3 +209,121 @@ def test_custom_dir_account_sets_config_dir_env(tmp_path):
 def test_not_logged_in_code_is_available_for_callers():
     """The API layer reports this code; keep it exported from one place."""
     assert CODE_ACCOUNT_NOT_LOGGED_IN == "account_not_logged_in"
+
+
+# --- macOS Keychain fallback -------------------------------------------------
+# On macOS `claude login` puts the account grant in the login Keychain, and
+# `.credentials.json` carries only MCP-server entries — so the file check alone
+# is a false negative for every logged-in macOS user. The conftest autouse
+# fixture pins the probe to False; these tests stub the same seam explicitly.
+
+
+def test_macos_keychain_login_counts_without_credentials_file(tmp_path, monkeypatch):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setattr(accounts.platform_compat, "IS_MACOS", True)
+    monkeypatch.setattr(accounts, "_keychain_has_login", lambda: True)
+    cfg = _Cfg(_Agent(account="empty", accounts={"empty": _Acct(str(empty))}))
+
+    assert resolve_account(cfg).logged_in is True
+
+
+def test_macos_keychain_login_counts_over_mcp_only_file(tmp_path, monkeypatch):
+    """An MCP-only file must not mask a real Keychain account grant."""
+    d = tmp_path / "mcp-only"
+    d.mkdir()
+    (d / ".credentials.json").write_text(json.dumps({"mcpOAuth": {"slack": {}}}))
+    monkeypatch.setattr(accounts.platform_compat, "IS_MACOS", True)
+    monkeypatch.setattr(accounts, "_keychain_has_login", lambda: True)
+    cfg = _Cfg(_Agent(account="mcp-only", accounts={"mcp-only": _Acct(str(d))}))
+
+    assert resolve_account(cfg).logged_in is True
+
+
+def test_macos_without_keychain_grant_is_not_logged_in(tmp_path, monkeypatch):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setattr(accounts.platform_compat, "IS_MACOS", True)
+    monkeypatch.setattr(accounts, "_keychain_has_login", lambda: False)
+    cfg = _Cfg(_Agent(account="empty", accounts={"empty": _Acct(str(empty))}))
+
+    assert resolve_account(cfg).logged_in is False
+
+
+def test_non_macos_never_probes_the_keychain(tmp_path, monkeypatch):
+    """Linux/Windows credentials live in the file; a probe there is a bug."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setattr(accounts.platform_compat, "IS_MACOS", False)
+
+    def _boom() -> bool:
+        raise AssertionError("keychain probed on a non-macOS platform")
+
+    monkeypatch.setattr(accounts, "_keychain_has_login", _boom)
+    cfg = _Cfg(_Agent(account="empty", accounts={"empty": _Acct(str(empty))}))
+
+    assert resolve_account(cfg).logged_in is False
+
+
+def test_credentials_file_wins_without_probing_the_keychain(tmp_path, monkeypatch):
+    """A file-based grant (keychain unavailable / migrated layout) short-circuits."""
+    work = tmp_path / "work"
+    _login(work)
+    monkeypatch.setattr(accounts.platform_compat, "IS_MACOS", True)
+
+    def _boom() -> bool:
+        raise AssertionError("keychain probed despite a file grant")
+
+    monkeypatch.setattr(accounts, "_keychain_has_login", _boom)
+    cfg = _Cfg(_Agent(account="work", accounts={"work": _Acct(str(work))}))
+
+    assert resolve_account(cfg).logged_in is True
+
+
+def test_keychain_probe_never_requests_the_secret(monkeypatch):
+    """The probe is an existence check: no ``-w`` (which would print the token to
+    stdout), and both streams discarded so the entry's attributes cannot leak
+    into logs either."""
+    seen: list[tuple[list[str], dict]] = []
+
+    def _fake_run(argv, **kwargs):
+        seen.append((list(argv), kwargs))
+
+        class _Proc:
+            returncode = 0
+
+        return _Proc()
+
+    monkeypatch.setattr(
+        accounts.platform_compat, "trusted_system_bin", lambda name: f"/usr/bin/{name}"
+    )
+    monkeypatch.setattr(accounts.subprocess, "run", _fake_run)
+
+    assert _keychain_has_login() is True
+    ((argv, kwargs),) = seen
+    assert argv[0] == "/usr/bin/security"
+    assert "-w" not in argv
+    assert kwargs["stdout"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.DEVNULL
+
+
+def test_keychain_probe_missing_security_binary_is_not_logged_in(monkeypatch):
+    monkeypatch.setattr(accounts.platform_compat, "trusted_system_bin", lambda name: None)
+
+    assert _keychain_has_login() is False
+
+
+def test_keychain_probe_nonzero_exit_is_not_logged_in(monkeypatch):
+    monkeypatch.setattr(
+        accounts.platform_compat, "trusted_system_bin", lambda name: f"/usr/bin/{name}"
+    )
+
+    def _fake_run(argv, **kwargs):
+        class _Proc:
+            returncode = 44  # errSecItemNotFound
+
+        return _Proc()
+
+    monkeypatch.setattr(accounts.subprocess, "run", _fake_run)
+
+    assert _keychain_has_login() is False

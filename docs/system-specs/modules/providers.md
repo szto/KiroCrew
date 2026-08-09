@@ -144,7 +144,18 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
   the default layout keeps that file at `~/.claude.json`. The caller's `extra_env` is
   merged, never replaced. A resolved-but-not-logged-in account raises `AccountError`
   with `CODE_ACCOUNT_NOT_LOGGED_IN` at session start rather than letting the adapter
-  surface an opaque mid-turn auth failure. `agent.approval_mode` maps onto the
+  surface an opaque mid-turn auth failure. **Login detection is platform-split**
+  (`accounts._is_logged_in`): a `claudeAiOauth` grant in
+  `<config_dir>/.credentials.json` counts everywhere (an `mcpOAuth`-only file is an
+  MCP-server login, not an account login); when the file has no grant, macOS falls
+  back to probing the login Keychain (`security find-generic-password -s
+  "Claude Code-credentials"`, resolved via `platform_compat.trusted_system_bin`) —
+  that is where `claude login` puts the account grant on macOS regardless of
+  `CLAUDE_CONFIG_DIR`, so the file check alone is a false negative for every
+  logged-in macOS user. The probe is existence-only: no `-w`, both streams
+  discarded, so token bytes never enter the gateway process. The Keychain is shared
+  across config dirs, so every macOS profile reports the same login state —
+  truthful, since a session on any profile authenticates from that same item. `agent.approval_mode` maps onto the
   backend's permission mode (`auto` → `CC_PERMISSION_MODE_AUTO`, `interactive` →
   `CC_PERMISSION_MODE_DEFAULT`); either way Kiro Crew's own PreToolUse gate still
   evaluates every call, so the backend's mode is not the security boundary. The model

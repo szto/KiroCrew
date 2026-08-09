@@ -404,6 +404,20 @@ def _reset_reasoning_effort_globals():
         _cp._reasoning_effort_ordered = saved_ordered
 
 
+@pytest.fixture(autouse=True)
+def _no_claude_keychain(monkeypatch):
+    """Pin the macOS Keychain login probe to "absent".
+
+    ``accounts._is_logged_in`` falls back to the host's login Keychain on macOS
+    (that is where ``claude login`` puts the account grant there), so every
+    file-shaped "not logged in" assertion in the suite would flip to True on a
+    developer Mac whose real Claude Code is logged in. Host credential state
+    must not leak into tests; the Keychain-behavior tests in test_accounts.py
+    stub this same seam the other way.
+    """
+    monkeypatch.setattr("kiro_crew.accounts._keychain_has_login", lambda: False)
+
+
 @pytest.fixture(scope="session")
 def _isolation_root(tmp_path_factory):
     """One session-scoped parent for the per-test isolation dirs below.
