@@ -1,9 +1,9 @@
-# KiroCrew gateway + Claude Code backend — derived image.
+# Kiro Crew gateway + Claude Code backend — derived image.
 #
 # The base image (docker/Dockerfile) ships kiro-cli only; sessions on
 # `agent.provider = "claude_code"` additionally spawn the claude-agent-acp
 # adapter, a Node.js program. This stage layers the Node runtime and the
-# adapter on top of an already-built KiroCrew image so the wheel/kiro-cli
+# adapter on top of an already-built Kiro Crew image so the wheel/kiro-cli
 # supply-chain discipline of the base build is inherited, not duplicated.
 #
 #   docker build -f docker/Dockerfile . -t kirocrew:dev            # base first
@@ -53,7 +53,7 @@ RUN set -eux; \
     rm -rf "${GH_TARBALL}" gh_checksums.txt "gh_${GH_VERSION}_linux_${GH_ARCH}"; \
     gh --version
 
-# claude-agent-acp — the ACP adapter KiroCrew's claude_code provider spawns
+# claude-agent-acp — the ACP adapter Kiro Crew's claude_code provider spawns
 # (resolved by name on PATH; global install lands it in /usr/local/bin,
 # outside the volume, so a mounted home can never shadow it — same rationale
 # as kiro-cli in the base image).

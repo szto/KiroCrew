@@ -1,4 +1,4 @@
-# KiroCrew gateway with the Claude Code backend — compose example.
+# Kiro Crew gateway with the Claude Code backend — compose example.
 #
 # Build (from the repo root; the base image consumes the CI/`make wheel`
 # artifact in dist/, see docker/Dockerfile):
