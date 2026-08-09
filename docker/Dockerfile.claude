@@ -1,0 +1,45 @@
+# KiroCrew gateway + Claude Code backend — derived image.
+#
+# The base image (docker/Dockerfile) ships kiro-cli only; sessions on
+# `agent.provider = "claude_code"` additionally spawn the claude-agent-acp
+# adapter, a Node.js program. This stage layers the Node runtime and the
+# adapter on top of an already-built KiroCrew image so the wheel/kiro-cli
+# supply-chain discipline of the base build is inherited, not duplicated.
+#
+#   docker build -f docker/Dockerfile . -t kirocrew:dev            # base first
+#   docker build -f docker/Dockerfile.claude --build-arg BASE_IMAGE=kirocrew:dev \
+#       . -t kirocrew-claude:dev
+#
+# Login (one-time, inside the container — Linux keeps the account OAuth in
+# $HOME/.claude/.credentials.json on the mounted volume, so it survives
+# container replacement):
+#   docker compose -f docker/compose.claude.yaml exec kirocrew claude /login
+
+ARG BASE_IMAGE=kirocrew:dev
+FROM ${BASE_IMAGE}
+
+USER root
+
+# Node.js from Debian's own archive (trixie ships >= 20, the adapter's floor):
+# no third-party apt source, so the image's input surface stays what Debian
+# signs plus the two npm packages below.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
+# claude-agent-acp — the ACP adapter KiroCrew's claude_code provider spawns
+# (resolved by name on PATH; global install lands it in /usr/local/bin,
+# outside the volume, so a mounted home can never shadow it — same rationale
+# as kiro-cli in the base image).
+# @anthropic-ai/claude-code — the `claude` CLI, present for the one-time
+# headless `/login` flow that writes the account OAuth grant the adapter
+# authenticates with; the gateway itself never invokes it.
+RUN npm install -g --omit=dev \
+        @agentclientprotocol/claude-agent-acp \
+        @anthropic-ai/claude-code \
+    && npm cache clean --force \
+    && claude-agent-acp --version \
+    && claude --version
+
+USER kirocrew
+WORKDIR /home/kirocrew
