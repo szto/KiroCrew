@@ -3037,6 +3037,12 @@ async def start_dashboard(
     # I/O (or Windows icacls subprocess) lands on the loop on the first auth op.
     await warm_auth_singletons()
 
+    # Cloudflare Access trust (dashboard entrypoint only — the headless
+    # --slack-only server has no browser UI, so Access auto-login does not
+    # apply there). Config load is a stat + cached read; offload anyway to
+    # keep the no-blocking-call-on-event-loop rule uniform.
+    _cf_access_cfg = (await asyncio.to_thread(KiroCrewConfig.load)).dashboard.cf_access
+
     # Explicit middleware ordering — self-documenting and immune to future insertions
     app.middlewares[:] = [
         # Outermost: privacy-safe per-route latency (rec #1). Times the FULL
@@ -3055,6 +3061,8 @@ async def start_dashboard(
             port=port,
             local_only=local_only,
             spa_shell_handler=handlers.index,
+            cf_access_team_domain=_cf_access_cfg.team_domain,
+            cf_access_aud=_cf_access_cfg.aud,
         ),
         sel_audit_middleware,
         spa_fallback,

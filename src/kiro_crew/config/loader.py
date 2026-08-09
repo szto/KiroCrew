@@ -1851,6 +1851,32 @@ class TailscaleConfig:
 
 
 @dataclass
+class CfAccessConfig:
+    """Cloudflare Access trust for dashboard auto-login (JWT verification)."""
+
+    team_domain: str = field(
+        default="",
+        metadata=_meta(
+            "Cloudflare Access Team Domain",
+            "Your Zero Trust team domain (e.g. `myteam.cloudflareaccess.com`). "
+            "With the AUD tag also set, a request whose `Cf-Access-Jwt-Assertion` "
+            "header verifies against this domain's signing keys is signed in "
+            "automatically as the JWT's email — no token URL needed. Empty "
+            "disables the feature.",
+        ),
+    )
+    aud: str = field(
+        default="",
+        metadata=_meta(
+            "Cloudflare Access Application AUD",
+            "The Access application's Audience (AUD) tag, from the Zero Trust "
+            "dashboard. Required alongside the team domain; it pins assertions "
+            "to this specific Access application.",
+        ),
+    )
+
+
+@dataclass
 class DashboardConfig:
     url: str = field(
         default="",
@@ -1864,6 +1890,14 @@ class DashboardConfig:
         metadata=_meta(
             "Tailscale",
             "Reach the dashboard over your tailnet via `tailscale serve`.",
+        ),
+    )
+    cf_access: CfAccessConfig = field(
+        default_factory=CfAccessConfig,
+        metadata=_meta(
+            "Cloudflare Access",
+            "Auto-login for requests that passed a Cloudflare Access policy "
+            "(verified via the signed `Cf-Access-Jwt-Assertion` header).",
         ),
     )
     restore_sessions: bool = field(
@@ -4933,6 +4967,12 @@ class KiroCrewConfig:
                     enabled=_safe_bool(
                         _safe_dict(dashboard_data.get("tailscale")).get("enabled"), False
                     ),
+                ),
+                cf_access=CfAccessConfig(
+                    team_domain=str(
+                        _safe_dict(dashboard_data.get("cf_access")).get("team_domain", "")
+                    ),
+                    aud=str(_safe_dict(dashboard_data.get("cf_access")).get("aud", "")),
                 ),
                 restore_sessions=dashboard_data.get("restore_sessions", False),
                 restore_window_minutes=dashboard_data.get("restore_window_minutes", 30),

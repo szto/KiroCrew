@@ -4,6 +4,12 @@
 
 Slack-gated token authentication for the KiroCrew dashboard. The owner generates a time-limited, HMAC-SHA256 signed URL via the `!dashboard` Slack command. An aiohttp middleware validates the token on every request (query param or cookie fallback), sets a session cookie on first use, and pins the token to the client's IP. Static assets bypass checks. Loopback access (127.0.0.1) is always trusted regardless of mode — this ensures local processes (mcp-core, doctor, SSH tunnels) work without tokens. All generation and validation events are logged to SEL.
 
+Deployments fronted by a Cloudflare Access application can additionally enable
+**Cloudflare Access trust** (see *Cloudflare Access auto-login* below): a request
+carrying a `Cf-Access-Jwt-Assertion` header that verifies against the operator's
+team-domain signing keys is authenticated as the JWT's `email` and minted the
+normal access + refresh cookies, with no token-URL step.
+
 Up to `MAX_CONCURRENT_NONCES` (50) link nonces can be valid concurrently (FIFO eviction via `OrderedDict` when the limit is exceeded), allowing multiple browser tabs and CLI sessions without invalidating each other. All in-memory link-session state is managed by a thread-safe `TokenStateManager`. Auth is **not** purely in-memory: the HMAC signing key is the **persistent** `token_signing.key` (mode `0600`) and revoked access-cookie nonces persist to `token_revoked_nonces.json` (mode `0600`), so signed cookies and per-session logouts both survive a gateway restart. Users can revoke a single session — access cookie **and** its refresh chain — via `POST /api/auth/logout`, or all **access** sessions via `kirocrew logout`. Note that `kirocrew logout` does not revoke refresh chains, so a browser holding a valid refresh cookie can still mint a new access cookie.
 
 The dashboard also issues a paired **refresh cookie** (`mc_refresh_{port}`, HttpOnly, path-restricted to `/api/auth`, up to 30-day TTL) alongside the access cookie on initial token-URL use. The SPA calls `POST /api/auth/refresh` shortly before the access cookie expires to silently rotate both cookies (rotation-on-use), so users only re-run `!dashboard` / `kirocrew token` roughly once per 30 idle days instead of every ~20h. Refresh tokens are HMAC-signed with the same persistent `token_signing.key` and enforce RFC 6819 §5.2.2.3 reuse detection: a consumed `jti` replayed outside a 60s same-IP multi-tab grace window auto-revokes the entire chain.
@@ -265,6 +271,68 @@ An **app token** (payload carries a non-empty `app` claim, minted by the `X-App-
 - It is enforced in **every** middleware branch that admits a token (the normal cookie/query-param flow and the cross-app `/apps/<other>/api` reverse-proxy re-check) — otherwise an app token could reach a mixed internal path (e.g. `/api/chat`, `/api/spawn`) with no app identity set and be mistaken for the dashboard user (privilege escalation).
 - It is a **no-op for dashboard-user tokens** (empty `app` claim), which bypass the gate entirely.
 
+### 1b. `cf_access.py` — Cloudflare Access auto-login
+
+Location: `src/kiro_crew/dashboard/cf_access.py`
+
+Opt-in trust for deployments where the dashboard sits behind a Cloudflare
+Access application (e.g. a Cloudflare Tunnel with a Zero Trust policy).
+Cloudflare attaches an RS256-signed JWT (`Cf-Access-Jwt-Assertion`) to every
+request that passed the Access login; verifying that signature against the
+team domain's published JWKS (`https://<team>/cdn-cgi/access/certs`) proves
+the request went through Access. A client that reaches the gateway directly
+(LAN, port-forward, spoofed header) cannot forge it.
+
+```python
+CF_ACCESS_HEADER = "Cf-Access-Jwt-Assertion"
+
+def normalize_team_domain(team_domain: str) -> str: ...
+    # Accepts bare host, https:// prefix, trailing slash; lowercases.
+
+async def validate_cf_access_jwt(assertion, team_domain, aud) -> tuple[bool, str, str]: ...
+    # Returns (valid, email, reason). Checks structure, RS256 pin, signature
+    # against the team JWKS, iss == https://<team>, aud contains the configured
+    # AUD tag, exp/nbf (60s leeway), then requires a non-empty `email` claim.
+```
+
+Design points:
+
+- **Server-side algorithm pin.** The attacker-controlled `alg` header never
+  selects the verify method — anything but `RS256` is rejected outright
+  (alg-confusion defense).
+- **No new dependency.** Verification is RSASSA-PKCS1-v1_5 over SHA-256
+  implemented directly on the JWKS `n`/`e` integers (RFC 8017 §8.2.2) —
+  public-key math on public inputs, so no `cryptography` package is needed.
+- **JWKS caching.** Keys cache for 1h; an unknown `kid` (possible key
+  rotation) triggers a refetch, rate-limited to one attempt per 60s so a
+  flood of garbage assertions cannot become an outbound request amplifier.
+  A certs-endpoint outage degrades to the cached keys, never raises into
+  the middleware.
+- **Identity logins only.** Access *service tokens* carry no `email` claim and
+  are rejected — the JWT's verified `email` becomes the dashboard `user_id`.
+
+**Middleware integration** (`token_auth_middleware(cf_access_team_domain=…,
+cf_access_aud=…)`, wired by `start_dashboard()` from `dashboard.cf_access`;
+the headless `start_api_server()` deliberately does not enable it — there is
+no browser UI on that entrypoint): both the *no token* and *invalid token*
+branches try the assertion **before** the SPA-shell/deny handling. On success
+the request is served authenticated and the response is minted the standard
+access + refresh cookie pair via the shared `_attach_auth_cookies()` (the same
+attach path as the token-URL exchange, so cookie attributes and the
+refresh-chain SEL audit cannot drift), and the session token is IP-bound like
+any token-URL session. On failure the request proceeds exactly as if the
+header were absent (shell for GET/HEAD navigations, 403 otherwise) — a bad
+assertion never widens or narrows the existing auth surface. The *invalid
+token* hook is what lets a CF-fronted browser with a lapsed session re-mint
+transparently instead of hitting the session-expired banner.
+
+The feature is enabled only when **both** `dashboard.cf_access.team_domain`
+and `dashboard.cf_access.aud` are set; the AUD check pins assertions to the
+specific Access application, so a JWT minted for another app on the same team
+domain does not authenticate. The effective allowlist of who can log in is
+the Cloudflare Access policy itself — anyone the policy admits gets a
+dashboard session as their verified email.
+
 ### 2. `origin.py` — Dashboard URL & Bind Address Resolution
 
 Location: `src/kiro_crew/dashboard/origin.py`
@@ -413,10 +481,17 @@ Single `dashboard.url` field on `KiroCrewConfig` (default: `""`), loaded from `c
 ```json
 {
   "dashboard": {
-    "url": "http://my-host.example.com:8080"
+    "url": "http://my-host.example.com:8080",
+    "cf_access": {
+      "team_domain": "myteam.cloudflareaccess.com",
+      "aud": "<Access application AUD tag>"
+    }
   }
 }
 ```
+
+`dashboard.cf_access` (both fields required, empty = disabled) enables
+Cloudflare Access auto-login — see *Cloudflare Access auto-login* above.
 
 `is_local_only()` determines the bind address and CSRF origins (not token auth):
 - No Slack → local-only (bind 127.0.0.1, no remote access)
@@ -470,6 +545,8 @@ HTML 403 page includes instructions to run `!dashboard` in Slack. The middleware
 | Request accepted | `dashboard.token_auth` | `ok` | request path |
 | Request denied | `dashboard.token_auth` | `denied` | rejection reason |
 | SPA shell served on cold-start nav | `dashboard.token_auth` | `shell_unauth` (no token) / `shell_unauth_invalid_token` (expired/forged token) | request path. **These replace `denied`/403 for non-API `GET`/`HEAD` navigations** — any volume-based scanning/brute-force alert keyed on `denied` or 403 counts for nav paths MUST also watch these two outcomes, or credential-less probing of a remote-exposed dashboard goes invisible. A forged token on a nav serves the secret-free shell but keeps the distinct `shell_unauth_invalid_token` signal (not `ok`). |
+| Cloudflare Access auto-login | `dashboard.token_auth` | `ok` (error field `cf_access`) | request path. Marks a session minted from a verified `Cf-Access-Jwt-Assertion` rather than a token URL. |
+| Cloudflare Access assertion rejected | `dashboard.token_auth` | `cf_denied` | rejection reason (bad signature / audience mismatch / expired / …). The request then falls through to the normal no-token handling, which emits its own `shell_unauth`/`denied` event — volume alerts on forged-assertion probing should key on `cf_denied`. |
 
 ## Security Properties
 
@@ -484,4 +561,10 @@ HTML 403 page includes instructions to run `!dashboard` in Slack. The middleware
 9. Bounded concurrent nonces (max 50; raised from 5 so pending Slack link nonces aren't evicted by other token-minting activity) — prevents unbounded memory growth, limits exposure window; an active session refreshes its eviction position on each check
 10. Explicit revocation via `kirocrew logout` — clears all nonces, IP bindings, and consumed tokens
 11. App-token scope confinement (CWE-269) — an `app`-claim token is confined deny-by-default to its own namespace (`/apps/<name>`, `/api/apps/<name>`) + its manifest `permissions.api` allowlist, enforced at every grant point; no-op for dashboard-user tokens
-12. Headless (`--slack-only`) auth parity — `start_api_server()` serves the same MCP route surface as the dashboard and mounts the same `host_validation → csrf → token_auth → sel_audit` chain against the shared `_STRICT_INTERNAL_API_PATHS`/`_MIXED_INTERNAL_API_PATHS` sets. Internal MCP routes require loopback **plus** `X-Internal-Secret` (loopback alone is not sufficient for these paths — port forwarders can spoof `127.0.0.1`); `sel_audit_middleware` alone only logs and is never a substitute for the token-auth chain
+12. Cloudflare Access trust is opt-in and signature-verified — enabled only when
+    `dashboard.cf_access.team_domain` **and** `.aud` are both set; assertions are
+    verified against the team domain's JWKS with a server-side RS256 pin and an
+    AUD check pinning them to the specific Access application, so a spoofed
+    header from a client that bypassed Cloudflare never authenticates, and a
+    failed assertion falls through to the unchanged deny/shell handling
+13. Headless (`--slack-only`) auth parity — `start_api_server()` serves the same MCP route surface as the dashboard and mounts the same `host_validation → csrf → token_auth → sel_audit` chain against the shared `_STRICT_INTERNAL_API_PATHS`/`_MIXED_INTERNAL_API_PATHS` sets. Internal MCP routes require loopback **plus** `X-Internal-Secret` (loopback alone is not sufficient for these paths — port forwarders can spoof `127.0.0.1`); `sel_audit_middleware` alone only logs and is never a substitute for the token-auth chain
