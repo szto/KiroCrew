@@ -5960,6 +5960,12 @@
       "select": "选择",
       "workspace_name": "工作区名称",
       "workspace_name_2": "workspace-name"
+    },
+    "accountDropdown": {
+      "account_aria": "账户：{{name}}",
+      "locked_tooltip": "开始新会话以切换账户",
+      "needs_login_tooltip": "请先为此账户运行 claude login",
+      "switch_tooltip": "切换账户"
     }
   },
   "hooks": {
@@ -7896,7 +7902,9 @@
         "shared": "共享",
         "summary": "摘要",
         "tag1_tag2_tag3": "标签 1, 标签 2, 标签 3",
-        "unarchive": "取消归档"
+        "unarchive": "取消归档",
+        "rendered": "渲染",
+        "source": "源码"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} 已嵌入 ({{pct}}%)",
@@ -8065,7 +8073,11 @@
         "use_sync_button_to_update": "使用“同步”按钮更新",
         "watch_anyway": "仍然监视",
         "watches_folder_recursively_supported_files_auto": "递归监视文件夹。支持的文件会自动导入。每个来源最多 5,000 个文件。",
-        "watching_folder": "正在监视文件夹"
+        "watching_folder": "正在监视文件夹",
+        "rebuild_graph": "重建图谱",
+        "rebuild_entity_graph": "重建实体图谱",
+        "re_extract_entities_from_the_items_already_store": "从已存储的条目重新提取实体，不会重新读取来源。",
+        "rebuild_failed": "重建失败"
       }
     },
     "localStorageDebug": {
@@ -8294,7 +8306,8 @@
         "using_legacy_mode_agent_default_agent_as_agent_t": "使用旧版模式 — 以 agent.default_agent 作为代理模板",
         "warm_pool": "预热池",
         "workspace": "工作区",
-        "workspaces": "工作区"
+        "workspaces": "工作区",
+        "backend_for_new_sessions_switching_clears_slot_m": "新会话使用的后端。切换会清除会话槽的模型。"
       },
       "mcpTab": {
         "actions": "操作",
@@ -9446,7 +9459,13 @@
         "which_model_new_sessions_start_with_pick_a_model": "代理未指定模型时，新会话默认使用的模型。可在“代理能力 → Crew”中为每个代理单独设置模型，或在会话内选择模型以就地覆盖。",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "将子代理的完成事件注入父会话时，保留其输出流的哪一部分。头部保留开头（默认，与旧行为一致）。尾部保留最终摘要。两端则各保留一段，中间加分隔标记。",
         "widget_density": "小组件密度",
-        "your_role": "你的角色"
+        "your_role": "你的角色",
+        "provider": "提供方",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "新会话运行所使用的后端。",
+        "switching_provider_affects_new_sessions_only_run": "仅对新会话生效。请登录所选的 CLI：kiro login 或 claude login。",
+        "failed_to_save_provider": "保存提供方失败"
       },
       "computerUsePanel": {
         "accessibility": "辅助功能",

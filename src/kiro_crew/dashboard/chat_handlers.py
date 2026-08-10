@@ -20,6 +20,11 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew import model_registry
+from kiro_crew.accounts import (
+    CODE_ACCOUNT_NOT_LOGGED_IN,
+    CODE_ACCOUNT_UNKNOWN,
+    list_accounts,
+)
 from kiro_crew.acp.client import AcpModelUnavailable
 from kiro_crew.config.loader import (
     KiroCrewConfig,
@@ -2448,6 +2453,61 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
             "failed": failed,
         }
     )
+
+
+async def api_chat_slot_account(request: web.Request) -> web.Response:
+    """POST /api/chat/slots/{slot}/account — pick the Claude account profile.
+
+    Body: ``{"account": "<declared profile name>"}``. Applies to the slot's NEXT
+    session, never the running one: the account is a ``CLAUDE_CONFIG_DIR`` handed to
+    the backend process at spawn, so there is deliberately no live apply and no
+    session reset here. Switching account means starting a new session, and the
+    dashboard locks its picker once a slot has one.
+
+    A profile that exists but has no Claude login is refused, so the failure lands
+    here — where the remedy (``claude login`` for that profile) can be named —
+    rather than as an opaque adapter auth error on the next turn.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_unknown"}, status=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    account = body.get("account", "")
+    if not isinstance(account, str):
+        return web.json_response(
+            {"error": "account must be a string", "code": CODE_ACCOUNT_UNKNOWN}, status=400
+        )
+    cfg = KiroCrewConfig.load()
+    if account:
+        declared = {a.name: a for a in list_accounts(cfg)}
+        resolved = declared.get(account)
+        if resolved is None:
+            return web.json_response(
+                {
+                    "error": f"no account profile named {account!r}",
+                    "code": CODE_ACCOUNT_UNKNOWN,
+                },
+                status=400,
+            )
+        if not resolved.logged_in:
+            return web.json_response(
+                {
+                    "error": f"account {account!r} has no Claude login",
+                    "code": CODE_ACCOUNT_NOT_LOGGED_IN,
+                },
+                status=400,
+            )
+    slot.account = account
+    logger.info("Slot %s account switched to %r", name, account or "config default")
+    # The dropdown renders the slot's account from the slots stream, so every
+    # open dashboard has to see the switch, not just the one that posted it.
+    state.push_slots_update()
+    return web.json_response({"ok": True, "account": account})
 
 
 async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:

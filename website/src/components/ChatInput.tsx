@@ -56,6 +56,7 @@ const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp,image/
 const FILE_ACCEPT = IMAGE_ACCEPT + ',.txt,.md,.json,.yaml,.yml,.xml,.csv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
 import ApprovalModePicker from './ApprovalModePicker'
+import AccountDropdown from './AccountDropdown'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
 // Re-exported here for back-compat with existing `from './ChatInput'` imports.
 export {
@@ -596,6 +597,19 @@ function ChatInput({
   const dispatch = useAppDispatch()
   const slotId = useSlotId()
   const pendingApproval = useAppSelector(s => selectSlotPendingApproval(s, slotId), shallowEqual)
+  // The account is fixed when the session spawns, so the picker locks as soon as the
+  // slot HAS a session. A slot with messages (or one mid-turn) has one; a fresh or
+  // reset slot does not. Selects a boolean so the subscription stays referentially
+  // stable across unrelated slot updates.
+  const accountLocked = useAppSelector(s => {
+    const sl = s.dashboard.slots.find(x => x.key === slotId)
+    return Boolean(sl && ((sl.messages ?? 0) > 0 || sl.running))
+  })
+  // The slot's own pick, pushed back over the slots stream after a switch. The
+  // dropdown needs it because /api/accounts only knows the config-level default.
+  const slotAccount = useAppSelector(
+    s => s.dashboard.slots.find(x => x.key === slotId)?.account ?? ''
+  )
   const hasApproval = !!pendingApproval
   const [approvalSubmitting, setApprovalSubmitting] = useState(false)
   // Non-null while the last approval decision failed. Rendered as a one-line
@@ -2896,6 +2910,18 @@ function ChatInput({
           )}
           {approvalMode && (
             <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} compact={isMobile || shelfCompact} />
+          )}
+          {/* Account picker sits with the other session-scoped controls; the
+              account locks once the slot has a session, so it lives beside the
+              pickers that share that lifecycle. Desktop-only: it has no compact
+              form and the mobile shelf has no room for it. */}
+          {!isMobile && (
+            <AccountDropdown
+              slot={activeSlot || ''}
+              selected={slotAccount}
+              disabled={accountLocked}
+              onSelect={name => { api.chatSlotAccount(activeSlot || '', name).catch(() => {}) }}
+            />
           )}
           </div>
         </div>

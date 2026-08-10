@@ -118,8 +118,113 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 }
 ```
 
-- `agent.provider` is fixed to `"acp"` (enum `["acp"]`); there is no provider to choose.
-- `create_provider_factory()` returns a `Callable` that creates the kiro-cli `AcpProvider`.
+- `agent.provider` selects the backend (enum `["acp", "claude_code"]`). `acp` drives
+  kiro-cli; `claude_code` drives claude-agent-acp through the SAME `AcpProvider` with
+  `acp_backend=ACP_BACKEND_CLAUDE` — a second backend behind one transport, not a
+  second transport. The enum is mirrored by `handlers/core._EDITABLE_CONFIG`, the
+  allowlist `PATCH /api/config/kirocrew` validates against; both are written in terms
+  of the `PROVIDER_*` constants because a schema that accepts a value the dashboard
+  allowlist rejects reads to the user as a broken settings control.
+- **Switching provider is a dashboard control**, on Settings → Chat → Model and in the
+  Overview config summary. The PATCH handler's `agent.provider` branch rebuilds the
+  agent artifacts, calls `SessionManager.reload_provider_factory()`, and **clears every
+  slot's `model`** — model aliases are provider-specific, so a kiro id left on a slot
+  would reach the claude backend unresolved. Live sessions keep the provider they
+  started on; the switch applies to new ones.
+- `create_provider_factory()` returns a `Callable`: the kiro-cli `AcpProvider` factory
+  by default, or `providers.claude_code_factory.build_claude_code_factory(self)` when
+  the provider is `claude_code`.
+- **The claude_code factory turns an account profile into one env var.** It resolves
+  the profile (`accounts.resolve_account`, with the per-session `account` kwarg
+  outranking `agent.account`) and injects `CLAUDE_CONFIG_DIR` from
+  `ResolvedAccount.config_dir_env`. That property is `None` for an account on Claude
+  Code's own default directory, and the factory then omits the variable entirely —
+  setting it to the default directory is NOT equivalent to leaving it unset, because
+  Claude Code would read its state file from `$CLAUDE_CONFIG_DIR/.claude.json` while
+  the default layout keeps that file at `~/.claude.json`. The caller's `extra_env` is
+  merged, never replaced. A resolved-but-not-logged-in account raises `AccountError`
+  with `CODE_ACCOUNT_NOT_LOGGED_IN` at session start rather than letting the adapter
+  surface an opaque mid-turn auth failure. **Login detection is platform-split**
+  (`accounts._is_logged_in`): a `claudeAiOauth` grant in
+  `<config_dir>/.credentials.json` counts everywhere (an `mcpOAuth`-only file is an
+  MCP-server login, not an account login); when the file has no grant, macOS falls
+  back to probing the login Keychain (`security find-generic-password -s
+  "Claude Code-credentials"`, resolved via `platform_compat.trusted_system_bin`) —
+  that is where `claude login` puts the account grant on macOS regardless of
+  `CLAUDE_CONFIG_DIR`, so the file check alone is a false negative for every
+  logged-in macOS user. The probe is existence-only: no `-w`, both streams
+  discarded, so token bytes never enter the gateway process. The Keychain is shared
+  across config dirs, so every macOS profile reports the same login state —
+  truthful, since a session on any profile authenticates from that same item. `agent.approval_mode` maps onto the
+  backend's permission mode (`auto` → `CC_PERMISSION_MODE_AUTO`, `interactive` →
+  `CC_PERMISSION_MODE_DEFAULT`); either way Kiro Crew's own PreToolUse gate still
+  evaluates every call, so the backend's mode is not the security boundary. The model
+  goes through `model_registry.to_provider_id(model, "claude_code")` so a canonical
+  registry key never reaches the backend unresolved.
+- **`GET /api/accounts`** (`dashboard/handlers/accounts.py`) returns
+  `{"provider", "active", "accounts": [{"name", "logged_in"}]}` in declaration order.
+  It is read-only and name-only by design: authenticating an account is a
+  `claude login` in a terminal, so there is no POST counterpart, and the body carries
+  **no config dir and no credential bytes** — the dropdown only needs a name and
+  whether a session can start. An `agent.account` that does not resolve degrades
+  `active` to `""` while still listing the rows, because a user who cannot see the
+  profiles cannot pick a working one.
+- **`POST /api/chat/slots/{slot}/account`** (`dashboard/chat_handlers.py`) picks the
+  profile for that slot's **next** session. Body `{"account": "<name>"}`; `""` returns
+  to the config's own choice. Unlike `reasoning_effort` there is deliberately no live
+  apply and no session reset: the account is a `CLAUDE_CONFIG_DIR` handed to the
+  backend process at spawn, so a running session keeps the account it started on and
+  the dashboard dropdown locks once the slot has one. A name no profile declares is a
+  400 with `code=account_unknown`; a declared profile with no Claude login is a 400
+  with `code=account_not_logged_in` — refused here, where the remedy (`claude login`
+  for that profile) can be named, not as an opaque adapter auth error mid-turn. The
+  pick lands on `slot.account`, is serialized into the slots stream (a successful
+  switch pushes a slots update so every open dashboard sees it), and reaches the
+  factory's `account` kwarg through `SessionManager.get_or_create`'s
+  `**extra_factory_kwargs` — the kiro-cli factory ignores it, so `chat_runner` threads
+  it unconditionally.
+- **`GET /api/models` is provider-dispatched** (`dashboard/handlers/agents.py`). On
+  `claude_code` it answers from `_cc_models()` and returns **before** the kiro
+  readiness gate and the `kiro chat --list-models` spawn: both gate on kiro login
+  state, which a claude_code gateway neither has nor needs, so falling through
+  would 503 a healthy dashboard (or pop a kiro-cli browser login) on every poll.
+  Rows carry `context_window`; the kiro branch's rows carry
+  `context_window_tokens` — the frontend ACP adapter reads both.
+- **The backend is the single source of truth for the claude_code model list.**
+  claude-agent-acp sends **no** `models.availableModels` payload; it advertises its
+  vocabulary as the `configOptions` entry with `id="model"`, the same channel the
+  effort selector uses. `AcpClient.available_models()` therefore falls back to that
+  option, and `model_registry` supplies no ids on this path at all. The values
+  (`default`, `opus`, `opus[1m]`, `sonnet`, `haiku`, `claude-fable-5[1m]`) are used
+  **verbatim** end to end — they are what `session/set_config_option("model", …)`
+  accepts, and they are versionless, so `opus` tracks whatever Opus is current. The
+  registry's aliases pin the same words to whichever model was current when the row
+  was authored, so folding through `from_provider_id` would both rename the live
+  Opus to `opus-4.8-1m` and then hand the backend an id it rejects. The backend's
+  own `default` choice folds onto `auto`, which already means "let the backend pick".
+- **A cold gateway probes rather than guessing.** The vocabulary is only reported at
+  `session/new`, so with no live session `claude_code_factory.probe_available_models`
+  runs one throwaway `initialize` + `session/new` handshake (no MCP servers, no
+  agent config, not registered with the SessionManager) and caches the answer per
+  account config dir for `_MODEL_PROBE_TTL_SECS`. The cache is what keeps the
+  dashboard's 8s degraded-list poll from spawning an adapter per poll. Any failure —
+  adapter missing, profile signed out, timeout — returns `[]`, and the static
+  registry is shown, which is the pre-existing degraded path.
+- A stored model that is a registry canonical key (`opus-4.8-1m`, written before the
+  dropdown served backend ids) is degraded to `""` by `_backend_model_id` instead of
+  being sent: the registry cannot say which live model it meant, and booting on the
+  backend default is recoverable where a rejected id is a failed session.
+- **`resolve_effective_model` skips its last tier on `claude_code`.** That tier reads
+  the installed `~/.kiro/agents/kirocrew.json`, a kiro-cli artifact whose `model` is a
+  kiro id by construction — and it lives **outside `KIROCREW_HOME`**, so even an
+  isolated instance reads the real one. On this provider it is a category error: the
+  backend rejects the session, and the failure surfaces far from its cause (a task
+  runner reporting `Could not generate a plan. Try rephrasing.` while the log carries
+  `The model 'claude-opus-4.8' is not available`). `agent.model = "auto"` therefore
+  resolves to `""` — let the backend pick — rather than to whatever kiro pinned.
+  Filtering by registry membership instead would NOT work: `opus` and `sonnet` are
+  registry aliases *and* real backend values, so dropping "ids the registry knows"
+  breaks the two most common picks. The cut has to be by provider.
 
 ### MCP Server Registration
 

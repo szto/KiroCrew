@@ -86,6 +86,13 @@ export default function DesignCritiquePage() {
   const [elapsed, setElapsed] = useState(0)
   const [writing, setWriting] = useState(false)
   const [pendingKind, setPendingKind] = useState<string | null>(null)
+  // Directory the gateway stored uploads in, learned from the absolute paths
+  // /api/upload/file returns. Handed to the scan/critique prompts as <UPLOADS>
+  // so the agent never has to resolve it — the command that used to do that is
+  // denied (inline Python importing kiro_crew reaches the token-minting CLI).
+  // Empty until an upload happens; the prompts then fall back to the session's
+  // own working directory, which is already per-run isolated.
+  const [uploadsDir, setUploadsDir] = useState('')
 
   const reduceMotion = useReduceMotion()
   const { toasts, notify } = useToasts()
@@ -338,6 +345,8 @@ export default function DesignCritiquePage() {
     try {
       const { paths } = await designCritiqueApi.uploadFiles(files)
       if (!paths || !paths.length) throw new Error('no file paths returned')
+      // Same directory for every file in one upload, so the first is enough.
+      setUploadsDir(paths[0].replace(/[/\\][^/\\]*$/, ''))
       const uploaded = paths.map((p, i) => ({ step: i + 1, label: 'Screen ' + (i + 1), url: fileUrl(p) }))
       // If `+ New` ran while this upload was in flight, a later run owns the
       // screen: keep critiquing in the background rather than stealing it back.
@@ -366,7 +375,7 @@ export default function DesignCritiquePage() {
       slotKey = await openSlot()
       activeSlotRef.current = slotKey; setSlot(slotKey)
       saveJob({ stage: 'scanning', slotKey, kind: det.kind, value: det.value, ts: Date.now() })
-      await send(slotKey, DISCOVER_PROMPT(det.kind, det.value))
+      await send(slotKey, DISCOVER_PROMPT(det.kind, det.value, uploadsDir))
       const info = await pollForReport<DiscoveryInfo>(slotKey)
       const list = Array.isArray(info.screens) ? info.screens.filter(s => s && s.id) : []
       if (info.blocked && info.blocked.reason) {
@@ -411,7 +420,7 @@ export default function DesignCritiquePage() {
     activeSlotRef.current = slot
     try {
       saveJob({ stage: 'analyzing', slotKey: slot, screens: [], ts: Date.now() })
-      await send(slot, SCOPED_PROMPT(picks, refBrief))
+      await send(slot, SCOPED_PROMPT(picks, refBrief, uploadsDir))
       const rep = await pollForReport<Report>(slot)
       finishReport(slot, [], rep)
       setSlot('')

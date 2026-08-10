@@ -74,10 +74,16 @@ This repo is the de-Amazoned public fork of an internal package. Never re-add:
 - **Keep these stubbed** (public symbols preserved as no-ops so the import graph
   holds): `sso_status.py`, `browser/auth.py`, `dashboard/handlers/sso_login.py`,
   `tunnel/manager.py`, `aim_agents.py`.
-- **Other providers.** Kiro Crew is KiroACP-only: `agent.provider` is fixed to
-  `acp` and kiro-cli is REQUIRED. Keep the dormant `ACP_BACKEND_CLAUDE` /
-  `_is_claude` seam in `acp/client.py` so an internal companion can re-register
-  Claude Code; do NOT re-add the public registration glue.
+- **Other providers.** Upstream Kiro Crew is KiroACP-only. **This fork deliberately
+  diverges:** `agent.provider` also accepts `claude_code`, which drives
+  claude-agent-acp through the `ACP_BACKEND_CLAUDE` seam, with named account
+  profiles bound to `CLAUDE_CONFIG_DIR`. The logic lives in
+  `providers/claude_code_factory.py` + `accounts.py`; the core edits are the
+  provider enum and factory dispatch in `config/loader.py`, two credential leaves
+  in `security.py`, and the dashboard account routes. An upstream sync must
+  re-apply those hunks rather than reverting them. Design:
+  [claude-code-accounts](docs/task-specs/2026/08/claude-code-accounts/design.md).
+  Keep the dormant `_is_claude` seam intact; do NOT add a third provider.
 - **OSS-flipped defaults:** always-on in-process embeddings, Piper TTS by default,
   a default-open Slack enterprise gate, lazy STT extras.
 - **Fork UX divergences:** the Channels app is hidden from the App Store and the

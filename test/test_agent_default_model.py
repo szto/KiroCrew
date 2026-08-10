@@ -48,7 +48,7 @@ def _load_from_dict(data: object) -> KiroCrewConfig:
 
 
 class TestNormalizeAgentModel:
-    """"auto" and "" are the same "inherit" state and must store identically."""
+    """ "auto" and "" are the same "inherit" state and must store identically."""
 
     @pytest.mark.parametrize(
         ("raw", "want"),
@@ -186,7 +186,7 @@ class TestPerAgentModelStorage:
         assert resolve_agent_bindings(cfg, "oncall").model == "claude-opus-5"
 
     def test_bindings_normalize_an_auto_pin(self) -> None:
-        """"auto" stored by an older write must still read as inherit."""
+        """ "auto" stored by an older write must still read as inherit."""
         cfg = _load_from_dict(
             {
                 "agents": {"oncall": {"kiro_agent": "kirocrew", "model": "auto"}},
@@ -236,7 +236,9 @@ class TestEffectiveModelPrecedence:
     """One resolver owns the chain, so display and execution cannot diverge."""
 
     def test_agent_model_outranks_the_global(self, specs_dir: Path) -> None:
-        cfg = _cfg({"crew": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5")
+        cfg = _cfg(
+            {"crew": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5"
+        )
         assert resolve_effective_model(cfg, "crew") == "claude-opus-5"
 
     def test_agent_model_outranks_a_template_pin(self, specs_dir: Path) -> None:
@@ -258,7 +260,7 @@ class TestEffectiveModelPrecedence:
         assert resolve_effective_model(cfg, "crew") == "claude-haiku-4.5"
 
     def test_auto_global_is_never_returned_verbatim(self, specs_dir: Path) -> None:
-        """"auto" is the inherit spelling; returning it would pin the chip to a
+        """ "auto" is the inherit spelling; returning it would pin the chip to a
         value no tier actually chose."""
         cfg = _cfg({"crew": {"kiro_agent": "kirocrew", "model": ""}}, "auto")
         assert resolve_effective_model(cfg, "crew") != "auto"
@@ -287,7 +289,9 @@ class TestSessionModelCoversEverySurface:
     """
 
     def test_crew_name_resolves_its_own_model(self, specs_dir: Path) -> None:
-        cfg = _cfg({"oncall": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5")
+        cfg = _cfg(
+            {"oncall": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5"
+        )
         assert _session_model(cfg, "oncall") == "claude-opus-5"
 
     def test_crew_pin_outranks_the_bound_template_pin(self, specs_dir: Path) -> None:
@@ -313,16 +317,16 @@ class TestSessionModelCoversEverySurface:
         assert _session_model(cfg, "pinned") is None
 
     def test_unknown_name_falls_back_to_the_global(self, specs_dir: Path) -> None:
-        cfg = _cfg({"oncall": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5")
+        cfg = _cfg(
+            {"oncall": {"kiro_agent": "kirocrew", "model": "claude-opus-5"}}, "claude-haiku-4.5"
+        )
         assert _session_model(cfg, "no-such-thing") == "claude-haiku-4.5"
 
     def test_auto_global_yields_none_so_kiro_resolves(self, specs_dir: Path) -> None:
         cfg = _cfg({"oncall": {"kiro_agent": "unpinned", "model": ""}}, "auto")
         assert _session_model(cfg, "oncall") is None
 
-    def test_non_string_crew_model_does_not_crash_the_session_path(
-        self, specs_dir: Path
-    ) -> None:
+    def test_non_string_crew_model_does_not_crash_the_session_path(self, specs_dir: Path) -> None:
         cfg = _load_from_dict(
             {
                 "agents": {"oncall": {"kiro_agent": "unpinned", "model": 123}},
@@ -331,3 +335,54 @@ class TestSessionModelCoversEverySurface:
         )
         cfg.agent.model = "claude-haiku-4.5"
         assert _session_model(cfg, "oncall") == "claude-haiku-4.5"
+
+
+class TestClaudeCodeDoesNotInheritTheKiroAgentFile:
+    """Tier 4 is a kiro-cli artifact and must not reach the claude backend.
+
+    When ``agent.model`` is "auto", the chain falls through to the installed
+    ``~/.kiro/agents/kirocrew.json``. That file is written by kiro-cli tooling,
+    so its ``model`` is a kiro id by construction — and it lives outside
+    ``KIROCREW_HOME``, so even an isolated instance reads the real one. On the
+    claude_code provider the value is a category error: the backend has never
+    heard of ``claude-opus-4.8`` and rejects the session ("The model
+    'claude-opus-4.8' is not available"), which surfaced as an unrelated-looking
+    "Could not generate a plan" in the task runner.
+
+    The registry cannot be used to filter these out: ``opus`` and ``sonnet`` are
+    registry aliases AND real claude backend values, so dropping "ids the
+    registry knows" would break the two most common picks. Skipping the tier by
+    provider is what is safe.
+    """
+
+    def _cc_cfg(self, global_model: str) -> KiroCrewConfig:
+        cfg = _cfg({"crew": {"kiro_agent": "kirocrew", "model": ""}}, global_model)
+        cfg.agent.provider = "claude_code"
+        return cfg
+
+    def test_auto_defers_to_the_backend_instead_of_the_kiro_file(self, specs_dir: Path) -> None:
+        cfg = self._cc_cfg("auto")
+        with unittest.mock.patch.object(
+            KiroCrewConfig, "_resolve_agent_model", staticmethod(lambda: "claude-opus-4.8")
+        ):
+            assert resolve_effective_model(cfg, "crew") == ""
+
+    def test_the_acp_provider_still_reads_the_kiro_file(self, specs_dir: Path) -> None:
+        """The tier exists for kiro and must keep working there — that is where
+        the file's vocabulary is correct."""
+        cfg = _cfg({"crew": {"kiro_agent": "kirocrew", "model": ""}}, "auto")
+        cfg.agent.provider = "acp"
+        with unittest.mock.patch.object(
+            KiroCrewConfig, "_resolve_agent_model", staticmethod(lambda: "claude-opus-4.8")
+        ):
+            assert resolve_effective_model(cfg, "crew") == "claude-opus-4.8"
+
+    def test_an_explicit_global_still_wins_on_claude_code(self, specs_dir: Path) -> None:
+        """Only the kiro-file tier is skipped; the operator's own choice stands."""
+        cfg = self._cc_cfg("opus[1m]")
+        assert resolve_effective_model(cfg, "crew") == "opus[1m]"
+
+    def test_a_crew_pin_still_wins_on_claude_code(self, specs_dir: Path) -> None:
+        cfg = _cfg({"crew": {"kiro_agent": "kirocrew", "model": "sonnet"}}, "auto")
+        cfg.agent.provider = "claude_code"
+        assert resolve_effective_model(cfg, "crew") == "sonnet"

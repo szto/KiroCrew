@@ -382,6 +382,67 @@ class TestStrValidator:
             assert "invalid value" in data["error"]
 
 
+# ── Provider switch ──────────────────────────────────────────────────────
+
+
+def _make_app_with_provider_state() -> tuple[web.Application, SimpleNamespace]:
+    """PATCH-handler app wired for the ``agent.provider`` side-effect branch.
+
+    That branch reloads the provider factory, clears every slot's model (aliases
+    are provider-specific) and pushes a slots update, so the handler raises
+    without all three on ``state``.
+    """
+    app = _make_app()
+    slot = SimpleNamespace(model="claude-sonnet-4.5")
+    state = SimpleNamespace(
+        sessions=SimpleNamespace(reload_provider_factory=AsyncMock()),
+        _slots={"chat-1": slot},
+        push_slots_update=MagicMock(),
+        subagents=None,
+    )
+    app["state"] = state
+    return app, state
+
+
+class TestProviderEnum:
+    """This fork accepts ``claude_code`` alongside ``acp``, so the dashboard
+    allowlist has to accept both — the config schema enum alone does not gate
+    the PATCH route."""
+
+    @pytest.mark.asyncio
+    async def test_claude_code_is_accepted_and_persisted(self, tmp_config) -> None:
+        app, state = _make_app_with_provider_state()
+        with patch("kiro_crew.agent.rebuild_agent_config"):
+            async with TestClient(TestServer(app)) as c:
+                resp = await _patch(c, "agent.provider", "claude_code")
+                assert resp.status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["agent"]["provider"] == "claude_code"
+        # Switching provider must rebuild the factory and clear slot models,
+        # otherwise a kiro alias would be sent to the claude backend.
+        state.sessions.reload_provider_factory.assert_awaited_once()
+        assert state._slots["chat-1"].model == ""
+        state.push_slots_update.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_acp_is_still_accepted(self, tmp_config) -> None:
+        app, _ = _make_app_with_provider_state()
+        with patch("kiro_crew.agent.rebuild_agent_config"):
+            async with TestClient(TestServer(app)) as c:
+                resp = await _patch(c, "agent.provider", "acp")
+                assert resp.status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["agent"]["provider"] == "acp"
+
+    @pytest.mark.asyncio
+    async def test_unknown_provider_still_rejected(self, tmp_config) -> None:
+        app, state = _make_app_with_provider_state()
+        async with TestClient(TestServer(app)) as c:
+            resp = await _patch(c, "agent.provider", "openai")
+            assert resp.status == 400
+        state.sessions.reload_provider_factory.assert_not_awaited()
+
+
 # ── completion_keep hot-reload ───────────────────────────────────────────
 
 

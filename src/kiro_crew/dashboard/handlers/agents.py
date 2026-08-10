@@ -24,6 +24,7 @@ from kiro_crew.agent_discovery import (
     spec_str,
 )
 from kiro_crew.config.loader import (
+    PROVIDER_CLAUDE_CODE,
     ConfigReadError,
     KiroCrewAgentConfig,
     KiroCrewConfig,
@@ -639,13 +640,15 @@ def _normalize_model_key(name: str) -> str:
 def _advertised_cc_models(request: web.Request) -> list[dict]:
     """Map the first active CC provider's advertised models to the API shape.
 
-    claude-agent-acp captures its real versioned list at session init (see
-    AcpClient._capture_available_models). Backend provider ids are mapped back to
-    canonical registry keys (``from_provider_id``) so they dedup cleanly against
-    the registry rows in :func:`_cc_models` and the wire value stays canonical.
-    A provider id with no registry entry passes through unchanged (forward-compat
-    for models the registry doesn't list yet). Returns ``[]`` when no session has
-    initialized or the backend advertised nothing.
+    The backend reports its real list at session init (see
+    ``AcpClient.available_models``, which reads kiro's ``models.availableModels``
+    or claude-agent-acp's ``model`` config option).
+
+    ``modelId`` is used VERBATIM. It is the value that goes back on the wire to
+    select the model, and the registry's aliases are versionless words pinned to
+    whichever model was current when the row was authored — folding through them
+    renames the live Opus into ``opus-4.8-1m`` and then sends an id the backend
+    rejects. Returns ``[]`` when no session has initialized.
     """
     try:
         state: DashboardState = request.app["state"]
@@ -663,10 +666,8 @@ def _advertised_cc_models(request: web.Request) -> list[dict]:
         if advertised:
             return [
                 {
-                    "model_name": model_registry.from_provider_id(
-                        m.get("modelId", ""), "claude_code"
-                    ),
-                    "display_name": m.get("name", "") or m.get("modelId", ""),
+                    "model_name": m["modelId"],
+                    "display_name": m.get("name", "") or m["modelId"],
                     "description": m.get("description", ""),
                 }
                 for m in advertised
@@ -750,15 +751,23 @@ def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict
     return kept
 
 
-def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]:
+def _cc_models(
+    request: web.Request,
+    configured_default: str = "",
+    probed: list[dict] | None = None,
+) -> list[dict]:
     """Assemble the CC model dropdown, scoped to what the account can actually use.
 
-    The live backend's advertised set is AUTHORITATIVE when present. It is the
-    only source that reflects entitlement: claude-agent-acp captures it at session
-    init from what the signed-in account is actually served. The registry is a
-    static catalog of everything KiroCrew knows how to name, so a free-tier user
-    used to be offered the full flagship list and only discovered the truth when a
-    prompt failed.
+    The backend's advertised set is AUTHORITATIVE when present. It is the only
+    source that reflects entitlement: claude-agent-acp reports it at session init
+    from what the signed-in account is actually served. The registry is a static
+    catalog of everything Kiro Crew knows how to name, so a free-tier user used to
+    be offered the full flagship list and only discovered the truth when a prompt
+    failed.
+
+    ``probed`` is that same answer obtained from a throwaway handshake when no
+    session is live (see ``claude_code_factory.probe_available_models``); it wins
+    over the live scan because a cold gateway has nothing to scan.
 
     So when anything is advertised, registry rows are FILTERED DOWN to it (keeping
     the registry's cleaner display names for the survivors), and advertised models
@@ -776,7 +785,7 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
     ``default: true`` flag sorts the current flagship to the top, which presented
     a specific paid model as the default in the picker.
     """
-    advertised = _advertised_cc_models(request)
+    advertised = list(probed or []) or _advertised_cc_models(request)
     registry_rows = model_registry.display_list("claude_code")
 
     if advertised:
@@ -838,8 +847,11 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
             # After "auto", never before it: "auto" is the configured default in
             # the general case and leads the list.
             merged.insert(
-                1 if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
-                else 0,
+                (
+                    1
+                    if merged and _normalize_model_key(merged[0].get("model_name", "")) == "auto"
+                    else 0
+                ),
                 {
                     "model_name": canonical_default,
                     "display_name": canonical_default,
@@ -879,7 +891,38 @@ def _wrap_list_models_argv(argv: list[str]) -> tuple[list[str], str | None]:
 
 
 async def api_models(request: web.Request) -> web.Response:
-    """GET /api/models — list available models from the live kiro-cli ACP session."""
+    """GET /api/models — list models for the configured provider.
+
+    claude_code is answered entirely from :func:`_cc_models` (registry ∩ what the
+    live backend advertises) and must branch BEFORE the kiro readiness gate and
+    the kiro-cli spawn below: both gate on kiro login state, which a claude_code
+    gateway neither has nor needs, so falling through would 503 a healthy
+    dashboard (or spawn a browser-opening kiro-cli login) on every 8s poll.
+    """
+    cfg = KiroCrewConfig.load()
+    if cfg.agent.provider == PROVIDER_CLAUDE_CODE:
+        probed: list[dict] = []
+        if not _advertised_cc_models(request):
+            # No live session to read the vocabulary off, so ask the adapter
+            # directly rather than serving the static registry. Cached per
+            # account, and it degrades to [] (registry) on any failure.
+            from kiro_crew.providers.claude_code_factory import probe_available_models
+
+            # ``modelId`` is used VERBATIM, never folded through the registry.
+            # The adapter's vocabulary is versionless ("opus" = whatever Opus is
+            # today) while the registry's aliases pin the same word to the model
+            # that was current when the row was written, so translating here
+            # would rename Opus 5 to "opus-4.8-1m" and hand the backend an id it
+            # rejects. The value round-trips to set_config_option unchanged.
+            probed = [
+                {
+                    "model_name": m["modelId"],
+                    "display_name": m.get("name", "") or m["modelId"],
+                    "description": m.get("description", ""),
+                }
+                for m in await probe_available_models(cfg)
+            ]
+        return web.json_response(_cc_models(request, cfg.agent.model, probed=probed))
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
     # an interactive browser login for ANY subcommand run unauthenticated
     # (--no-interactive does not suppress it, and there is no opt-out env var),

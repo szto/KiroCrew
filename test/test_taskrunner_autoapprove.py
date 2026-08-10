@@ -42,8 +42,9 @@ def _provider_one_tool_then_done():
     provider = MagicMock()
 
     async def _stream(msg: str):
-        yield LLMEvent(kind="permission_request", title="read", text="",
-                       request_id="req-1", tool_kind="tool")
+        yield LLMEvent(
+            kind="permission_request", title="read", text="", request_id="req-1", tool_kind="tool"
+        )
         yield LLMEvent(kind="text_chunk", text="done")
         yield LLMEvent(kind="complete")
 
@@ -81,9 +82,17 @@ async def test_hook_auto_approve_bypasses_interactive_prompt(tmp_path):
     with patch.object(task_executor.KiroCrewConfig, "load") as cfg:
         cfg.return_value.agent.provider = "acp"
         await task_executor.execute_task(
-            run=run, task=task, sessions=sessions, ctx=ctx, agent="",
-            on_tool_approval=prompt, auto_test=False, test_cmd=None,
-            work_dir=Path(tmp_path), on_notify=AsyncMock(), session_key="k",
+            run=run,
+            task=task,
+            sessions=sessions,
+            ctx=ctx,
+            agent="",
+            on_tool_approval=prompt,
+            auto_test=False,
+            test_cmd=None,
+            work_dir=Path(tmp_path),
+            on_notify=AsyncMock(),
+            session_key="k",
         )
     prompt.assert_not_called()
     provider.approve_tool.assert_awaited_once_with("req-1")
@@ -99,9 +108,17 @@ async def test_headless_no_authorization_rejects(tmp_path):
     with patch.object(task_executor.KiroCrewConfig, "load") as cfg:
         cfg.return_value.agent.provider = "acp"
         await task_executor.execute_task(
-            run=run, task=task, sessions=sessions, ctx=ctx, agent="",
-            on_tool_approval=None, auto_test=False, test_cmd=None,
-            work_dir=Path(tmp_path), on_notify=AsyncMock(), session_key="k",
+            run=run,
+            task=task,
+            sessions=sessions,
+            ctx=ctx,
+            agent="",
+            on_tool_approval=None,
+            auto_test=False,
+            test_cmd=None,
+            work_dir=Path(tmp_path),
+            on_notify=AsyncMock(),
+            session_key="k",
         )
     provider.reject_tool.assert_awaited_once_with("req-1")
     provider.approve_tool.assert_not_awaited()
@@ -118,9 +135,17 @@ async def test_headless_hook_auto_approve_still_approves(tmp_path):
     with patch.object(task_executor.KiroCrewConfig, "load") as cfg:
         cfg.return_value.agent.provider = "acp"
         await task_executor.execute_task(
-            run=run, task=task, sessions=sessions, ctx=ctx, agent="",
-            on_tool_approval=None, auto_test=False, test_cmd=None,
-            work_dir=Path(tmp_path), on_notify=AsyncMock(), session_key="k",
+            run=run,
+            task=task,
+            sessions=sessions,
+            ctx=ctx,
+            agent="",
+            on_tool_approval=None,
+            auto_test=False,
+            test_cmd=None,
+            work_dir=Path(tmp_path),
+            on_notify=AsyncMock(),
+            session_key="k",
         )
     provider.approve_tool.assert_awaited_once_with("req-1")
     provider.reject_tool.assert_not_awaited()
@@ -137,9 +162,65 @@ async def test_interactive_prompt_fires_when_handler_present(tmp_path):
     with patch.object(task_executor.KiroCrewConfig, "load") as cfg:
         cfg.return_value.agent.provider = "acp"
         await task_executor.execute_task(
-            run=run, task=task, sessions=sessions, ctx=ctx, agent="",
-            on_tool_approval=prompt, auto_test=False, test_cmd=None,
-            work_dir=Path(tmp_path), on_notify=AsyncMock(), session_key="k",
+            run=run,
+            task=task,
+            sessions=sessions,
+            ctx=ctx,
+            agent="",
+            on_tool_approval=prompt,
+            auto_test=False,
+            test_cmd=None,
+            work_dir=Path(tmp_path),
+            on_notify=AsyncMock(),
+            session_key="k",
         )
     prompt.assert_awaited_once()
     provider.approve_tool.assert_awaited_once_with("req-1")
+
+
+@pytest.mark.asyncio
+async def test_declined_interactive_approval_records_a_reason(tmp_path):
+    """A rejection must say WHY, like every other reject path here.
+
+    The interactive branch was the one caller of ``_reject_and_log`` that passed
+    no metadata, so a decline — including the 3-minute background-approval
+    timeout, which reaches this branch as a plain False — landed in the audit log
+    as ``outcome=rejected`` with an empty ``error`` and ``metadata={}``. The
+    sibling paths record ``hook_deny``, ``context_overflow`` and
+    ``headless_no_authorization``, so an unexplained row read as "some rule
+    blocked it" and sent a real diagnosis down the wrong path.
+    """
+    prompt = AsyncMock(return_value=False)
+    provider = _provider_one_tool_then_done()
+    sessions = _mock_sessions(provider)
+    run, task = _run_and_task()
+    ctx = _ctx_with_hook_action(TOOL_ALLOW)
+    sel_spy = MagicMock()
+
+    with (
+        patch.object(task_executor.KiroCrewConfig, "load") as cfg,
+        patch.object(task_executor, "sel", lambda: sel_spy),
+    ):
+        cfg.return_value.agent.provider = "acp"
+        await task_executor.execute_task(
+            run=run,
+            task=task,
+            sessions=sessions,
+            ctx=ctx,
+            agent="",
+            on_tool_approval=prompt,
+            auto_test=False,
+            test_cmd=None,
+            work_dir=Path(tmp_path),
+            on_notify=AsyncMock(),
+            session_key="k",
+        )
+
+    provider.reject_tool.assert_awaited_once_with("req-1")
+    rejects = [
+        c.kwargs
+        for c in sel_spy.log_tool_invocation.call_args_list
+        if c.kwargs.get("outcome") == "rejected"
+    ]
+    assert rejects, "the decline must be audited"
+    assert rejects[0].get("metadata", {}).get("reason") == "interactive_not_approved"

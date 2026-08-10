@@ -224,7 +224,9 @@ user confirms, and no code path treats it as a bound.
 Both entity extraction (`EntityExtractor`) and internal-URL fetch (`agent_fetch.fetch_url_content`) acquire workers from a shared `LLMPool` — a provider-agnostic, bounded pool (`DEFAULT_POOL_SIZE` = 3) of **long-lived** ACP workers. A `Worker` ABC has two concrete paths:
 
 - **Default (kiro-cli)** — `AcpWorker` drives the `kirocrew-knowledge` agent over ACP (`AGENT_NAME`). That agent is installed by `agent.py:_install_knowledge_agent` (model `claude-haiku-4.5`, kirocrew-core tools only — no internal MCP wiring in the OSS fork).
-- **`agent.provider="claude_code"` (legacy seam)** — `CCWorker` drives a long-lived `claude` CLI subprocess over stream-json I/O (haiku model, `bypassPermissions`); URL-fetch tools are opt-in via `KIROCREW_KNOWLEDGE_FETCH_TOOLS`. KiroCrew's provider enum is `["acp"]`, so this branch is dormant in practice.
+- **`agent.provider="claude_code"`** — `CCWorker` drives a long-lived `claude` CLI subprocess over stream-json I/O (haiku model, `bypassPermissions`); URL-fetch tools are opt-in via `KIROCREW_KNOWLEDGE_FETCH_TOOLS`. This fork's provider enum accepts `claude_code`, so this branch is live, not dormant — see [providers](providers.md).
+
+**Response shape (`CCWorker._collect_response`).** The terminal `result` event carries the final text as a **string**, not a content-block dict, and it repeats what already streamed as `assistant` text blocks. So the streamed blocks are authoritative and `result` is a fallback used only when nothing streamed — appending both would hand the extractor's `json.loads` two concatenated objects. `thinking` blocks are never collected, for the same parse reason. Reading `result` as a dict raised `'str' object has no attribute 'get'` on **every** message; because `LLMPool.send_batch` catches per item and `EntityExtractor.extract_batch` swallows the batch, the failure was silent — ingestion reported `completed`, every item stored with a heading-derived title and a NULL summary, and the entity graph stayed permanently empty. Any change here needs a test against the real event shape, not a hand-written fixture.
 
 ### Sweep shielding + audit source
 
@@ -305,6 +307,72 @@ Returns the item count per source **under the active filters**:
 - Sourceless items are reported under the `__none__` key.
 - The list view derives its rows from these counts, which is what guarantees
   every source is visible at once regardless of relative size.
+
+### `POST /api/knowledge/sources/{id}/rebuild-graph`
+
+Re-runs entity extraction over a source's **already-stored** items
+(`IngestionPipeline.rebuild_entities`). Returns
+`{"status": "rebuilding", "source_id", "items"}` and runs in the background;
+progress lands on the normal `ingestion_jobs` row. `404 source_unknown`,
+`503 pipeline_unconfigured`, `400 source_empty`.
+
+- **Why it is not sync.** Sync re-reads the origin and skips files whose content
+  is unchanged — which is every file when the text is fine and only the
+  extraction was lost. That is the normal state after an extraction outage,
+  because a failed batch still stores the item (heading-derived title, NULL
+  summary, no entities) and reports the job `completed`. Re-reading is also the
+  expensive half: file IO and chunking redo work that is already correct.
+- **Content is never rewritten** — only mentions, relations and the summary.
+- **Idempotent, not additive.** Each item's old `mentions` and its
+  `entity_relations` rows are deleted before the fresh extraction is stored;
+  without that, a second run doubles every mention and inflates the degree
+  ranking the graph view sorts on. Entities themselves are left alone — another
+  source may still mention them.
+- **Reloads the graph once at the end.** Deleting relation ROWS does not remove
+  the matching edges from the in-memory `SimpleDiGraph` (only the `add_*` methods
+  mutate it), so a rebuild that drops a relation would keep serving it until the
+  next gateway start. Per item would be O(n) full-graph loads.
+- **Never runs dedup.** `_maybe_dedup` collapses a NEWLY INGESTED document
+  against the corpus and hard-deletes the loser through `delete_source_cascade`.
+  A rebuild adds no document, so there is nothing to judge — and calling it there
+  cascade-deleted a real 7-item folder source, taking every item, mention and
+  relation with it. A control labelled "rebuild graph" must not be able to delete
+  the source.
+
+### An empty extraction is stored as a success — so it must be logged
+
+`EntityExtractor` degrades to `_empty_result()` on three paths: a pool exception
+in `extract`, a pool exception in `extract_batch`, and an unparseable response in
+`_parse_response`. Degrading is correct — one bad chunk must not fail an ingest —
+but an empty result is **indistinguishable from a genuinely entity-free chunk**,
+so the item is stored with a heading-derived title, a NULL summary and no
+entities, and the job reports `completed` with `items_failed=0`. Nothing in the
+data says extraction ever ran.
+
+All three paths therefore log a WARNING, and `extract_batch` additionally warns
+when the WHOLE batch came back empty — the signal that separates "this text has
+no entities" from "extraction is broken", and the one that would have caught the
+`CCWorker` outage immediately instead of after a database audit. The unparseable
+path logs the response **length only**: the body is model output over untrusted
+document text and must never reach the log.
+
+Keep these. A silent `except Exception: return _empty_result()` here reads as a
+working ingest.
+
+### `tags` on the wire is a JSON array STRING
+
+`items.tags` round-trips through `json.dumps`, so the list/detail APIs serve it as
+`'["content_type:markdown"]'` — not a comma-separated string and not an array. A
+reader that only comma-splits gets one element still wrapped in its brackets and
+quotes, so `content_type:markdown` never matches: that is why markdown from every
+folder-ingested document rendered as raw source in the dashboard rather than as
+prose. `pages/knowledge/DetailView.tsx:parseTags` parses JSON first and falls back
+to the comma form; anything reading a marker tag must go through it.
+
+`content_type:markdown` is set by the ingest path for `MARKDOWN_EXTS`
+(`.md`, `.docx`) and is what the detail view's rendered/source toggle keys on.
+Entity highlighting exists only in the source view — injecting marks into rendered
+markdown would mean rewriting the AST.
 
 ## Invariants
 

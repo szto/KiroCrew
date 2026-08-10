@@ -65,8 +65,10 @@ _MAX_SOURCE_NAME_LEN = 200
 def _sel_log(tool: str, **kwargs: object) -> None:
     """Emit SEL audit event for knowledge API mutations."""
     sel().log_tool_invocation(
-        session_key="dashboard", agent="knowledge-api",
-        tool_name=f"knowledge.{tool}", outcome=str(kwargs.pop("outcome", "completed")),
+        session_key="dashboard",
+        agent="knowledge-api",
+        tool_name=f"knowledge.{tool}",
+        outcome=str(kwargs.pop("outcome", "completed")),
         resources=str(kwargs) if kwargs else "",
     )
 
@@ -98,10 +100,13 @@ async def list_namespaces(request: web.Request) -> web.Response:
     rows = store.db.execute(
         "SELECT namespace, COUNT(*) as count FROM items WHERE status = 'active' GROUP BY namespace ORDER BY count DESC"
     ).fetchall()
-    return web.json_response([{"name": r["namespace"] or "default", "count": r["count"]} for r in rows])
+    return web.json_response(
+        [{"name": r["namespace"] or "default", "count": r["count"]} for r in rows]
+    )
 
 
 # ---------- Source Watcher ----------
+
 
 async def _start_watcher_async(app: web.Application) -> None:
     """Start the source watcher (auto-watches local_file sources)."""
@@ -173,12 +178,20 @@ def _attach_file_paths(store, items: list[dict]) -> None:
     if not source_ids:
         return
     ph = ",".join("?" * len(source_ids))
-    folder_sids = {r["id"] for r in store.db.execute(
-        f"SELECT id FROM sources WHERE id IN ({ph}) AND source_type IN ('local_folder', 'obsidian_vault')",  # noqa: S608
-        list(source_ids)).fetchall()}
-    artifact_sids = {r["id"] for r in store.db.execute(
-        f"SELECT id FROM sources WHERE id IN ({ph}) AND source_type = 'artifact'",  # noqa: S608
-        list(source_ids)).fetchall()}
+    folder_sids = {
+        r["id"]
+        for r in store.db.execute(
+            f"SELECT id FROM sources WHERE id IN ({ph}) AND source_type IN ('local_folder', 'obsidian_vault')",  # noqa: S608
+            list(source_ids),
+        ).fetchall()
+    }
+    artifact_sids = {
+        r["id"]
+        for r in store.db.execute(
+            f"SELECT id FROM sources WHERE id IN ({ph}) AND source_type = 'artifact'",  # noqa: S608
+            list(source_ids),
+        ).fetchall()
+    }
     if not folder_sids and not artifact_sids:
         return
     # Build item_id -> group-label reverse map.
@@ -186,7 +199,8 @@ def _attach_file_paths(store, items: list[dict]) -> None:
     # Folder/vault sources: group label is the file path.
     for sid in folder_sids:
         for row in store.db.execute(
-                "SELECT file_path, item_ids FROM folder_file_state WHERE source_id = ?", (sid,)):
+            "SELECT file_path, item_ids FROM folder_file_state WHERE source_id = ?", (sid,)
+        ):
             try:
                 ids = json.loads(row["item_ids"]) if row["item_ids"] else []
             except (json.JSONDecodeError, TypeError):
@@ -196,7 +210,8 @@ def _attach_file_paths(store, items: list[dict]) -> None:
     # Aggregate artifact source: group label is the artifact name (fallback slug).
     for sid in artifact_sids:
         for row in store.db.execute(
-                "SELECT slug, name, item_ids FROM artifact_item_state WHERE source_id = ?", (sid,)):
+            "SELECT slug, name, item_ids FROM artifact_item_state WHERE source_id = ?", (sid,)
+        ):
             try:
                 ids = json.loads(row["item_ids"]) if row["item_ids"] else []
             except (json.JSONDecodeError, TypeError):
@@ -264,7 +279,7 @@ def _load_items_by_id(store, item_ids: list[str]) -> dict[str, dict]:
     """
     out: dict[str, dict] = {}
     for start in range(0, len(item_ids), _SQLITE_VARIABLE_CHUNK):
-        chunk = item_ids[start:start + _SQLITE_VARIABLE_CHUNK]
+        chunk = item_ids[start : start + _SQLITE_VARIABLE_CHUNK]
         placeholders = ",".join("?" * len(chunk))
         rows = store.db.execute(
             f"SELECT * FROM items WHERE id IN ({placeholders})",  # noqa: S608
@@ -311,9 +326,7 @@ async def list_items(request: web.Request) -> web.Response:
         if source_id:
             all_results = await _search_until_exhausted(retriever, q, limit)
         else:
-            all_results = await run_in_embed_pool(
-                retriever.search, q, limit=limit * 3
-            )
+            all_results = await run_in_embed_pool(retriever.search, q, limit=limit * 3)
         # Batch fetch all candidate items (avoid N+1). A scoped search escalates
         # its candidate pool, so this query and the row serialization can both be
         # large: run them in a worker thread rather than on the event loop.
@@ -339,7 +352,7 @@ async def list_items(request: web.Request) -> web.Response:
             filtered.append(item)
         total = len(filtered)
         offset = (page - 1) * limit
-        items = filtered[offset:offset + limit]
+        items = filtered[offset : offset + limit]
         _attach_file_paths(store, items)
         return web.json_response({"items": items, "total": total, "page": page, "limit": limit})
     else:
@@ -358,14 +371,15 @@ async def list_items(request: web.Request) -> web.Response:
         elif source_id:
             where.append("i.source_id = ?")
             params.append(source_id)
-        where_clause = ' AND '.join(where)
+        where_clause = " AND ".join(where)
         total = store.db.execute(
-            f"SELECT COUNT(*) FROM items i WHERE {where_clause}",  # noqa: S608
-            params).fetchone()[0]
+            f"SELECT COUNT(*) FROM items i WHERE {where_clause}", params  # noqa: S608
+        ).fetchone()[0]
         offset = (page - 1) * limit
         rows = store.db.execute(
             f"SELECT i.* FROM items i LEFT JOIN sources s ON i.source_id = s.id WHERE {where_clause} ORDER BY s.updated_at DESC, i.chunk_index ASC LIMIT ? OFFSET ?",  # noqa: S608, E501
-            [*params, limit, offset]).fetchall()
+            [*params, limit, offset],
+        ).fetchall()
         items = [store._serialize_item(r) for r in rows]
         _attach_file_paths(store, items)
         return web.json_response({"items": items, "total": total, "page": page, "limit": limit})
@@ -379,7 +393,9 @@ async def get_item(request: web.Request) -> web.Response:
     if not item:
         return web.json_response({"error": "not found"}, status=404)
 
-    mentions = store.db.execute("SELECT entity_id, context FROM mentions WHERE item_id = ?", (item_id,)).fetchall()
+    mentions = store.db.execute(
+        "SELECT entity_id, context FROM mentions WHERE item_id = ?", (item_id,)
+    ).fetchall()
     entity_ids = [m["entity_id"] for m in mentions]
     entities = []
     for eid in entity_ids:
@@ -391,21 +407,30 @@ async def get_item(request: web.Request) -> web.Response:
     seen_ids = set()
     for eid in entity_ids:
         for row in store.db.execute(
-                "SELECT * FROM entity_relations WHERE source_id = ? OR target_id = ?", (eid, eid)):
+            "SELECT * FROM entity_relations WHERE source_id = ? OR target_id = ?", (eid, eid)
+        ):
             r = dict(row)
             if r["id"] not in seen_ids:
                 seen_ids.add(r["id"])
                 # Resolve entity names for display
-                src = store.db.execute("SELECT name FROM entities WHERE id = ?", (r["source_id"],)).fetchone()
-                tgt = store.db.execute("SELECT name FROM entities WHERE id = ?", (r["target_id"],)).fetchone()
+                src = store.db.execute(
+                    "SELECT name FROM entities WHERE id = ?", (r["source_id"],)
+                ).fetchone()
+                tgt = store.db.execute(
+                    "SELECT name FROM entities WHERE id = ?", (r["target_id"],)
+                ).fetchone()
                 r["source_name"] = src["name"] if src else r["source_id"]
                 r["target_name"] = tgt["name"] if tgt else r["target_id"]
                 relations.append(r)
 
-    locations = [dict(r) for r in store.db.execute(
-        "SELECT * FROM source_locations WHERE item_id = ?", (item_id,))]
+    locations = [
+        dict(r)
+        for r in store.db.execute("SELECT * FROM source_locations WHERE item_id = ?", (item_id,))
+    ]
 
-    return web.json_response({**item, "entities": entities, "relations": relations, "source_locations": locations})
+    return web.json_response(
+        {**item, "entities": entities, "relations": relations, "source_locations": locations}
+    )
 
 
 async def update_item(request: web.Request) -> web.Response:
@@ -475,7 +500,8 @@ async def list_entities(request: web.Request) -> web.Response:
         params.append(f"%{q}%")
     params.append(limit)
     rows = store.db.execute(
-        f"SELECT * FROM entities WHERE {' AND '.join(where)} ORDER BY name LIMIT ?", params).fetchall()  # noqa: S608
+        f"SELECT * FROM entities WHERE {' AND '.join(where)} ORDER BY name LIMIT ?", params
+    ).fetchall()  # noqa: S608
     return web.json_response([dict(r) for r in rows])
 
 
@@ -516,8 +542,12 @@ async def get_related_items(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid limit"}, status=400)
 
     # Find entities mentioned in this item
-    entity_ids = [r["entity_id"] for r in store.db.execute(
-        "SELECT entity_id FROM mentions WHERE item_id = ?", (item_id,)).fetchall()]
+    entity_ids = [
+        r["entity_id"]
+        for r in store.db.execute(
+            "SELECT entity_id FROM mentions WHERE item_id = ?", (item_id,)
+        ).fetchall()
+    ]
     if not entity_ids:
         return web.json_response([])
 
@@ -528,9 +558,11 @@ async def get_related_items(request: web.Request) -> web.Response:
         f"FROM items i JOIN mentions m ON i.id = m.item_id "
         f"WHERE m.entity_id IN ({placeholders}) AND i.id != ? AND i.status = 'active' "
         f"GROUP BY i.id ORDER BY shared_entities DESC LIMIT ?",
-        [*entity_ids, item_id, limit]
+        [*entity_ids, item_id, limit],
     ).fetchall()
-    return web.json_response([{**store._serialize_item(r), "shared_entities": r["shared_entities"]} for r in rows])
+    return web.json_response(
+        [{**store._serialize_item(r), "shared_entities": r["shared_entities"]} for r in rows]
+    )
 
 
 async def get_full_graph(request: web.Request) -> web.Response:
@@ -540,14 +572,25 @@ async def get_full_graph(request: web.Request) -> web.Response:
         limit = min(200, max(1, int(request.query.get("limit", 100) or 100)))
     except ValueError:
         return web.json_response({"error": "invalid limit"}, status=400)
-    nodes_by_degree = sorted(store.graph.nodes, key=lambda n: store.graph.degree(n), reverse=True)[:limit]
+    nodes_by_degree = sorted(store.graph.nodes, key=lambda n: store.graph.degree(n), reverse=True)[
+        :limit
+    ]
     if not nodes_by_degree:
         return web.json_response({"nodes": [], "edges": []})
     node_set = set(nodes_by_degree)
-    nodes = [{"id": n, "name": store.graph.nodes[n].get("name"), "type": store.graph.nodes[n].get("entity_type")}
-             for n in node_set]
-    edges = [{"source": u, "target": v, "type": d.get("relation_type"), "weight": d.get("weight")}
-             for u, v, d in store.graph.edges(data=True) if u in node_set and v in node_set]
+    nodes = [
+        {
+            "id": n,
+            "name": store.graph.nodes[n].get("name"),
+            "type": store.graph.nodes[n].get("entity_type"),
+        }
+        for n in node_set
+    ]
+    edges = [
+        {"source": u, "target": v, "type": d.get("relation_type"), "weight": d.get("weight")}
+        for u, v, d in store.graph.edges(data=True)
+        if u in node_set and v in node_set
+    ]
     return web.json_response({"nodes": nodes, "edges": edges})
 
 
@@ -617,12 +660,14 @@ async def list_sources(request: web.Request) -> web.Response:
     store = _store(request)
     uri_filter = request.query.get("uri")
     if uri_filter:
-        resolved_filter = str(Path(uri_filter).resolve()) if uri_filter.startswith('/') else uri_filter
+        resolved_filter = (
+            str(Path(uri_filter).resolve()) if uri_filter.startswith("/") else uri_filter
+        )
         rows = store.db.execute(
             "SELECT s.*, COALESCE(c.cnt, 0) AS item_count "
             "FROM sources s LEFT JOIN (SELECT source_id, COUNT(*) AS cnt FROM items GROUP BY source_id) c "
             "ON s.id = c.source_id WHERE s.uri = ? ORDER BY s.updated_at DESC",
-            (resolved_filter,)
+            (resolved_filter,),
         ).fetchall()
     else:
         rows = store.db.execute(
@@ -649,13 +694,17 @@ def _run_folder_dialog() -> str | None:
     absolute path, or None if the user cancelled or it failed to launch. Meant
     to run off the event loop via an executor."""
     cmd = [
-        "osascript", "-e",
-        'POSIX path of (choose folder with prompt '
+        "osascript",
+        "-e",
+        "POSIX path of (choose folder with prompt "
         '"Select a folder to add to your knowledge base")',
     ]
     try:
         proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            cmd, capture_output=True, text=True, timeout=_FOLDER_DIALOG_TIMEOUT,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_FOLDER_DIALOG_TIMEOUT,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
@@ -695,9 +744,7 @@ async def add_source(request: web.Request) -> web.Response:
     uri = body.get("uri", "")
     properties = body.get("properties", {})
     if not isinstance(properties, dict):
-        return web.json_response(
-            {"error": "properties must be an object"}, status=400
-        )
+        return web.json_response({"error": "properties must be an object"}, status=400)
     namespace = body.get("namespace", "")
 
     # Validate namespace if provided at top level or in properties
@@ -705,9 +752,7 @@ async def add_source(request: web.Request) -> web.Response:
         namespace = properties.get("namespace", "")
     if namespace:
         if not isinstance(namespace, str):
-            return web.json_response(
-                {"error": "namespace must be a string"}, status=400
-            )
+            return web.json_response({"error": "namespace must be a string"}, status=400)
         namespace = namespace.strip()[:64]
 
     if not source_type:
@@ -756,7 +801,9 @@ async def add_source(request: web.Request) -> web.Response:
         resolved_uri = str(Path(uri).resolve())
         if is_sensitive_path(resolved_uri):
             _sel_log("source.add_denied", reason="sensitive_path", uri=uri)
-            return web.json_response({"error": "Path is restricted for security reasons"}, status=403)
+            return web.json_response(
+                {"error": "Path is restricted for security reasons"}, status=403
+            )
 
     # Validate URI format for sources without a dedicated connector
     if source_type == "local_file":
@@ -796,14 +843,18 @@ async def add_source(request: web.Request) -> web.Response:
     # Check for existing source with same URI
     existing = store.get_source_by_uri(uri)
     if existing:
-        return web.json_response({"error": "source already exists", "id": existing["id"]}, status=409)
+        return web.json_response(
+            {"error": "source already exists", "id": existing["id"]}, status=409
+        )
 
     # Folder sources: discovery walk + pending_confirmation (no auto-scan)
     if source_type in ("local_folder", "obsidian_vault"):
         folder_path = Path(uri).resolve()
         if is_sensitive_path(str(folder_path)):
             _sel_log("source.add_denied", reason="sensitive_path", uri=uri)
-            return web.json_response({"error": "Path is restricted for security reasons"}, status=403)
+            return web.json_response(
+                {"error": "Path is restricted for security reasons"}, status=403
+            )
         if not folder_path.is_dir():
             return web.json_response({"error": f"Directory not found: {uri}"}, status=400)
 
@@ -833,8 +884,9 @@ async def add_source(request: web.Request) -> web.Response:
             # Fold top-level namespace into properties for folder watchers
             if namespace and "namespace" not in properties:
                 properties["namespace"] = namespace
-        sid = store.add_source(name=name or uri, source_type=source_type, uri=uri,
-                               properties=properties)
+        sid = store.add_source(
+            name=name or uri, source_type=source_type, uri=uri, properties=properties
+        )
         _sel_log("source.add", source_id=sid, source_type=source_type)
         return web.json_response(
             {
@@ -853,8 +905,9 @@ async def add_source(request: web.Request) -> web.Response:
             status=201,
         )
 
-    sid = store.add_source(name=name or uri, source_type=source_type, uri=uri,
-                           properties=properties)
+    sid = store.add_source(
+        name=name or uri, source_type=source_type, uri=uri, properties=properties
+    )
     _sel_log("source.add", source_id=sid, source_type=source_type)
 
     # Trigger immediate ingestion for local_file sources
@@ -870,6 +923,51 @@ async def add_source(request: web.Request) -> web.Response:
             task.add_done_callback(app_tasks.discard)
 
     return web.json_response({"id": sid, "status": "created"}, status=201)
+
+
+async def rebuild_graph(request: web.Request) -> web.Response:
+    """POST /api/knowledge/sources/{id}/rebuild-graph -- re-extract stored items.
+
+    Distinct from sync: sync re-reads the origin and skips files whose content is
+    unchanged, which is exactly the case this cannot help — when the text is fine
+    and only the extraction was lost, sync has nothing to do. Runs in the
+    background and reports through the normal ingestion-job row.
+    """
+    source_id = request.match_info["id"]
+    store = _store(request)
+    source = store.db.execute("SELECT id FROM sources WHERE id = ?", (source_id,)).fetchone()
+    if not source:
+        return web.json_response({"error": "not found", "code": "source_unknown"}, status=404)
+
+    pipeline = _pipeline(request)
+    if not pipeline:
+        return web.json_response(
+            {"error": "pipeline not configured", "code": "pipeline_unconfigured"}, status=503
+        )
+
+    total = store.db.execute(
+        "SELECT COUNT(*) AS n FROM items WHERE source_id = ? AND status = 'active'",
+        (source_id,),
+    ).fetchone()["n"]
+    if not total:
+        return web.json_response(
+            {"error": "source has no items to rebuild", "code": "source_empty"}, status=400
+        )
+
+    task = asyncio.create_task(_rebuild_graph_task(pipeline, source_id))
+    app_tasks = request.app.setdefault("_bg_tasks", set())
+    app_tasks.add(task)
+    task.add_done_callback(app_tasks.discard)
+    _sel_log("source.rebuild_graph", source_id=source_id)
+    return web.json_response({"status": "rebuilding", "source_id": source_id, "items": total})
+
+
+async def _rebuild_graph_task(pipeline, source_id: str) -> None:  # type: ignore[no-untyped-def]
+    """Background half of rebuild_graph; the job row carries the outcome."""
+    try:
+        await pipeline.rebuild_entities(source_id)
+    except Exception:
+        logger.exception("Entity rebuild failed for source %s", source_id)
 
 
 async def _ingest_local_file_task(pipeline, store, path: str, source_id: str) -> None:  # type: ignore[no-untyped-def]
@@ -921,7 +1019,9 @@ async def sync_source(request: web.Request) -> web.Response:
         if not file_uri:
             return web.json_response({"error": "no file path to sync"}, status=400)
         if source["sync_status"] == "syncing":
-            return web.json_response({"error": "sync already in progress", "source_id": source_id}, status=409)
+            return web.json_response(
+                {"error": "sync already in progress", "source_id": source_id}, status=409
+            )
         pipeline = _pipeline(request)
         if not pipeline:
             return web.json_response({"error": "pipeline not configured"}, status=503)
@@ -936,13 +1036,19 @@ async def sync_source(request: web.Request) -> web.Response:
 
     # Agent-assisted sync: fetch in background, no chat session needed
     uri = source["uri"] or ""
-    props = json.loads(source["properties"] or "{}") if isinstance(source["properties"], str) else (source["properties"] or {})
+    props = (
+        json.loads(source["properties"] or "{}")
+        if isinstance(source["properties"], str)
+        else (source["properties"] or {})
+    )
     url = uri or props.get("url", "")
     if not url:
         return web.json_response({"error": "no URL to fetch"}, status=400)
 
     if source["sync_status"] == "syncing":
-        return web.json_response({"error": "sync already in progress", "source_id": source_id}, status=409)
+        return web.json_response(
+            {"error": "sync already in progress", "source_id": source_id}, status=409
+        )
 
     store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (source_id,))
     store.db.commit()
@@ -951,7 +1057,9 @@ async def sync_source(request: web.Request) -> web.Response:
     if not pipeline:
         return web.json_response({"error": "pipeline not configured"}, status=503)
     pool = request.app["knowledge_llm_pool"]
-    task = asyncio.create_task(_background_agent_sync(source_id, url, source["name"], store, pipeline, pool))
+    task = asyncio.create_task(
+        _background_agent_sync(source_id, url, source["name"], store, pipeline, pool)
+    )
     app_tasks = request.app.setdefault("_bg_tasks", set())
     app_tasks.add(task)
     task.add_done_callback(app_tasks.discard)
@@ -974,16 +1082,12 @@ async def _background_agent_sync(  # type: ignore[no-untyped-def]
             await pipeline.ingest_file(tmp.name, original_name=name, source_id=source_id)
         finally:
             Path(tmp.name).unlink(missing_ok=True)
-        store.db.execute(
-            "UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,)
-        )
+        store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,))
         store.db.commit()
         logger.info("Agent sync complete: source=%s url=%s", source_id, url)
     except Exception:
         logger.exception("Agent sync failed: source=%s url=%s", source_id, url)
-        store.db.execute(
-            "UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,)
-        )
+        store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
         store.db.commit()
 
 
@@ -1002,7 +1106,11 @@ async def delete_source(request: web.Request) -> web.Response:
     # tombstone; a hand-added source has no discovery loop to resurrect it.
     dismiss_uri = None
     try:
-        props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
+        props = (
+            json.loads(row["properties"])
+            if isinstance(row["properties"], str)
+            else (row["properties"] or {})
+        )
         if isinstance(props, dict) and props.get(AUTO_ADDED_PROP):
             dismiss_uri = row["uri"]
     except Exception:
@@ -1011,9 +1119,7 @@ async def delete_source(request: web.Request) -> web.Response:
         # BEGIN IMMEDIATE takes the write lock eagerly and the connection's
         # busy_timeout is 10s, so a concurrent ingestion writer could park this
         # call for that long -- never on the event loop.
-        await asyncio.to_thread(
-            store.delete_source_cascade, source_id, dismiss_uri=dismiss_uri
-        )
+        await asyncio.to_thread(store.delete_source_cascade, source_id, dismiss_uri=dismiss_uri)
     except Exception:
         logger.exception("delete_source failed: source_id=%s", source_id)
         return web.json_response({"error": "internal server error"}, status=500)
@@ -1044,7 +1150,8 @@ async def rename_source(request: web.Request) -> web.Response:
         return web.json_response({"error": "name cannot be empty"}, status=400)
     if len(name) > _MAX_SOURCE_NAME_LEN:
         return web.json_response(
-            {"error": f"name must be {_MAX_SOURCE_NAME_LEN} characters or fewer"}, status=400)
+            {"error": f"name must be {_MAX_SOURCE_NAME_LEN} characters or fewer"}, status=400
+        )
     store.update_source(source_id, name=name)
     _sel_log("source.rename", source_id=source_id)
     return web.json_response({"ok": True, "name": name})
@@ -1055,7 +1162,13 @@ def _track_scan_task(app: web.Application, task: asyncio.Task) -> None:  # type:
     tasks = app.setdefault("_scan_tasks", set())
     tasks.add(task)
     task.add_done_callback(tasks.discard)
-    task.add_done_callback(lambda t: logger.exception("scan_source failed", exc_info=t.exception()) if not t.cancelled() and t.exception() else None)
+    task.add_done_callback(
+        lambda t: (
+            logger.exception("scan_source failed", exc_info=t.exception())
+            if not t.cancelled() and t.exception()
+            else None
+        )
+    )
 
 
 async def confirm_source(request: web.Request) -> web.Response:
@@ -1070,7 +1183,11 @@ async def confirm_source(request: web.Request) -> web.Response:
     if is_sensitive_path(resolved_uri):
         _sel_log("source.confirm_denied", source_id=source_id, reason="sensitive_path")
         return web.json_response({"error": "Path is restricted for security reasons"}, status=403)
-    props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
+    props = (
+        json.loads(row["properties"])
+        if isinstance(row["properties"], str)
+        else (row["properties"] or {})
+    )
     props["sync_status"] = "active"
     props.pop("scan_paused", None)
     store.update_source(source_id, properties=props, sync_status="active")
@@ -1096,7 +1213,11 @@ async def pause_source(request: web.Request) -> web.Response:
     row = store.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
     if not row:
         return web.json_response({"error": "not found"}, status=404)
-    props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
+    props = (
+        json.loads(row["properties"])
+        if isinstance(row["properties"], str)
+        else (row["properties"] or {})
+    )
     props["scan_paused"] = True
     # Keep the JSON copy in sync with the column: the watcher's pre-scan skip
     # reads properties["sync_status"] (it selects `properties`, not the column),
@@ -1121,7 +1242,11 @@ async def resume_source(request: web.Request) -> web.Response:
     if is_sensitive_path(resolved_uri):
         _sel_log("source.resume_denied", source_id=source_id, reason="sensitive_path")
         return web.json_response({"error": "Path is restricted for security reasons"}, status=403)
-    props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
+    props = (
+        json.loads(row["properties"])
+        if isinstance(row["properties"], str)
+        else (row["properties"] or {})
+    )
     props.pop("scan_paused", None)
     props["sync_status"] = "active"
     store.update_source(source_id, properties=props, sync_status="active")
@@ -1143,17 +1268,26 @@ async def list_source_files(request: web.Request) -> web.Response:
     rows = store.db.execute(
         "SELECT file_path, status, error_message, mtime, content_hash, item_ids, last_seen "
         "FROM folder_file_state WHERE source_id = ? ORDER BY last_seen DESC",
-        (source_id,)).fetchall()
-    files = [{"file_path": r["file_path"], "status": r["status"] or "pending",
-              "error_message": _redact(r["error_message"]) if r["error_message"] else None,
-              "mtime": r["mtime"],
-              "item_count": len(json.loads(r["item_ids"] or "[]"))} for r in rows]
+        (source_id,),
+    ).fetchall()
+    files = [
+        {
+            "file_path": r["file_path"],
+            "status": r["status"] or "pending",
+            "error_message": _redact(r["error_message"]) if r["error_message"] else None,
+            "mtime": r["mtime"],
+            "item_count": len(json.loads(r["item_ids"] or "[]")),
+        }
+        for r in rows
+    ]
     # Also count totals
     total = len(files)
     done = sum(1 for f in files if f["status"] == "done")
     failed = sum(1 for f in files if f["status"] == "failed")
     skipped = sum(1 for f in files if f["status"] == "skipped")
-    return web.json_response({"files": files, "total": total, "done": done, "failed": failed, "skipped": skipped})
+    return web.json_response(
+        {"files": files, "total": total, "done": done, "failed": failed, "skipped": skipped}
+    )
 
 
 async def retry_file(request: web.Request) -> web.Response:
@@ -1169,7 +1303,8 @@ async def retry_file(request: web.Request) -> web.Response:
         return web.json_response({"error": "path is restricted"}, status=403)
     store.db.execute(
         "UPDATE folder_file_state SET status = 'pending', error_message = NULL WHERE source_id = ? AND file_path = ?",
-        (source_id, file_path))
+        (source_id, file_path),
+    )
     store.db.commit()
     _sel_log("source.file.retry", source_id=source_id)
     return web.json_response({"status": "pending"})
@@ -1188,7 +1323,8 @@ async def skip_file(request: web.Request) -> web.Response:
         return web.json_response({"error": "path is restricted"}, status=403)
     store.db.execute(
         "UPDATE folder_file_state SET status = 'skipped', error_message = NULL WHERE source_id = ? AND file_path = ?",
-        (source_id, file_path))
+        (source_id, file_path),
+    )
     store.db.commit()
     _sel_log("source.file.skip", source_id=source_id)
     return web.json_response({"status": "skipped"})
@@ -1220,8 +1356,9 @@ async def ingest_text(request: web.Request) -> web.Response:
     try:
         tmp.write(text.encode())
         tmp.close()
-        job_id = await pipeline.ingest_file(tmp.name, original_name=name,
-                                            namespace=namespace, source_id=source_id)
+        job_id = await pipeline.ingest_file(
+            tmp.name, original_name=name, namespace=namespace, source_id=source_id
+        )
         # Update source status
         store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,))
         store.db.commit()
@@ -1246,12 +1383,14 @@ async def get_config(request: web.Request) -> web.Response:
     # keep ``supported_formats`` as the clean extension list and surface the
     # no-extension capability via an explicit boolean instead of stripping the
     # information away entirely.
-    return web.json_response({
-        "enabled": pipeline is not None,
-        "supported_formats": sorted(FileReader.SUPPORTED - {''}),
-        "accepts_no_extension": '' in FileReader.SUPPORTED,
-        "folder_picker": _folder_picker_available(request),
-    })
+    return web.json_response(
+        {
+            "enabled": pipeline is not None,
+            "supported_formats": sorted(FileReader.SUPPORTED - {""}),
+            "accepts_no_extension": "" in FileReader.SUPPORTED,
+            "folder_picker": _folder_picker_available(request),
+        }
+    )
 
 
 # ---------- Stats ----------
@@ -1263,7 +1402,9 @@ async def get_stats(request: web.Request) -> web.Response:
     stats = store.get_stats()
     embedder = request.app.get("knowledge_embedder")
     if embedder:
-        embedded_count = store.db.execute("SELECT COUNT(*) FROM items WHERE embedding IS NOT NULL").fetchone()[0]
+        embedded_count = store.db.execute(
+            "SELECT COUNT(*) FROM items WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
         available = await embedder.is_available_async()
         stats["embeddings"] = {
             "enabled": True,
@@ -1345,7 +1486,9 @@ async def ingest_file(request: web.Request) -> web.Response:
                 tmp.close()
                 Path(tmp.name).unlink(missing_ok=True)
                 return web.json_response(
-                    {"error": f"file too large (max {_MAX_INGEST_FILE_SIZE // (1024 * 1024)} MB)"}, status=413)
+                    {"error": f"file too large (max {_MAX_INGEST_FILE_SIZE // (1024 * 1024)} MB)"},
+                    status=413,
+                )
             if len(head) < 16:
                 head.extend(chunk[: 16 - len(head)])
             tmp.write(chunk)
@@ -1360,7 +1503,8 @@ async def ingest_file(request: web.Request) -> web.Response:
             Path(tmp.name).unlink(missing_ok=True)
             _sel_log("ingest", filename=filename, outcome="rejected")
             return web.json_response(
-                {"error": f"file content does not match its type: {ext}"}, status=400)
+                {"error": f"file content does not match its type: {ext}"}, status=400
+            )
 
         # Decompression-bomb guard (CWE-770): a valid-signature OOXML/zip can
         # still be a bomb whose members expand unbounded once python-docx / the
@@ -1375,7 +1519,8 @@ async def ingest_file(request: web.Request) -> web.Response:
                 Path(tmp.name).unlink(missing_ok=True)
                 _sel_log("ingest", filename=filename, outcome="rejected", reason=reason)
                 return web.json_response(
-                    {"error": f"{ext} archive rejected ({reason})"}, status=400)
+                    {"error": f"{ext} archive rejected ({reason})"}, status=400
+                )
 
         # Create source record immediately so it appears in the UI
         store = _store(request)
@@ -1383,18 +1528,24 @@ async def ingest_file(request: web.Request) -> web.Response:
         existing = store.get_source_by_uri(uri)
         if not existing:
             source_id = store.add_source(
-                name=filename, source_type='local_file', uri=uri,
+                name=filename,
+                source_type="local_file",
+                uri=uri,
                 properties={},
             )
-            store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (source_id,))
+            store.db.execute(
+                "UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (source_id,)
+            )
             store.db.commit()
         else:
-            source_id = existing['id']
+            source_id = existing["id"]
 
         # Run extraction in background so response returns immediately
         async def _bg_ingest(tmp_path: str, src_id: str) -> None:
             try:
-                await pipeline.ingest_file(tmp_path, original_name=filename, namespace=namespace, source_id=src_id)
+                await pipeline.ingest_file(
+                    tmp_path, original_name=filename, namespace=namespace, source_id=src_id
+                )
             except Exception:
                 logger.exception("Background ingestion failed for %s", filename)
                 store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (src_id,))
@@ -1418,8 +1569,9 @@ async def ingest_file(request: web.Request) -> web.Response:
 async def get_job(request: web.Request) -> web.Response:
     """GET /api/knowledge/jobs/{id}."""
     store = _store(request)
-    row = store.db.execute("SELECT * FROM ingestion_jobs WHERE id = ?",
-                           (request.match_info["id"],)).fetchone()
+    row = store.db.execute(
+        "SELECT * FROM ingestion_jobs WHERE id = ?", (request.match_info["id"],)
+    ).fetchone()
     if not row:
         return web.json_response({"error": "not found"}, status=404)
     return web.json_response(dict(row))
@@ -1436,7 +1588,9 @@ async def export_item(request: web.Request) -> web.Response:
     if not bundle:
         return web.json_response({"error": "not found"}, status=404)
     _sel_log("export_item", item_id=item_id)
-    return web.json_response(bundle, headers={"Content-Disposition": "attachment; filename=item.knowledge"})
+    return web.json_response(
+        bundle, headers={"Content-Disposition": "attachment; filename=item.knowledge"}
+    )
 
 
 async def export_all(request: web.Request) -> web.Response:
@@ -1445,9 +1599,11 @@ async def export_all(request: web.Request) -> web.Response:
     _sel_log("export_all", namespace=namespace)
     store = _store(request)
     bundle = store.export_all(namespace=namespace)
-    safe_ns = re.sub(r'[^\w.-]', '_', namespace) if namespace else None
+    safe_ns = re.sub(r"[^\w.-]", "_", namespace) if namespace else None
     filename = f"{safe_ns}.knowledge" if safe_ns else "knowledge.knowledge"
-    return web.json_response(bundle, headers={"Content-Disposition": f"attachment; filename={filename}"})
+    return web.json_response(
+        bundle, headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 
 async def import_bundle(request: web.Request) -> web.Response:
@@ -1483,25 +1639,28 @@ async def get_embedding_status(request: web.Request) -> web.Response:
     """GET /api/knowledge/embedding/status -- embedding config and progress."""
     store = _store(request)
     embedder = request.app.get("knowledge_embedder")
-    total = store.db.execute(
-        "SELECT COUNT(*) as c FROM items WHERE status = 'active'"
-    ).fetchone()["c"]
+    total = store.db.execute("SELECT COUNT(*) as c FROM items WHERE status = 'active'").fetchone()[
+        "c"
+    ]
     embedded = store.db.execute(
         "SELECT COUNT(*) as c FROM items WHERE status = 'active' AND embedding IS NOT NULL"
     ).fetchone()["c"]
     # Polled every 30s by the frontend — loop-safe probe.
     available = await embedder.is_available_async() if embedder else False
-    return web.json_response({
-        "enabled": embedder is not None,
-        "available": available,
-        "model": embedder.model if embedder else None,
-        "total_items": total,
-        "embedded_items": embedded,
-    })
+    return web.json_response(
+        {
+            "enabled": embedder is not None,
+            "available": available,
+            "model": embedder.model if embedder else None,
+            "total_items": total,
+            "embedded_items": embedded,
+        }
+    )
 
 
-async def _rebuild_embeddings_job(app: web.Application, store, embedder, job_id: str,
-                                  force: bool = False) -> None:
+async def _rebuild_embeddings_job(
+    app: web.Application, store, embedder, job_id: str, force: bool = False
+) -> None:
     """Background wrapper: run the sig-gated rebuild and finalize the job row.
 
     The re-embed loop itself lives in ``knowledge.ingestion.rebuild_embeddings`` so
@@ -1514,7 +1673,8 @@ async def _rebuild_embeddings_job(app: web.Application, store, embedder, job_id:
         store.db.execute(
             "UPDATE ingestion_jobs SET status = 'completed', items_processed = ?, updated_at = ? "
             "WHERE id = ?",
-            (processed, datetime.now().isoformat(), job_id))
+            (processed, datetime.now().isoformat(), job_id),
+        )
         store.db.commit()
         _sel_log("batch_embed", count=processed, rebuild=True, force=force)
     except BaseException as exc:
@@ -1528,7 +1688,8 @@ async def _rebuild_embeddings_job(app: web.Application, store, embedder, job_id:
             logger.exception("Embedding rebuild job %s failed", job_id)
         store.db.execute(
             "UPDATE ingestion_jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?",
-            (status, str(exc), datetime.now().isoformat(), job_id))
+            (status, str(exc), datetime.now().isoformat(), job_id),
+        )
         store.db.commit()
         _sel_log("batch_embed", rebuild=True, force=force, outcome=status)
         if is_cancel:
@@ -1570,7 +1731,8 @@ async def batch_embed_items(request: web.Request) -> web.Response:
                 {"job_id": active["id"] if active else None, "status": "processing"}
             )
         task = asyncio.create_task(
-            _rebuild_embeddings_job(request.app, store, embedder, job_id, force=force))
+            _rebuild_embeddings_job(request.app, store, embedder, job_id, force=force)
+        )
         app_tasks = request.app.setdefault("_bg_tasks", set())
         app_tasks.add(task)
         task.add_done_callback(app_tasks.discard)
@@ -1591,7 +1753,8 @@ async def batch_embed_items(request: web.Request) -> web.Response:
         if vec:
             store.db.execute(
                 "UPDATE items SET embedding = ?, embedding_sig = ?, embedded_at = ? WHERE id = ?",
-                (floats_to_bytes(vec), sig, datetime.now().isoformat(), row["id"]))
+                (floats_to_bytes(vec), sig, datetime.now().isoformat(), row["id"]),
+            )
             embedded += 1
             if embedded % 50 == 0:
                 store.db.commit()
@@ -1689,18 +1852,20 @@ async def search_for_context(request: web.Request) -> web.Response:
         if remaining_budget <= 0:
             break
         if tokens > remaining_budget:
-            content = content[:remaining_budget * 4]
+            content = content[: remaining_budget * 4]
             tokens = remaining_budget
         cards.append(_build_context_card(r, content, tokens))
         total_tokens += tokens
 
     _sel_log("search_for_context", query=_redact(q), results=len(cards))
-    return web.json_response({
-        "query": _redact(q),
-        "results": cards,
-        "total_tokens": total_tokens,
-        "max_tokens": max_tokens,
-    })
+    return web.json_response(
+        {
+            "query": _redact(q),
+            "results": cards,
+            "total_tokens": total_tokens,
+            "max_tokens": max_tokens,
+        }
+    )
 
 
 async def add_agent_document_route(request: web.Request) -> web.Response:
@@ -1747,9 +1912,13 @@ def setup_knowledge_routes(app: web.Application) -> None:
         store = app["state"].knowledge_store
         pool = LLMPool()
         embedder = _create_embedder(app)
-        pipeline = IngestionPipeline(store=store, extractor=EntityExtractor(pool=pool),
-                                     chunker=HeadingAwareChunker(), reader=FileReader(),
-                                     embedder=embedder)
+        pipeline = IngestionPipeline(
+            store=store,
+            extractor=EntityExtractor(pool=pool),
+            chunker=HeadingAwareChunker(),
+            reader=FileReader(),
+            embedder=embedder,
+        )
         app["knowledge_llm_pool"] = pool
         app["knowledge_embedder"] = embedder
         connectors: dict[str, "BaseConnector"] = {}
@@ -1781,8 +1950,7 @@ def setup_knowledge_routes(app: web.Application) -> None:
             )
         )
         app["knowledge_pipeline"] = pipeline
-        app["knowledge_sync"] = SyncScheduler(store=store, pipeline=pipeline,
-                                              connectors=connectors)
+        app["knowledge_sync"] = SyncScheduler(store=store, pipeline=pipeline, connectors=connectors)
         # Start source watcher (auto-watches local_file sources)
         app.on_startup.append(_start_watcher_async)
         # Start artifact ingest watcher (no-op unless auto-ingest is enabled)
@@ -1797,6 +1965,7 @@ def setup_knowledge_routes(app: web.Application) -> None:
     app.router.add_post("/api/knowledge/sources", add_source)
     app.router.add_post("/api/knowledge/pick-folder", pick_folder)
     app.router.add_post("/api/knowledge/sources/{id}/sync", sync_source)
+    app.router.add_post("/api/knowledge/sources/{id}/rebuild-graph", rebuild_graph)
     app.router.add_post("/api/knowledge/sources/{id}/confirm", confirm_source)
     app.router.add_post("/api/knowledge/sources/{id}/pause", pause_source)
     app.router.add_post("/api/knowledge/sources/{id}/resume", resume_source)

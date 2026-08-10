@@ -15,14 +15,16 @@ import type { Report, Screen, DiscoveryScreen } from './types'
 const CRITIC =
   'You are an experienced designer running a heuristic design critique — a fellow designer ' +
   'looking over someone’s work, not a title on a review panel.\n\n' +
-  'Before judging anything, load the method. Resolve the directory that holds it and read ' +
-  'both files from it:\n' +
-  '  python3 -c "import kiro_crew, pathlib; print(pathlib.Path(kiro_crew.__file__).parent / \'apps/builtins/design_critique/skills/design-critique\')"\n' +
-  'If that prints nothing or python3 is unavailable, try `python` instead, and if neither ' +
-  'works use glob to find a path ending in ' +
-  '`apps/builtins/design_critique/skills/design-critique/SKILL.md`. From that directory ' +
-  'read SKILL.md and frameworks/main-checklist.md with fs_read, then follow their method ' +
-  'exactly. Do this first, every time — without the checklist the critique is guesswork.\n\n' +
+  // This is the FIRST instruction of every prompt, and it used to be the denied
+  // `python3 -c "import kiro_crew, ..."` — so every run opened with a blocked
+  // tool call before it did anything, then burned turns on the "if that prints
+  // nothing… use glob" fallback. Load the skill by name instead: the agent
+  // resolves it the same way it resolves any other skill, and the two files are
+  // relative to it.
+  'Before judging anything, load the method: read SKILL.md and ' +
+  'frameworks/main-checklist.md from the design-critique skill with fs_read, then follow ' +
+  'their method exactly. Do this first, every time — without the checklist the critique is ' +
+  'guesswork.\n\n' +
   'Voice: lead with a one-line overall read and a health tally using the NN/g severity names ' +
   '(Cosmetic / Minor / Major / Catastrophe), then what is working, then the top 3-5 things ' +
   'you would tighten (element → problem → fix), then one line on what the evidence could not ' +
@@ -31,22 +33,37 @@ const CRITIC =
   'evidence cannot reveal, and never critique visuals from unrendered source.\n\n'
 
 // As a BUILTIN app, the skill's scripts live inside the installed kiro_crew
-// package, not under ~/.kiro/crew/apps. The path is machine-specific, so we never
-// hardcode it: instead every prompt that runs a script tells the agent to resolve
-// the two directories itself and substitute the printed paths wherever <SCRIPTS>
-// and <UPLOADS> appear. <SCRIPTS> is the skill's bundled scripts dir; <UPLOADS> is
-// the KiroCrew uploads dir (both derived with pathlib, no absolute paths baked in).
-const RESOLVE_PATHS =
-  'FIRST, resolve two directories on THIS machine and use the printed paths wherever ' +
-  '<SCRIPTS> and <UPLOADS> appear below. Run each command and read its single line of output:\n' +
-  '  <SCRIPTS> = the design-critique skill scripts dir:\n' +
-  '    python3 -c "import kiro_crew, pathlib; print(pathlib.Path(kiro_crew.__file__).parent / \'apps/builtins/design_critique/skills/design-critique/scripts\')"\n' +
-  '  <UPLOADS> = the KiroCrew uploads dir:\n' +
-  // Must go through config_dir(), not Path.home(): KIROCREW_HOME can move the
-  // data home (a dev instance does exactly that), and hardcoding ~/.kiro/crew
-  // would write captures into the production home and contaminate isolated data.
-  // This is the same resolution the upload handler itself uses.
-  '    python3 -c "from kiro_crew.config.paths import config_dir; print(config_dir() / \'uploads\')"\n\n'
+// package, not under ~/.kiro/crew/apps, so the path is machine-specific and must
+// never be hardcoded here.
+//
+// This used to make the agent resolve both paths by shelling out to
+// `python3 -c "import kiro_crew, ..."`. That command is DENIED by design:
+// `python -c` that imports kiro_crew reaches the CLI, and
+// `python -c "from kiro_crew.cli import main; main()" token` mints a dashboard
+// token — so security.py refuses the whole shape (see _SELF_IMPORT_RE, and
+// _INLINE_DYNAMIC_EXEC_RE which also closes the __import__/importlib rewrites).
+// Every run therefore opened with a blocked tool call and the agent detoured
+// looking for a way around it, including re-issuing the same command through an
+// MCP shell tool. The gate is right; asking for that command was the bug.
+//
+// Neither path needs a subprocess:
+//   <SCRIPTS>  the agent already loaded this skill, so it knows the directory it
+//              read SKILL.md from — the same convention builtin_skills use
+//              (browser-recording's `python3 <skill-dir>/scripts/...`).
+//   <UPLOADS>  a writable directory for rendered PNGs. The app passes the real
+//              one in when it has uploads (their absolute paths come back from
+//              /api/upload/file); otherwise the session's working directory is
+//              already isolated per run and readable back through /api/file-raw.
+// Both keep the "no absolute paths baked in" property that the python calls had.
+const RESOLVE_PATHS = (uploadsDir: string): string =>
+  'FIRST, fix two directories and use them wherever <SCRIPTS> and <UPLOADS> appear below. ' +
+  'Do NOT shell out to resolve them:\n' +
+  '  <SCRIPTS> = the `scripts/` directory inside the design-critique skill you have loaded ' +
+  '(the directory this skill\'s SKILL.md was read from).\n' +
+  '  <UPLOADS> = ' +
+  (uploadsDir
+    ? uploadsDir + '\n\n'
+    : 'your current working directory — save renders there.\n\n')
 
 // Shared tail: the JSON contract. Same shape for one screen or many.
 export const SCHEMA = (multi: boolean): string =>
@@ -101,7 +118,7 @@ export const IMAGES_PROMPT = (paths: string[], brief?: string): string => {
 // before judging them, using the skill's bundled scripts.
 // STEP 1 — find the candidate screens. No critique yet. The same chat slot is
 // reused for step 2, so a cloned repo stays on disk between the two calls.
-export const DISCOVER_PROMPT = (kind: string, value: string): string => {
+export const DISCOVER_PROMPT = (kind: string, value: string, uploadsDir = ''): string => {
   const how: Record<string, string> = {
     repo: 'Clone it shallow into a temp dir with credential prompts DISABLED so it can never ' +
       'hang: `GIT_TERMINAL_PROMPT=0 git clone --depth 1 <url> <dir>`. If the clone fails, do NOT ' +
@@ -134,7 +151,7 @@ export const DISCOVER_PROMPT = (kind: string, value: string): string => {
   const needsScripts = kind === 'repo' || kind === 'local' || kind === 'url'
   return (
     CRITIC +
-    (needsScripts ? RESOLVE_PATHS : '') +
+    (needsScripts ? RESOLVE_PATHS(uploadsDir) : '') +
     'Do NOT critique anything yet. I need to know what screens are IN this ' +
     (KIND_LABEL[kind] || 'design') + ' so the user can choose what to audit.\n\n' +
     'Target: ' + value + '\n\n' + (how[kind] || '') + '\n\n' +
@@ -163,9 +180,13 @@ export const DISCOVER_PROMPT = (kind: string, value: string): string => {
 }
 
 // STEP 2 — critique only the screens the user picked, in their order.
-export const SCOPED_PROMPT = (picks: DiscoveryScreen[], brief?: string): string =>
+export const SCOPED_PROMPT = (
+  picks: DiscoveryScreen[],
+  brief?: string,
+  uploadsDir = '',
+): string =>
   CRITIC +
-  RESOLVE_PATHS +
+  RESOLVE_PATHS(uploadsDir) +
   'Now critique exactly these screens, in this order' + (picks.length > 1 ? ' as one flow' : '') + ':\n' +
   picks.map((p, i) => (i + 1) + '. ' + p.label + ' — ' + (p.ref || p.id)).join('\n') + '\n\n' +
   (brief ? 'Context from the user: ' + brief + '\n\n' : '') +
@@ -204,3 +225,8 @@ export const ASK_PROMPT = (quote: string, question?: string): string =>
   'reasoning or the principle behind it and what they would actually change. No headings, no ' +
   'bullet lists, no restating the question. If the honest answer is that you are not sure or the ' +
   'evidence did not show it, say that plainly.'
+
+/** Test seam. CRITIC is prepended to every prompt and is where the denied
+ *  `python3 -c "import kiro_crew, …"` used to live, so the guard in
+ *  designCritiquePrompts.test.ts has to assert on it directly. */
+export const CRITIC_FOR_TEST = CRITIC

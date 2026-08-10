@@ -5960,6 +5960,12 @@
       "select": "선택",
       "workspace_name": "워크스페이스 이름",
       "workspace_name_2": "workspace-name"
+    },
+    "accountDropdown": {
+      "account_aria": "계정: {{name}}",
+      "locked_tooltip": "계정을 전환하려면 새 세션을 시작하세요",
+      "needs_login_tooltip": "먼저 이 계정으로 claude login을 실행하세요",
+      "switch_tooltip": "계정 전환"
     }
   },
   "hooks": {
@@ -7896,7 +7902,9 @@
         "shared": "공유",
         "summary": "요약",
         "tag1_tag2_tag3": "tag1, tag2, tag3",
-        "unarchive": "보관 해제"
+        "unarchive": "보관 해제",
+        "rendered": "렌더링",
+        "source": "소스"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} 임베딩됨({{pct}}%)",
@@ -8065,7 +8073,11 @@
         "use_sync_button_to_update": "동기화 버튼으로 업데이트하세요",
         "watch_anyway": "그래도 감시",
         "watches_folder_recursively_supported_files_auto": "폴더를 재귀적으로 감시합니다. 지원 파일은 자동으로 수집됩니다. 소스당 최대 5,000개 파일.",
-        "watching_folder": "폴더 감시 중"
+        "watching_folder": "폴더 감시 중",
+        "rebuild_graph": "그래프 재구축",
+        "rebuild_entity_graph": "엔티티 그래프 재구축",
+        "re_extract_entities_from_the_items_already_store": "이미 저장된 아이템에서 엔티티를 다시 추출합니다. 소스를 다시 읽지 않습니다.",
+        "rebuild_failed": "재구축 실패"
       }
     },
     "localStorageDebug": {
@@ -8294,7 +8306,8 @@
         "using_legacy_mode_agent_default_agent_as_agent_t": "레거시 모드 사용 중 — agent.default_agent를 에이전트 템플릿으로 사용",
         "warm_pool": "웜 풀",
         "workspace": "워크스페이스",
-        "workspaces": "워크스페이스"
+        "workspaces": "워크스페이스",
+        "backend_for_new_sessions_switching_clears_slot_m": "새 세션의 백엔드. 전환하면 슬롯 모델이 초기화됩니다."
       },
       "mcpTab": {
         "actions": "동작",
@@ -9446,7 +9459,13 @@
         "which_model_new_sessions_start_with_pick_a_model": "에이전트가 모델을 고정하지 않았을 때 새 세션이 시작할 모델입니다. Capabilities → Crews에서 에이전트별로 모델을 설정하거나, 세션 안에서 모델을 선택해 재정의하세요.",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "서브에이전트의 완료 이벤트를 상위 세션에 삽입할 때 스트림의 어느 부분을 유지할지 결정합니다. ‘앞부분’은 스트림 시작을 유지합니다(기본값, 기존 동작과 동일). ‘끝부분’은 최종 요약을 유지합니다. ‘양쪽’은 양 끝에서 일부를 유지하고 그 사이에 표시를 넣습니다.",
         "widget_density": "위젯 밀도",
-        "your_role": "사용자 역할"
+        "your_role": "사용자 역할",
+        "provider": "프로바이더",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "새 세션이 실행될 백엔드입니다.",
+        "switching_provider_affects_new_sessions_only_run": "새 세션에만 적용됩니다. 선택한 CLI에 로그인하세요: kiro login 또는 claude login.",
+        "failed_to_save_provider": "프로바이더를 저장하지 못했습니다"
       },
       "computerUsePanel": {
         "accessibility": "손쉬운 사용",

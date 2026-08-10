@@ -60,7 +60,10 @@ Use these tags: `image-visible` · `needs-html` · `needs-runtime` · `needs-flo
 - **Figma:** obtain design context and a screenshot; use declared values when available.
 - **Code or markup file** (HTML, JSX/TSX, Vue, Svelte, a CSS+HTML pair, etc.): **render it, then
   critique the pixels.** Use the renderer bundled with this skill. `<skill-dir>` is the directory
-  printed by the resolution command (`python3 -c "import kiro_crew, pathlib; print(pathlib.Path(kiro_crew.__file__).parent / 'apps/builtins/design_critique/skills/design-critique')"`), and the scripts live in `<skill-dir>/scripts`:
+  this SKILL.md was loaded from — do NOT shell out to compute it. (It used to name a
+  `python3 -c "import kiro_crew, …"` command, which `security.py` denies: inline Python that
+  imports the package reaches the CLI, and that same shape mints a dashboard token.) The
+  scripts live in `<skill-dir>/scripts`:
   `node <skill-dir>/scripts/render.mjs <file-or-url> <out.png> [--width=1280 --height=900 --full]`
   (prefers Playwright, falls back to headless Chrome). Then **`fs_read` the PNG to actually view
   it** and critique those pixels; inspect the DOM/computed styles for exact contrast and sizes.

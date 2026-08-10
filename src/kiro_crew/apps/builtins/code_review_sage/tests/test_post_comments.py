@@ -916,3 +916,32 @@ class TestDraftConfirmed(unittest.TestCase):
         got = [{"path": "src/a.py", "line": 4, "body": "widens scope"}]
         crlf = self._review(body="[code-review-sage] summary\r\n")
         self.assertTrue(self._confirm(crlf, got))
+
+    def test_confirms_a_pending_draft_served_in_the_legacy_lineless_shape(self):
+        """The list-comments-for-a-review endpoint serves a PENDING draft with
+        `line` and `original_line` both null on EVERY comment (only diff
+        positions survive), so requiring a line match refused every freshly
+        posted draft — the run reported "the posted draft could not be
+        confirmed" with the draft sitting right there on the pull request."""
+        got = [{"path": "src/a.py", "line": None, "original_line": None,
+                "position": 23, "original_position": 23, "body": "widens scope"}]
+        self.assertTrue(self._confirm(self._review(), got))
+
+    def test_refuses_a_lineless_draft_whose_comment_differs(self):
+        """The lineless fallback still compares what the review says."""
+        got = [{"path": "src/a.py", "line": None, "original_line": None,
+                "position": 23, "body": "a different finding"}]
+        self.assertFalse(self._confirm(self._review(), got))
+
+    def test_a_single_missing_line_among_real_ones_is_still_a_mismatch(self):
+        """Only the all-null pending shape gets the fallback: one null line in
+        an otherwise line-bearing draft keeps the strict comparison."""
+        payload = self._payload()
+        payload["comments"] = [
+            {"path": "src/a.py", "line": 4, "side": "RIGHT", "body": "widens scope"},
+            {"path": "src/b.py", "line": 9, "side": "RIGHT", "body": "leaks handle"},
+        ]
+        got = [{"path": "src/a.py", "line": 4, "body": "widens scope"},
+               {"path": "src/b.py", "line": None, "original_line": None,
+                "position": 12, "body": "leaks handle"}]
+        self.assertFalse(self._confirm(self._review(), got, payload=payload))

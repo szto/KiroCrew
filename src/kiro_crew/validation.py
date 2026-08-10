@@ -1327,10 +1327,15 @@ _ARTIFACT_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$")
 _ARTIFACT_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}$")
 _ARTIFACT_KIND_RE = re.compile(r"^(widget|html|markdown|svg|json|text|image|webapp)$")
 
-# Model identifiers passed to kiro-cli ``--model`` (AcpRuntime). First char
-# must be alphanumeric so a value can never be parsed as a CLI flag, and the
-# charset covers real model ids (gpt-5.6-sol, claude-sonnet-4.6) only.
-MODEL_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
+# Model identifiers accepted by AcpRuntime (and passed to kiro-cli ``--model``).
+# First char must be alphanumeric so a value can never be parsed as a CLI flag,
+# and the charset covers real model ids only — including the claude backend's
+# context-window suffix (``opus[1m]``, ``claude-fable-5[1m]``), which is why
+# brackets are in the set. They cannot make a value flag-like, no shell is
+# involved (argv is a list), and the dashboard's own ``agent.model`` validator
+# already accepts them; a stricter regex here just rejected ids the picker
+# legitimately offers.
+MODEL_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._\-\[\]]{0,127}$")
 _ARTIFACT_SOURCE_RE = re.compile(r"^(chat|cron|subagent|manual|import)$")
 # Single source of truth: the MCP save/update field cap MUST equal the store's
 # own content cap, else the tool path rejects content the store would accept
@@ -1733,9 +1738,7 @@ ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("owner", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("repo", str, required=True, max_len=MAX_SHORT_STRING),
-        FieldSpec(
-            "number", int, required=True, min_val=1, max_val=_ISSUE_RADAR_MAX_ITEM_NUMBER
-        ),
+        FieldSpec("number", int, required=True, min_val=1, max_val=_ISSUE_RADAR_MAX_ITEM_NUMBER),
         # provider/host/kind are REQUIRED, with no defaults, because together
         # with owner/repo they select the record's STORAGE NAMESPACE (see
         # ``store.provider_root``: public GitHub keeps the original
@@ -1747,9 +1750,7 @@ ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA = ToolSchema(
         # The caller always has this information to hand (`recordIdentityJson`
         # in ``website/src/apps/issue-radar/lib/links.ts`` emits all three), so
         # requiring them costs nothing and removes the ambiguity.
-        FieldSpec(
-            "provider", str, required=True, max_len=16, allowed=_ISSUE_RADAR_PROVIDERS
-        ),
+        FieldSpec("provider", str, required=True, max_len=16, allowed=_ISSUE_RADAR_PROVIDERS),
         FieldSpec("host", str, required=True, max_len=253),
         FieldSpec("kind", str, required=True, max_len=8, allowed=_ISSUE_RADAR_ITEM_KINDS),
         FieldSpec("status", str, max_len=16, allowed=_ISSUE_RADAR_STATUSES, default="resolved"),

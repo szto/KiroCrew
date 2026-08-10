@@ -6045,6 +6045,12 @@
       "select": "Auswählen",
       "workspace_name": "Workspace-Name",
       "workspace_name_2": "workspace-name"
+    },
+    "accountDropdown": {
+      "account_aria": "Konto: {{name}}",
+      "locked_tooltip": "Starte eine neue Sitzung, um das Konto zu wechseln",
+      "needs_login_tooltip": "Führe zuerst claude login für dieses Konto aus",
+      "switch_tooltip": "Konto wechseln"
     }
   },
   "hooks": {
@@ -8002,7 +8008,9 @@
         "shared": "gemeinsam",
         "summary": "Zusammenfassung",
         "tag1_tag2_tag3": "tag1, tag2, tag3",
-        "unarchive": "Aus dem Archiv holen"
+        "unarchive": "Aus dem Archiv holen",
+        "rendered": "Gerendert",
+        "source": "Quelltext"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} eingebettet ({{pct}}%)",
@@ -8172,7 +8180,11 @@
         "use_sync_button_to_update": "Verwenden Sie die Schaltfläche „Synchronisieren“ zum Aktualisieren",
         "watch_anyway": "Trotzdem überwachen",
         "watches_folder_recursively_supported_files_auto": "Überwacht den Ordner rekursiv. Unterstützte Dateien werden automatisch eingelesen. Max. 5.000 Dateien pro Quelle.",
-        "watching_folder": "Ordner wird überwacht"
+        "watching_folder": "Ordner wird überwacht",
+        "rebuild_graph": "Graph neu aufbauen",
+        "rebuild_entity_graph": "Entitätsgraphen neu aufbauen",
+        "re_extract_entities_from_the_items_already_store": "Extrahiert Entitäten erneut aus den bereits gespeicherten Einträgen. Die Quelle wird nicht neu gelesen.",
+        "rebuild_failed": "Neuaufbau fehlgeschlagen"
       }
     },
     "localStorageDebug": {
@@ -8401,7 +8413,8 @@
         "using_legacy_mode_agent_default_agent_as_agent_t": "Legacy-Modus wird verwendet — agent.default_agent als Agenten-Vorlage",
         "warm_pool": "Warm-Pool",
         "workspace": "Workspace",
-        "workspaces": "Workspaces"
+        "workspaces": "Workspaces",
+        "backend_for_new_sessions_switching_clears_slot_m": "Backend für neue Sitzungen. Ein Wechsel löscht die Slot-Modelle."
       },
       "mcpTab": {
         "actions": "Aktionen",
@@ -9560,7 +9573,13 @@
         "which_model_new_sessions_start_with_pick_a_model": "Mit welchem Modell neue Sitzungen starten, wenn ihr Agent keines festlegt. Lege pro Agent unter Agenten-Fähigkeiten → Crews ein Modell fest oder wähle innerhalb einer Sitzung eines, um es dort zu übersteuern.",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "Welcher Teil des Streams eines Subagenten beim Einfügen seines Abschlussereignisses in die übergeordnete Sitzung erhalten bleibt. „Kopf“ bewahrt den Anfang (Standard, entspricht dem Legacy-Verhalten). „Ende“ bewahrt die abschließende Zusammenfassung. „Beides“ behält einen Abschnitt von jedem Ende mit einer Markierung dazwischen.",
         "widget_density": "Widget-Dichte",
-        "your_role": "Ihre Rolle"
+        "your_role": "Ihre Rolle",
+        "provider": "Anbieter",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "Auf welchem Backend neue Sitzungen laufen.",
+        "switching_provider_affects_new_sessions_only_run": "Gilt nur für neue Sitzungen. Melde dich bei der gewählten CLI an: kiro login oder claude login.",
+        "failed_to_save_provider": "Anbieter konnte nicht gespeichert werden"
       },
       "computerUsePanel": {
         "accessibility": "Bedienungshilfen",

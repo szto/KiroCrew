@@ -773,6 +773,30 @@ DEFAULT_CWD_ALLOWED_ROOTS = [
     "~/workplaces",
 ]
 
+# Provider ids. ``claude_code`` drives claude-agent-acp through the ACP client's
+# ``ACP_BACKEND_CLAUDE`` seam — it is not a second transport, just a second backend
+# behind the same AcpProvider.
+PROVIDER_ACP = "acp"
+PROVIDER_CLAUDE_CODE = "claude_code"
+
+
+@dataclass
+class AccountConfig:
+    """One Claude account profile.
+
+    ``config_dir`` becomes ``CLAUDE_CONFIG_DIR`` for sessions on this account, which
+    is what isolates its credentials and history. Empty means Claude Code's own
+    default directory, so a profile can name an account without relocating it.
+    """
+
+    config_dir: str = field(
+        default="",
+        metadata=_meta(
+            "Config Directory",
+            "CLAUDE_CONFIG_DIR for this account. Empty uses Claude Code's default.",
+        ),
+    )
+
 
 @dataclass
 class AgentConfig:
@@ -821,8 +845,24 @@ class AgentConfig:
         ),
     )
     provider: str = field(
-        default="acp",
-        metadata=_meta("Provider", "LLM provider backend (KiroACP / kiro-cli).", enum=["acp"]),
+        default=PROVIDER_ACP,
+        metadata=_meta(
+            "Provider",
+            "LLM provider backend (KiroACP / kiro-cli, or Claude Code via claude-agent-acp).",
+            enum=[PROVIDER_ACP, PROVIDER_CLAUDE_CODE],
+        ),
+    )
+    account: str = field(
+        default="",
+        metadata=_meta(
+            "Account",
+            "Named account profile for the claude_code provider. Empty uses the first "
+            "declared profile, or Claude Code's default login when none are declared.",
+        ),
+    )
+    accounts: dict[str, AccountConfig] = field(
+        default_factory=dict,
+        metadata=_meta("Accounts", "Named Claude account profiles."),
     )
     default_agent: str = field(
         default="",
@@ -2729,7 +2769,12 @@ _SECURITY_BOUNDED_FIELDS: tuple[tuple[str, str, int, int], ...] = (
     ("agent", "max_subagents", 0, SUBAGENT_AUTO_MAX_CEILING),
     ("agent", "subagent_max_turns", 1, SUBAGENT_MAX_TURNS_CEILING),
     ("agent", "chat_turn_timeout_secs", CHAT_TURN_TIMEOUT_MIN, CHAT_TURN_TIMEOUT_MAX),
-    ("dashboard", "loop_stall_exit_after_secs", LOOP_STALL_EXIT_AFTER_MIN, LOOP_STALL_EXIT_AFTER_MAX),
+    (
+        "dashboard",
+        "loop_stall_exit_after_secs",
+        LOOP_STALL_EXIT_AFTER_MIN,
+        LOOP_STALL_EXIT_AFTER_MAX,
+    ),
     ("session", "pool_size", 0, POOL_SIZE_MAX),
 )
 
@@ -3075,6 +3120,23 @@ def _migrate_workspaces(raw_workspaces: dict) -> dict[str, WorkspaceConfig]:
     if not result:
         result["default"] = WorkspaceConfig(dir="workspace")
     return result
+
+
+def _parse_accounts(raw_accounts: dict) -> dict[str, AccountConfig]:
+    """Build ``AccountConfig`` entries, skipping malformed ones.
+
+    A hand-edited config must not abort boot: a non-dict entry is dropped with a
+    warning rather than raised, matching how the rest of the loader degrades.
+    """
+    parsed: dict[str, AccountConfig] = {}
+    if not isinstance(raw_accounts, dict):
+        return parsed
+    for name, entry in raw_accounts.items():
+        if not isinstance(entry, dict):
+            logger.warning("config: dropping malformed account profile %r", name)
+            continue
+        parsed[name] = AccountConfig(config_dir=str(entry.get("config_dir", "")))
+    return parsed
 
 
 def resolve_memory_store_config(
@@ -4620,7 +4682,9 @@ class KiroCrewConfig:
                 role_models=coerce_role_models(agent_data.get("role_models")),
                 role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
-                provider=agent_data.get("provider", "acp"),
+                provider=agent_data.get("provider", PROVIDER_ACP),
+                account=agent_data.get("account", ""),
+                accounts=_parse_accounts(agent_data.get("accounts", {})),
                 default_agent=agent_data.get("default_agent", ""),
                 sandbox=agent_data.get("sandbox", "auto"),
                 sandbox_allow_no_isolation=bool(
@@ -4662,12 +4726,8 @@ class KiroCrewConfig:
                 subagent_spawn_stagger_secs=_safe_float(
                     agent_data.get("subagent_spawn_stagger_secs", 2.0), 2.0
                 ),
-                resource_pressure_gb=_safe_float(
-                    agent_data.get("resource_pressure_gb", 4.0), 4.0
-                ),
-                resource_critical_gb=_safe_float(
-                    agent_data.get("resource_critical_gb", 2.0), 2.0
-                ),
+                resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
+                resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
                 subagent_max_turns=agent_data.get("subagent_max_turns", 100),
                 subagent_timeout_secs=agent_data.get("subagent_timeout_secs", 1800),
                 subagent_stall_idle_secs=_safe_int(
@@ -5503,10 +5563,18 @@ class KiroCrewConfig:
     def create_provider_factory(self) -> Callable:
         """Return a factory that creates LLMProvider instances from config.
 
-        KiroCrew is KiroACP-only: the sole provider is the ACP adapter driving
-        the kiro-cli backend. The factory accepts an optional ``session_key`` to
-        create a per-session subdirectory under ``workspace_root()``.
+        ``agent.provider`` selects the backend: ``acp`` drives kiro-cli, and
+        ``claude_code`` drives claude-agent-acp through the same AcpProvider with
+        a different ``acp_backend``. The factory accepts an optional
+        ``session_key`` to create a per-session subdirectory under
+        ``workspace_root()``.
         """
+        if self.agent.provider == PROVIDER_CLAUDE_CODE:
+            # circular import: providers.claude_code_factory -> providers.acp -> ... -> config
+            from kiro_crew.providers.claude_code_factory import build_claude_code_factory
+
+            return build_claude_code_factory(self)
+
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )
@@ -6021,7 +6089,8 @@ def resolve_effective_model(
     2. the bound kiro agent's pinned ``model`` (skipped for the built-in
        ``kirocrew`` agent, which tracks the global by design)
     3. the global ``agent.model`` default
-    4. the installed ``kirocrew.json`` / bundled ``defaults.json`` model
+    4. the installed ``kirocrew.json`` / bundled ``defaults.json`` model —
+       **kiro (``acp``) only**, since that file's model is a kiro id
 
     A per-session pick outranks all of these and is NOT considered here — the
     caller holds it. Returns ``""`` when every tier defers, meaning the backend
@@ -6040,6 +6109,20 @@ def resolve_effective_model(
     configured = normalize_agent_model(config.agent.model)
     if configured:
         return configured
+    if config.agent.provider == PROVIDER_CLAUDE_CODE:
+        # Tier 4 is a kiro-cli artifact: ``~/.kiro/agents/kirocrew.json`` is
+        # written by kiro tooling, so its ``model`` is a kiro id by construction
+        # (and it sits outside KIROCREW_HOME, so even an isolated instance reads
+        # the real one). Handing that to claude-agent-acp is a category error —
+        # it rejects the session outright, which surfaces far from here (a task
+        # runner reporting "Could not generate a plan").
+        #
+        # The registry cannot filter these out instead: ``opus`` and ``sonnet``
+        # are registry aliases AND real backend values, so dropping "ids the
+        # registry knows" would break the two most common picks. Skipping the
+        # tier by provider is the safe cut. "" means the backend picks, which is
+        # what "auto" should have meant here all along.
+        return ""
     # agent.model is "auto"/unset: fall through to the installed agent file the
     # factory would read, so the chip shows what will actually be used.
     return normalize_agent_model(config._resolve_agent_model())

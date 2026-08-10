@@ -3,6 +3,7 @@
 Provider-agnostic bounded pool of long-lived workers (CC or ACP).
 Both entity extraction and URL fetch acquire workers from this pool.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -33,11 +34,13 @@ except ImportError:
 try:
     from kiro_crew.session_pid import register_protected_pid, unregister_protected_pid
 except Exception:  # pragma: no cover - standalone / test fallback
+
     def register_protected_pid(pid: int) -> None:  # type: ignore[misc]
         return None
 
     def unregister_protected_pid(pid: int) -> None:  # type: ignore[misc]
         return None
+
 
 logger = logging.getLogger(__name__)
 
@@ -153,9 +156,7 @@ def _get_idle_ttl(config: Optional[dict] = None) -> float:
     value falls back to the default rather than silently disabling the reaper.
     """
     data = _read_config() if config is None else config
-    value = _section(data, "knowledge").get(
-        "pool_idle_ttl_secs", DEFAULT_IDLE_TTL_SECS
-    )
+    value = _section(data, "knowledge").get("pool_idle_ttl_secs", DEFAULT_IDLE_TTL_SECS)
     if isinstance(value, bool):
         return DEFAULT_IDLE_TTL_SECS
     if isinstance(value, (int, float)) and value >= 0:
@@ -255,7 +256,11 @@ class AcpWorker(Worker):
             register_protected_pid(pid)
         else:
             self._protected_pid = None
-        logger.info("AcpWorker: ready (agent=%s, pid=%s)", AGENT_NAME, getattr(self._client, '_pid', 'unknown'))
+        logger.info(
+            "AcpWorker: ready (agent=%s, pid=%s)",
+            AGENT_NAME,
+            getattr(self._client, "_pid", "unknown"),
+        )
 
     async def send_message(self, prompt: str, timeout: float = DEFAULT_TIMEOUT) -> str:
         if self._client is None or not self._client.is_ready:
@@ -329,10 +334,14 @@ class CCWorker(Worker):
             self._claude_bin,
             "-p",
             "--verbose",
-            "--model", "haiku",
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
-            "--permission-mode", "bypassPermissions",
+            "--model",
+            "haiku",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--permission-mode",
+            "bypassPermissions",
         ]
         # Optional URL-fetch tool. Empty by default (no built-in remote fetch on a
         # vanilla machine). Users can opt in by setting KIROCREW_KNOWLEDGE_FETCH_TOOLS
@@ -376,10 +385,7 @@ class CCWorker(Worker):
             await self._spawn()
         assert self._proc is not None and self._proc.stdin is not None
 
-        msg = json.dumps({
-            "type": "user",
-            "message": {"role": "user", "content": prompt}
-        })
+        msg = json.dumps({"type": "user", "message": {"role": "user", "content": prompt}})
         self._proc.stdin.write((msg + "\n").encode())
         await self._proc.stdin.drain()
 
@@ -390,7 +396,19 @@ class CCWorker(Worker):
             raise
 
     async def _collect_response(self) -> str:
-        """Collect text from events until a result event arrives."""
+        """Collect text from events until a result event arrives.
+
+        Only ``text`` blocks are collected — ``thinking`` blocks are not part of
+        the answer, and folding them in would break the JSON parse the extractor
+        runs on the response.
+
+        The terminal ``result`` event carries the final text as a **string**, not
+        a content-block dict, and it repeats what already streamed as assistant
+        blocks. So it is a FALLBACK: used only when nothing streamed, which keeps
+        a CLI that emits just the terminal event working without handing the
+        parser the same JSON object twice. The dict form is still accepted in
+        case a future/other build shapes it that way.
+        """
         text_parts: list[str] = []
         while True:
             event = await self._event_queue.get()
@@ -405,9 +423,14 @@ class CCWorker(Worker):
                         text_parts.append(block.get("text", ""))
 
             elif event_type == "result":
-                for block in event.get("result", {}).get("content", []):
-                    if block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
+                if not text_parts:
+                    result = event.get("result")
+                    if isinstance(result, str):
+                        text_parts.append(result)
+                    elif isinstance(result, dict):
+                        for block in result.get("content", []):
+                            if block.get("type") == "text":
+                                text_parts.append(block.get("text", ""))
                 break
 
         return "".join(text_parts)
@@ -511,7 +534,8 @@ class LLMPool:
                 self._reaper_task = asyncio.create_task(self._idle_reaper())
             logger.info(
                 "LLMPool started: %d workers, provider=%s",
-                self._pool_size, self._provider_type,
+                self._pool_size,
+                self._provider_type,
             )
 
     async def _create_worker(self) -> Worker:
@@ -649,7 +673,8 @@ class LLMPool:
             self._reaping_workers = None
         logger.info(
             "LLMPool: scaled to zero after %.0fs idle (%d workers freed)",
-            self._idle_ttl, len(workers),
+            self._idle_ttl,
+            len(workers),
         )
         return True
 

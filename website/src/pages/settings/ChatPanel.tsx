@@ -33,6 +33,17 @@ function restoreLabels(): string[] {
 const COMPACT_OPTIONS = ['20', '40', '60', '80', '90']
 const COMPACT_LABELS = ['20% (aggressive)', '40%', '60%', '80%', '90% (default)']
 
+/** Backend provider ids, mirroring `config.loader.PROVIDER_*`. The labels name the
+ *  CLI a user would have to be signed into, which is the thing that actually
+ *  differs to them — "acp"/"claude_code" are wire values, not product names. */
+const PROVIDER_OPTIONS = ['acp', 'claude_code']
+function providerLabels(): string[] {
+  return [
+    i18nT('pages.settings.chatPanel.provider_acp'),
+    i18nT('pages.settings.chatPanel.provider_claude_code'),
+  ]
+}
+
 // About You — slugs shared with onboarding step 2 and context.py's prompt maps.
 const ROLE_OPTIONS = ['', ...ROLE_SLUGS]
 function roleLabels(): string[] {
@@ -157,6 +168,7 @@ export function ChatPanel() {
   const mcQ = useQuery<{
     session?: { autocompact_pct?: number }
     agent?: {
+      provider?: string
       model?: string
       role_models?: { background?: string; subagent?: string }
       role_efforts?: { background?: string; subagent?: string }
@@ -291,6 +303,23 @@ export function ChatPanel() {
     onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_completion_keep_mode')),
   })
 
+  // ── Backend provider ──
+  // The fork ships two: kiro-cli over ACP, and Claude Code via claude-agent-acp.
+  // Switching rebuilds the provider factory and clears every slot's model server
+  // side (model aliases are provider-specific), so it only affects NEW sessions.
+  const agentProvider = mcCfg?.agent?.provider || 'acp'
+  const providerMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.provider', v),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+      // /api/models is provider-dispatched and the account list only exists on
+      // claude_code, so both are stale the instant the provider changes.
+      qc.invalidateQueries({ queryKey: ['available-models'] })
+      qc.invalidateQueries({ queryKey: ['accounts'] })
+    },
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_provider')),
+  })
+
   // ── Default model + default reasoning effort ──
   // These are the DEFAULTS for new sessions. A session's own model/effort
   // picker still overrides them per-slot; nothing here touches live sessions.
@@ -406,6 +435,16 @@ export function ChatPanel() {
             when left on Auto. */}
         <SettingsCard>
           <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.settings.chatPanel.role_chat')}</div>
+          <SettingsSelect
+            label={i18nT('pages.settings.chatPanel.provider')}
+            description={i18nT('pages.settings.chatPanel.which_backend_new_sessions_run_on')}
+            hint={i18nT('pages.settings.chatPanel.switching_provider_affects_new_sessions_only_run')}
+            value={agentProvider}
+            options={PROVIDER_OPTIONS}
+            optionLabels={providerLabels()}
+            onChange={v => providerMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+          />
           <SettingsSelect
             label={i18nT('pages.settings.chatPanel.default_model')}
             description={i18nT('pages.settings.chatPanel.which_model_new_sessions_start_with_pick_a_model')}

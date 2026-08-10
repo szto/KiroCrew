@@ -53,6 +53,9 @@ from kiro_crew.dashboard.handlers._shared import (  # noqa: E402, F401
     _resolve_aim_skill_path,
 )
 
+# ── Claude account profiles (handlers/accounts.py) ──
+from kiro_crew.dashboard.handlers.accounts import api_accounts_get  # noqa: E402, F401
+
 # ── Agents (extracted to handlers/agents.py) ──
 from kiro_crew.dashboard.handlers.agents import (  # noqa: E402, F401
     _auto_install_agent,
