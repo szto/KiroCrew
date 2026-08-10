@@ -6130,6 +6130,12 @@
       "select": "Sélectionner",
       "workspace_name": "Nom de l'espace de travail",
       "workspace_name_2": "workspace-name"
+    },
+    "accountDropdown": {
+      "account_aria": "Compte : {{name}}",
+      "locked_tooltip": "Démarrez une nouvelle session pour changer de compte",
+      "needs_login_tooltip": "Exécutez d'abord claude login pour ce compte",
+      "switch_tooltip": "Changer de compte"
     }
   },
   "hooks": {
@@ -8108,7 +8114,9 @@
         "shared": "partagé",
         "summary": "Résumé",
         "tag1_tag2_tag3": "étiquette1, étiquette2, étiquette3",
-        "unarchive": "Désarchiver"
+        "unarchive": "Désarchiver",
+        "rendered": "Rendu",
+        "source": "Source"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} vectorisés ({{pct}}%)",
@@ -8279,7 +8287,11 @@
         "use_sync_button_to_update": "Utilisez le bouton Synchroniser pour mettre à jour",
         "watch_anyway": "Surveiller quand même",
         "watches_folder_recursively_supported_files_auto": "Surveille le dossier de façon récursive. Les fichiers pris en charge sont ingérés automatiquement. 5 000 fichiers max par source.",
-        "watching_folder": "Surveillance du dossier"
+        "watching_folder": "Surveillance du dossier",
+        "rebuild_graph": "Reconstruire le graphe",
+        "rebuild_entity_graph": "Reconstruire le graphe d’entités",
+        "re_extract_entities_from_the_items_already_store": "Réextrait les entités des éléments déjà stockés. Ne relit pas la source.",
+        "rebuild_failed": "Échec de la reconstruction"
       }
     },
     "localStorageDebug": {
@@ -8508,7 +8520,8 @@
         "using_legacy_mode_agent_default_agent_as_agent_t": "Mode héritage — agent.default_agent comme modèle d'agent",
         "warm_pool": "Pool préchauffé",
         "workspace": "Espace de travail",
-        "workspaces": "Espaces de travail"
+        "workspaces": "Espaces de travail",
+        "backend_for_new_sessions_switching_clears_slot_m": "Backend des nouvelles sessions. Le changer efface les modèles des emplacements."
       },
       "mcpTab": {
         "actions": "Actions",
@@ -9674,7 +9687,13 @@
         "which_model_new_sessions_start_with_pick_a_model": "Le modèle avec lequel démarrent les nouvelles sessions quand leur agent n’en fixe aucun. Définis un modèle pour chaque crew dans Capacités de l’agent → Crews, ou choisis-en un dans une session pour le remplacer localement.",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "Quelle partie du flux d'un sous-agent conserver lors de l'injection de son événement de fin dans la session parente. Début conserve le commencement (par défaut, correspond au comportement historique). Fin conserve le résumé final. Les deux conserve une tranche à chaque extrémité, avec un marqueur entre elles.",
         "widget_density": "Densité des widgets",
-        "your_role": "Votre rôle"
+        "your_role": "Votre rôle",
+        "provider": "Fournisseur",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "Le backend sur lequel les nouvelles sessions s’exécutent.",
+        "switching_provider_affects_new_sessions_only_run": "S’applique uniquement aux nouvelles sessions. Connectez-vous à la CLI choisie : kiro login ou claude login.",
+        "failed_to_save_provider": "Échec de l’enregistrement du fournisseur"
       },
       "computerUsePanel": {
         "accessibility": "Accessibilité",

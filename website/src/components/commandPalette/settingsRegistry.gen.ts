@@ -269,6 +269,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.provider",
+    "label": "Provider",
+    "description": "Which backend new sessions run on.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
     "id": "chat.quick-send",
     "label": "Quick Send",
     "tab": "chat",

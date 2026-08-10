@@ -1,0 +1,67 @@
+# Kiro Crew gateway with the Claude Code backend — compose example.
+#
+# Build (from the repo root; the base image consumes the CI/`make wheel`
+# artifact in dist/, see docker/Dockerfile):
+#   make wheel
+#   docker build -f docker/Dockerfile . -t kirocrew:dev
+#   docker compose -f docker/compose.claude.yaml up -d --build
+#
+# One-time setup:
+#   docker compose -f docker/compose.claude.yaml exec kirocrew claude /login
+#       # headless OAuth: open the printed URL anywhere, paste the code back.
+#       # The grant lands in the volume (~/.claude/.credentials.json) and
+#       # survives image upgrades.
+#   docker compose -f docker/compose.claude.yaml exec kirocrew \
+#       kirocrew token --ttl 2h                  # mint a dashboard link
+# Then switch Settings → Chat → Provider to "Claude Code" in the dashboard
+# (or set agent.provider = "claude_code" in config.json inside the volume).
+#
+# Everything about networking, tokens, and the sandbox posture is the same
+# as the stock image: docs/guides/docker.md.
+
+services:
+  kirocrew:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.claude
+      args:
+        BASE_IMAGE: kirocrew:dev
+    image: kirocrew-claude:dev
+    container_name: kirocrew
+    restart: unless-stopped
+    ports:
+      # Loopback-published: only this machine reaches the dashboard. For LAN
+      # or public access put a TLS reverse proxy in front and see
+      # docs/guides/docker.md "Networking and security".
+      - "127.0.0.1:5476:5476"
+    volumes:
+      # One named volume persists everything: gateway state (~/.kiro/crew),
+      # the Claude login (~/.claude), agents, skills.
+      - kirocrew-home:/home/kirocrew
+    environment:
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}
+      KIROCREW_OWNER_ID: ${KIROCREW_OWNER_ID:-}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      WECOM_BOT_ID: ${WECOM_BOT_ID:-}
+      WECOM_SECRET: ${WECOM_SECRET:-}
+      WEBEX_BOT_TOKEN: ${WEBEX_BOT_TOKEN:-}
+      KIROCREW_ALLOW_UNSANDBOXED: ${KIROCREW_ALLOW_UNSANDBOXED:-}
+    # Inner user-namespace sandbox stays available inside the container (the
+    # alternative is consenting to unsandboxed exec via
+    # KIROCREW_ALLOW_UNSANDBOXED=1). Details: docs/guides/docker.md
+    # "Sandbox troubleshooting".
+    security_opt:
+      - seccomp:./seccomp/kirocrew-seccomp.json
+    deploy:
+      resources:
+        limits:
+          # Gateway ~0.7 GB resident (in-process embeddings included) plus
+          # ~0.35 GB per live session (adapter + its claude process). 2 GB
+          # covers the gateway and a couple of concurrent sessions; raise it
+          # rather than lower it if you run many parallel subagents.
+          memory: 2g
+
+volumes:
+  kirocrew-home:

@@ -4076,6 +4076,16 @@ _SENSITIVE_HOME_DIRS: list[str] = [
     ".local/share/amazon-q",
     "Library/Application Support/kiro-cli",
     "Library/Application Support/amazon-q",
+    # Claude Code's credential store. Holds the account OAuth grant (accessToken,
+    # refreshToken, subscriptionType, rateLimitTier) AND a per-MCP-server bearer
+    # token for every connected service, so an agent that could read it could
+    # impersonate the user against all of them. A LEAF, not the whole ~/.claude:
+    # CLAUDE.md and settings.json in the same directory are legitimate agent reads
+    # (the .docker/config.json precedent above). Write is covered too — a writable
+    # credentials file is a token-replacement vector, not just a disclosure one.
+    # claude-agent-acp reads it through its own process env, never this gate, so
+    # classifying it does not break the backend.
+    ".claude/.credentials.json",
 ]
 
 # ── KiroCrew's own data-home secrets & governance trust-root ──
@@ -4146,6 +4156,13 @@ _CREW_SECRET_LEAVES: list[str] = [
     "app_admission.json",
     "security_policy.json",
     "profiles",
+    # Account profiles are Claude Code config dirs, so each one holds its own
+    # credential store. A whole DIRECTORY entry (like ``profiles``) rather than a
+    # leaf: _CREW_SECRET_LEAVES joins exact ``{prefix}/{leaf}`` paths and does not
+    # glob, so there is no way to name ``accounts/*/.credentials.json``. Covering
+    # the directory is also the safer default — a config dir accumulates history
+    # and settings sidecars that can carry the same bytes.
+    "accounts",
     "admission_policy.json",
     "denied_commands.json",
     # Which checkout the gateway executes (Dev Fleet "Make live"). The pointer is

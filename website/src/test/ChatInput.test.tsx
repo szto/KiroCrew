@@ -13,6 +13,12 @@ import type { PasteBlock } from '../utils/pasteTokens'
 const touchEnv = vi.hoisted(() => ({ touch: false }))
 vi.mock('../utils/isTouchDevice', () => ({ isTouchDevice: () => touchEnv.touch }))
 
+// AccountDropdown queries /api/accounts on mount. The prompt-optimizer tests
+// below capture the resolver of the LAST global-fetch call, so an extra fetch
+// from a child component would silently steal it and starve the optimize
+// request. The dropdown has its own test file; here it is not under test.
+vi.mock('../components/AccountDropdown', () => ({ default: () => null }))
+
 const defaultProps = {
   value: '',
   onChange: vi.fn(),

@@ -6130,6 +6130,12 @@
       "select": "Seleziona",
       "workspace_name": "Nome del workspace",
       "workspace_name_2": "workspace-name"
+    },
+    "accountDropdown": {
+      "account_aria": "Account: {{name}}",
+      "locked_tooltip": "Avvia una nuova sessione per cambiare account",
+      "needs_login_tooltip": "Esegui prima claude login per questo account",
+      "switch_tooltip": "Cambia account"
     }
   },
   "hooks": {
@@ -8108,7 +8114,9 @@
         "shared": "condiviso",
         "summary": "Riepilogo",
         "tag1_tag2_tag3": "tag1, tag2, tag3",
-        "unarchive": "Rimuovi dall'archivio"
+        "unarchive": "Rimuovi dall'archivio",
+        "rendered": "Renderizzato",
+        "source": "Sorgente"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} incorporato ({{pct}}%)",
@@ -8279,7 +8287,11 @@
         "use_sync_button_to_update": "Usa il pulsante Sincronizza per aggiornare",
         "watch_anyway": "Monitora comunque",
         "watches_folder_recursively_supported_files_auto": "Monitora la cartella in modo ricorsivo. I file supportati vengono acquisiti automaticamente. Massimo 5.000 file per origine.",
-        "watching_folder": "Monitoraggio della cartella"
+        "watching_folder": "Monitoraggio della cartella",
+        "rebuild_graph": "Ricostruisci grafo",
+        "rebuild_entity_graph": "Ricostruisci il grafo delle entità",
+        "re_extract_entities_from_the_items_already_store": "Riestrae le entità dagli elementi già memorizzati. Non rilegge la sorgente.",
+        "rebuild_failed": "Ricostruzione non riuscita"
       }
     },
     "localStorageDebug": {
@@ -8508,7 +8520,8 @@
         "using_legacy_mode_agent_default_agent_as_agent_t": "Modalità legacy in uso — agent.default_agent come modello di agente",
         "warm_pool": "Pool caldo",
         "workspace": "Workspace",
-        "workspaces": "Workspace"
+        "workspaces": "Workspace",
+        "backend_for_new_sessions_switching_clears_slot_m": "Backend per le nuove sessioni. Il cambio azzera i modelli degli slot."
       },
       "mcpTab": {
         "actions": "Azioni",
@@ -9674,7 +9687,13 @@
         "which_model_new_sessions_start_with_pick_a_model": "Con quale modello si avviano le nuove sessioni quando il loro agente non ne specifica uno. Imposta un modello per ogni agente in Capacità dell'agente → Crews, oppure scegline uno all'interno di una sessione per sostituirlo lì.",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "Quale parte del flusso di un subagente conservare quando il suo evento di completamento viene inserito nella sessione principale. \"Inizio\" conserva la parte iniziale (predefinito, corrisponde al comportamento legacy). \"Fine\" conserva il riepilogo finale. \"Entrambi\" conserva una porzione da ciascuna estremità con un indicatore tra le due.",
         "widget_density": "Densità dei widget",
-        "your_role": "Il tuo ruolo"
+        "your_role": "Il tuo ruolo",
+        "provider": "Provider",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "Su quale backend vengono eseguite le nuove sessioni.",
+        "switching_provider_affects_new_sessions_only_run": "Si applica solo alle nuove sessioni. Accedi alla CLI scelta: kiro login o claude login.",
+        "failed_to_save_provider": "Impossibile salvare il provider"
       },
       "computerUsePanel": {
         "accessibility": "Accessibilità",

@@ -4,6 +4,7 @@ The ``AcpRuntime``/``AcpSessionHandle`` layer is faked so the executor's
 concurrency, batch lifecycle, per-task session isolation, tool auto-approval,
 and SEL audit are exercised without spawning a real kiro-cli process.
 """
+
 import asyncio
 import json
 import tempfile
@@ -72,10 +73,11 @@ class FakeRuntime:
     def __init__(self, agent=None, work_dir=None, sandbox_mode="auto", **kw):
         self.agent = agent
         self.work_dir = work_dir
+        self.kw = kw
         self.spawned = False
         self.killed = False
         self.sessions: dict = {}
-        self._session_queues: dict = {}   # read by holder.stats()
+        self._session_queues: dict = {}  # read by holder.stats()
         self.active = 0
         self.max_active = 0
         self._seq = 0
@@ -106,6 +108,7 @@ class FakeRuntime:
         async def _destroy():
             self._session_queues.pop(sid, None)
             await _orig()
+
         h.destroy = _destroy  # type: ignore[method-assign]
         return h
 
@@ -115,13 +118,40 @@ def _install_fake_runtime(test, script=None, gate=None):
     FakeRuntime.instances = []
 
     def factory(agent=None, work_dir=None, sandbox_mode="auto", **kw):
-        r = FakeRuntime(agent=agent, work_dir=work_dir, sandbox_mode=sandbox_mode)
+        r = FakeRuntime(agent=agent, work_dir=work_dir, sandbox_mode=sandbox_mode, **kw)
         r.script = script or []
         r.gate = gate
         return r
+
     orig = rp.AcpRuntime
     rp.AcpRuntime = factory  # type: ignore[assignment]
     test.addCleanup(lambda: setattr(rp, "AcpRuntime", orig))
+
+
+# ── Backend threading ───────────────────────────────────────────────────────
+class TestBackendThreading(unittest.IsolatedAsyncioTestCase):
+    """The pool spawns its runtime directly (no parent provider), so it must
+    thread the configured ACP backend itself: unthreaded, a ``claude_code``
+    deployment silently spawns kiro-cli, which the operator may not be signed
+    into — the review dies at spawn with ``process exited (rc=1)``."""
+
+    async def test_runtime_gets_configured_backend(self):
+        _install_fake_runtime(self)
+        orig = rp._configured_acp_backend
+        rp._configured_acp_backend = lambda: "claude"  # type: ignore[assignment]
+        self.addCleanup(lambda: setattr(rp, "_configured_acp_backend", orig))
+        pool = ReviewPool(work_dir="/tmp/x")
+        await pool.begin_batch()
+        self.assertEqual(FakeRuntime.instances[0].kw.get("acp_backend"), "claude")
+
+    async def test_runtime_defaults_to_kiro_backend(self):
+        _install_fake_runtime(self)
+        orig = rp._configured_acp_backend
+        rp._configured_acp_backend = lambda: ""  # type: ignore[assignment]
+        self.addCleanup(lambda: setattr(rp, "_configured_acp_backend", orig))
+        pool = ReviewPool(work_dir="/tmp/x")
+        await pool.begin_batch()
+        self.assertEqual(FakeRuntime.instances[0].kw.get("acp_backend"), "")
 
 
 # ── Batch lifecycle + isolation ─────────────────────────────────────────────
@@ -129,7 +159,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
     async def test_lazy_no_runtime_until_used(self):
         _install_fake_runtime(self)
         ReviewPool(work_dir="/tmp/x")
-        self.assertEqual(FakeRuntime.instances, [])   # nothing spawned on construction
+        self.assertEqual(FakeRuntime.instances, [])  # nothing spawned on construction
 
     async def test_begin_batch_spawns_one_runtime_shared_across_sends(self):
         _install_fake_runtime(self, script=[_ev(rp.EVENT_TEXT_CHUNK, text="hi")])
@@ -148,12 +178,12 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
     async def test_end_batch_kills_runtime_only_when_drained(self):
         _install_fake_runtime(self)
         pool = ReviewPool(work_dir="/tmp/x")
-        await pool.begin_batch()          # batches 0->1 spawns
-        await pool.begin_batch()          # batches 1->2 (overlapping run)
+        await pool.begin_batch()  # batches 0->1 spawns
+        await pool.begin_batch()  # batches 1->2 (overlapping run)
         rt = FakeRuntime.instances[0]
-        await pool.end_batch()            # batches 2->1: NOT killed
+        await pool.end_batch()  # batches 2->1: NOT killed
         self.assertFalse(rt.killed)
-        await pool.end_batch()            # batches 1->0: killed
+        await pool.end_batch()  # batches 1->0: killed
         self.assertTrue(rt.killed)
 
     async def test_new_batch_after_drain_spawns_fresh_runtime(self):
@@ -162,7 +192,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         await pool.begin_batch()
         await pool.end_batch()
         await pool.begin_batch()
-        self.assertEqual(len(FakeRuntime.instances), 2)   # a fresh runtime per batch
+        self.assertEqual(len(FakeRuntime.instances), 2)  # a fresh runtime per batch
         await pool.end_batch()
 
     async def test_session_created_and_destroyed_per_task(self):
@@ -173,7 +203,7 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         rt = FakeRuntime.instances[0]
         # exactly one session was created, and it was destroyed (no leak)
         self.assertEqual(rt._seq, 1)
-        self.assertEqual(rt._session_queues, {})          # destroyed -> unregistered
+        self.assertEqual(rt._session_queues, {})  # destroyed -> unregistered
         await pool.end_batch()
 
     async def test_standalone_send_lazily_spawns(self):
@@ -196,14 +226,15 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await pool.send("t")
         rt = FakeRuntime.instances[0]
-        self.assertEqual(rt._session_queues, {})   # session destroyed despite the raise
+        self.assertEqual(rt._session_queues, {})  # session destroyed despite the raise
         await pool.end_batch()
 
     async def test_tool_stall_stop_reason_is_abnormal(self):
         # STOP_REASON_TOOL_STALL ("error: tool stall") must be classified abnormal
         # and surface as a failure (matched explicitly, not just by prefix).
         _install_fake_runtime(
-            self, script=[_ev(rp.EVENT_COMPLETE, stop_reason=rp.STOP_REASON_TOOL_STALL)])
+            self, script=[_ev(rp.EVENT_COMPLETE, stop_reason=rp.STOP_REASON_TOOL_STALL)]
+        )
         pool = ReviewPool(work_dir="/tmp/x")
         await pool.begin_batch()
         with self.assertRaises(RuntimeError):
@@ -219,18 +250,21 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
             r = FakeRuntime(agent=agent, work_dir=work_dir)
             calls["n"] += 1
             if calls["n"] == 1:
+
                 async def _boom():
                     raise RuntimeError("spawn boom")
+
                 r.spawn = _boom  # type: ignore[method-assign]
             return r
+
         orig = rp.AcpRuntime
         rp.AcpRuntime = factory  # type: ignore[assignment]
         self.addCleanup(lambda: setattr(rp, "AcpRuntime", orig))
         FakeRuntime.instances = []
         pool = ReviewPool(work_dir="/tmp/x")
         with self.assertRaises(RuntimeError):
-            await pool.begin_batch()                 # spawn fails
-        self.assertEqual(pool._holder._batches, 0)   # counter not leaked
+            await pool.begin_batch()  # spawn fails
+        self.assertEqual(pool._holder._batches, 0)  # counter not leaked
         # a subsequent batch spawns cleanly and drains to 0 (runtime killed)
         await pool.begin_batch()
         await pool.end_batch()
@@ -247,11 +281,11 @@ class TestConcurrency(unittest.IsolatedAsyncioTestCase):
         tasks = [asyncio.create_task(pool.send(f"t{i}")) for i in range(4)]
         await asyncio.sleep(0.05)
         rt = FakeRuntime.instances[0]
-        self.assertEqual(rt.active, 2)             # only 2 in flight at once
+        self.assertEqual(rt.active, 2)  # only 2 in flight at once
         self.assertLessEqual(rt.max_active, 2)
         gate.set()
         await asyncio.gather(*tasks)
-        self.assertLessEqual(rt.max_active, 2)     # never exceeded the cap
+        self.assertLessEqual(rt.max_active, 2)  # never exceeded the cap
         await pool.end_batch()
 
     async def test_effective_max_concurrent_clamped(self):
@@ -284,11 +318,13 @@ class TestApprovalAndAudit(unittest.IsolatedAsyncioTestCase):
             def log_tool_invocation(self, **kw):
                 calls.append(kw)
 
-        script = [_ev(rp.EVENT_TOOL_CALL, title="shell", tool_kind="execute"),
-                  _ev(rp.EVENT_TEXT_CHUNK, text="ok")]
+        script = [
+            _ev(rp.EVENT_TOOL_CALL, title="shell", tool_kind="execute"),
+            _ev(rp.EVENT_TEXT_CHUNK, text="ok"),
+        ]
         _install_fake_runtime(self, script=script)
         orig_sel = rp._sel
-        rp._sel = lambda: _FakeSel()          # type: ignore[assignment]
+        rp._sel = lambda: _FakeSel()  # type: ignore[assignment]
         self.addCleanup(lambda: setattr(rp, "_sel", orig_sel))
         pool = ReviewPool(work_dir="/tmp/x")
         await pool.begin_batch()
@@ -308,12 +344,13 @@ class TestApprovalAndAudit(unittest.IsolatedAsyncioTestCase):
             def log_tool_invocation(self, **kw):
                 calls.append(kw)
 
-        script = [_ev(rp.EVENT_PERMISSION_REQUEST, request_id="r1",
-                      title="shell", tool_kind="execute"),
-                  _ev(rp.EVENT_TEXT_CHUNK, text="ok")]
+        script = [
+            _ev(rp.EVENT_PERMISSION_REQUEST, request_id="r1", title="shell", tool_kind="execute"),
+            _ev(rp.EVENT_TEXT_CHUNK, text="ok"),
+        ]
         _install_fake_runtime(self, script=script)
         orig_sel = rp._sel
-        rp._sel = lambda: _FakeSel()          # type: ignore[assignment]
+        rp._sel = lambda: _FakeSel()  # type: ignore[assignment]
         self.addCleanup(lambda: setattr(rp, "_sel", orig_sel))
         pool = ReviewPool(work_dir="/tmp/x")
         await pool.begin_batch()
@@ -374,6 +411,7 @@ class TestSyncDispatchBridge(unittest.TestCase):
             r = FakeRuntime(agent=agent, work_dir=work_dir)
             r.script = [_ev(rp.EVENT_TEXT_CHUNK, text="hello")]
             return r
+
         orig = rp.AcpRuntime
         rp.AcpRuntime = factory  # type: ignore[assignment]
         try:
@@ -395,8 +433,10 @@ class TestSyncDispatchBridge(unittest.TestCase):
 
             async def _boom(cwd=None, agent=None):
                 raise RuntimeError("boom")
-            r.create_session = _boom   # type: ignore[assignment]
+
+            r.create_session = _boom  # type: ignore[assignment]
             return r
+
         orig = rp.AcpRuntime
         rp.AcpRuntime = factory  # type: ignore[assignment]
         try:
@@ -413,8 +453,7 @@ class TestSyncDispatchBridge(unittest.TestCase):
 # ── Reviewer identity resolution ─────────────────────────────────────────────
 class TestReviewAgentResolution(unittest.TestCase):
     def test_fallback_to_kirocrew_when_dedicated_missing(self):
-        self.assertEqual(
-            _resolve_review_agent("definitely-not-installed-xyz"), "kirocrew")
+        self.assertEqual(_resolve_review_agent("definitely-not-installed-xyz"), "kirocrew")
 
     def test_review_work_dir_is_app_root(self):
         wd = _review_work_dir()
@@ -436,34 +475,37 @@ class TestReviewEffort(unittest.TestCase):
             cli = Path(tmp) / ".kiro" / "settings" / "cli.json"
             self.assertTrue(cli.is_file(), "overlay cli.json not written")
             data = json.loads(cli.read_text(encoding="utf-8"))
-            effort = (data["chat.modelDefaults"]["claude-sonnet-4.6"]
-                      ["output_config"]["effort"])
+            effort = data["chat.modelDefaults"]["claude-sonnet-4.6"]["output_config"]["effort"]
             self.assertEqual(effort, REVIEW_EFFORT)
 
     def test_write_effort_overlay_is_merge_safe(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = Path(tmp) / ".kiro" / "settings"
             settings.mkdir(parents=True)
-            (settings / "cli.json").write_text(json.dumps({
-                "chat.modelDefaults": {"other-model": {"output_config": {"effort": "low"}}},
-                "unrelated.key": 42,
-            }), encoding="utf-8")
+            (settings / "cli.json").write_text(
+                json.dumps(
+                    {
+                        "chat.modelDefaults": {"other-model": {"output_config": {"effort": "low"}}},
+                        "unrelated.key": 42,
+                    }
+                ),
+                encoding="utf-8",
+            )
             _write_effort_overlay(tmp, "claude-sonnet-4.6", "high")
             data = json.loads((settings / "cli.json").read_text(encoding="utf-8"))
             self.assertEqual(
-                data["chat.modelDefaults"]["claude-sonnet-4.6"]["output_config"]["effort"],
-                "high")
+                data["chat.modelDefaults"]["claude-sonnet-4.6"]["output_config"]["effort"], "high"
+            )
             self.assertEqual(
-                data["chat.modelDefaults"]["other-model"]["output_config"]["effort"],
-                "low")
+                data["chat.modelDefaults"]["other-model"]["output_config"]["effort"], "low"
+            )
             self.assertEqual(data["unrelated.key"], 42)
 
     def test_write_effort_overlay_never_raises(self):
         _write_effort_overlay("/proc/nonexistent/\x00bad", "claude-sonnet-4.6")
 
     def test_reviewer_model_falls_back_to_default(self):
-        self.assertEqual(
-            _reviewer_model("definitely-not-installed-xyz"), _DEFAULT_REVIEW_MODEL)
+        self.assertEqual(_reviewer_model("definitely-not-installed-xyz"), _DEFAULT_REVIEW_MODEL)
 
     def test_reviewer_info_reports_agent_model_and_effort(self):
         info = reviewer_info()

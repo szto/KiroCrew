@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Upload, FolderSync, FolderOpen, X, RefreshCw, AlertCircle, CheckCircle, ChevronDown, ChevronRight, Pause, Play, Pencil, Check } from 'lucide-react'
+import { Upload, FolderSync, FolderOpen, X, RefreshCw, AlertCircle, CheckCircle, ChevronDown, ChevronRight, Pause, Play, Pencil, Check, Network } from 'lucide-react'
 import { Badge, EmptyState, ContentSkeleton } from '../../components/ui'
 import Clickable from '../../components/Clickable'
 import { knowledgeApi } from './api'
@@ -254,6 +254,29 @@ export default function SourcesList({ onIngest, uploadNamespace, setUploadNamesp
     }
   }
 
+  // Re-extracts entities from the items already stored, without re-reading the
+  // origin. Sync cannot do this: it skips files whose content is unchanged,
+  // which is every file when the text is fine and only the extraction was lost.
+  const [rebuildingIds, setRebuildingIds] = useState<Set<string>>(new Set())
+  const [rebuildError, setRebuildError] = useState('')
+
+  const rebuildGraph = async (id: string) => {
+    setRebuildError('')
+    setRebuildingIds(prev => new Set(prev).add(id))
+    try {
+      await knowledgeApi(`/sources/${id}/rebuild-graph`, { method: 'POST' })
+      // The rebuild runs in the background, so refresh the views it lands in
+      // rather than reporting a result the request itself cannot carry.
+      queryClient.invalidateQueries({ queryKey: ['knowledge-sources'] })
+      queryClient.invalidateQueries({ queryKey: ['knowledge-graph'] })
+      queryClient.invalidateQueries({ queryKey: ['knowledge-stats'] })
+    } catch (e) {
+      setRebuildError(e instanceof Error ? e.message : i18nT('pages.knowledge.sourcesList.rebuild_failed'))
+    } finally {
+      setRebuildingIds(prev => { const next = new Set(prev); next.delete(id); return next })
+    }
+  }
+
   const { data: kbConfig } = useQuery({
     queryKey: ['knowledge-config'],
     queryFn: () => knowledgeApi<{ enabled: boolean; supported_formats: string[]; folder_picker?: boolean }>('/config'),
@@ -430,6 +453,12 @@ export default function SourcesList({ onIngest, uploadNamespace, setUploadNamesp
         />
       )}
 
+      {rebuildError && (
+        <div className="mb-3 text-[12px] text-danger flex items-center gap-1">
+          <AlertCircle size={12} /> {rebuildError}
+        </div>
+      )}
+
       {!sources.length && !showAdd ? (
         <EmptyState icon={<FolderSync size={40} />} title={i18nT('pages.knowledge.sourcesList.no_sources_registered')} subtitle={i18nT('pages.knowledge.sourcesList.upload_local_files_or_watch_a_local_folder_to_in')} />
       ) : (
@@ -521,6 +550,14 @@ export default function SourcesList({ onIngest, uploadNamespace, setUploadNamesp
                     : <><RefreshCw size={12} /> {i18nT('pages.knowledge.sourcesList.sync')}</>}
                 </button>
               )}
+              <button aria-label={i18nT('pages.knowledge.sourcesList.rebuild_entity_graph')}
+                title={i18nT('pages.knowledge.sourcesList.re_extract_entities_from_the_items_already_store')}
+                onClick={() => rebuildGraph(s.id)} disabled={isDeleting || rebuildingIds.has(s.id)}
+                className="px-2 py-1 text-[11px] border border-border rounded hover:bg-bg-elevated disabled:opacity-50 flex items-center gap-1">
+                {rebuildingIds.has(s.id)
+                  ? <RefreshCw size={12} className="animate-spin" />
+                  : <><Network size={12} /> {i18nT('pages.knowledge.sourcesList.rebuild_graph')}</>}
+              </button>
               <button aria-label={i18nT('pages.knowledge.sourcesList.remove_source')} onClick={() => { if (confirm(i18nT('pages.knowledge.sourcesList.remove_this_source_and_all_its_ingested_items'))) deleteMutation.mutate(s.id) }}
                 disabled={isDeleting}
                 className="px-2 py-1 text-[11px] border border-border rounded hover:bg-bg-elevated text-danger/70 hover:text-danger disabled:opacity-50 flex items-center gap-0.5">

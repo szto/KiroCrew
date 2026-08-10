@@ -2940,6 +2940,10 @@ async def _run_chat(
             model=slot.model or agent_model or None,
             cwd=slot.project or None,
             reasoning_effort_override=slot.reasoning_effort or None,
+            # Reaches the claude_code factory through **extra_factory_kwargs. The
+            # kiro-cli factory swallows it, so this is unconditional rather than
+            # branched on the configured provider.
+            account=slot.account or None,
         )
         _acquired = True
         # Publish the live inner AcpClient onto the slot so a concurrent request

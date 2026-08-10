@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ChevronLeft, Copy, Download, Archive, X, RefreshCw, AlertCircle, Link2, ArrowUpRight, Tag } from 'lucide-react'
+import { ChevronLeft, Copy, Download, Archive, X, RefreshCw, AlertCircle, Link2, ArrowUpRight, Tag, Eye, Code } from 'lucide-react'
 import { Card, Btn, Badge, ContentSkeleton } from '../../components/ui'
 import Clickable from '../../components/Clickable'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
@@ -91,10 +91,30 @@ function TagEditor({ itemId, currentTags }: { itemId: string; currentTags: strin
   )
 }
 
+/** Tags as a list, whatever shape the row arrived in.
+ *
+ *  The API serves `tags` as a JSON-encoded ARRAY STRING (`'["content_type:markdown"]'`)
+ *  — the store round-trips the column through `json.dumps`. Splitting that on `,`
+ *  yields one element still wrapped in its brackets and quotes, so a marker tag
+ *  never matched and markdown from every folder-ingested document rendered as raw
+ *  source. Parse JSON first; fall back to the comma form for a hand-written tag
+ *  string, and drop stray quotes/brackets so a partially-encoded value still reads.
+ */
+export function parseTags(tags: KnowledgeItem['tags']): string[] {
+  if (!tags) return []
+  if (Array.isArray(tags)) return tags.map(t => String(t).trim())
+  if (typeof tags !== 'string') return []
+  try {
+    const parsed = JSON.parse(tags)
+    if (Array.isArray(parsed)) return parsed.map(t => String(t).trim())
+  } catch {
+    // not JSON — fall through to the comma form
+  }
+  return tags.split(',').map(t => t.trim().replace(/^[["']+|["'\]]+$/g, ''))
+}
+
 function isMarkdownContent(item: KnowledgeItem): boolean {
-  if (!item.tags) return false
-  const tags = typeof item.tags === 'string' ? item.tags.split(',') : Array.isArray(item.tags) ? item.tags : []
-  return tags.some(t => t.trim() === 'content_type:markdown')
+  return parseTags(item.tags).some(t => t === 'content_type:markdown')
 }
 
 export default function DetailView({ itemId, onBack, onEntityClick }: { itemId: string; onBack: () => void; onEntityClick?: (name: string) => void }) {
@@ -103,6 +123,9 @@ export default function DetailView({ itemId, onBack, onEntityClick }: { itemId: 
     queryKey: ['knowledge-item', itemId],
     queryFn: () => knowledgeApi<KnowledgeItem>(`/items/${itemId}`),
   })
+  // Rendered by default — the raw view is opt-in, and per item rather than
+  // sticky, so opening a document never surprises you with markup.
+  const [rawMarkdown, setRawMarkdown] = useState(false)
 
   const archiveMutation = useMutation({
     mutationFn: ({ id, status }: { id: string; status: string }) =>
@@ -214,18 +237,35 @@ export default function DetailView({ itemId, onBack, onEntityClick }: { itemId: 
       <RelatedItems itemId={item.id} entities={item.entities || []} />
 
       <Card className="!mb-3">
-        <div className="text-[13px] font-semibold text-text-strong mb-1">{i18nT('pages.knowledge.detailView.content')}</div>
-        {isMarkdownContent(item) ? (
-          <div className="text-[12px] text-text max-h-96 overflow-y-auto bg-bg-elevated rounded p-3 prose-sm">
+        <div className="flex items-center justify-between mb-1">
+          <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.knowledge.detailView.content')}</div>
+          {isMarkdownContent(item) && (
+            // Raw mode is not just a debugging view: entity highlighting only
+            // exists there, because injecting marks into rendered markdown would
+            // mean rewriting the AST.
+            <div className="flex items-center gap-0.5 shrink-0">
+              <button onClick={() => setRawMarkdown(false)} aria-pressed={!rawMarkdown}
+                className={`px-2 py-0.5 text-[11px] rounded border cursor-pointer ${!rawMarkdown ? 'border-accent text-accent bg-accent/10' : 'border-border text-muted bg-transparent hover:text-text'}`}>
+                <Eye className="lucide-inline" /> {i18nT('pages.knowledge.detailView.rendered')}
+              </button>
+              <button onClick={() => setRawMarkdown(true)} aria-pressed={rawMarkdown}
+                className={`px-2 py-0.5 text-[11px] rounded border cursor-pointer ${rawMarkdown ? 'border-accent text-accent bg-accent/10' : 'border-border text-muted bg-transparent hover:text-text'}`}>
+                <Code className="lucide-inline" /> {i18nT('pages.knowledge.detailView.source')}
+              </button>
+            </div>
+          )}
+        </div>
+        {isMarkdownContent(item) && !rawMarkdown ? (
+          <div className="text-[13px] text-text max-h-[70vh] overflow-y-auto bg-bg-elevated rounded p-4 leading-relaxed">
             {/* MarkdownRenderer sanitizes rendered HTML output via rehypeSanitize plugin
                (MarkdownRenderer.tsx:192-210) — strips javascript:/data:/vbscript: URLs,
                event handler attributes, and dangerous tags (script/iframe/object/embed) */}
             <MarkdownRenderer content={item.content || ''} />
           </div>
         ) : (
-          <pre className="text-[12px] text-text whitespace-pre-wrap max-h-96 overflow-y-auto font-mono bg-bg-elevated rounded p-3">{highlightEntities(item.content || '', item.entities || [], onEntityClick)}</pre>
+          <pre className="text-[12px] text-text whitespace-pre-wrap max-h-[70vh] overflow-y-auto font-mono bg-bg-elevated rounded p-3">{highlightEntities(item.content || '', item.entities || [], onEntityClick)}</pre>
         )}
-        {isMarkdownContent(item) && !!item.entities?.length && (
+        {isMarkdownContent(item) && !rawMarkdown && !!item.entities?.length && (
           <div className="mt-2 flex flex-wrap gap-1 border-t border-border pt-2">
             <span className="text-[11px] text-muted mr-1">{i18nT('pages.knowledge.detailView.entities_in_this_chunk')}</span>
             {item.entities.map(e => (

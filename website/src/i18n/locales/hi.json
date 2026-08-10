@@ -6045,6 +6045,12 @@
       "select": "चुनें",
       "workspace_name": "वर्कस्पेस का नाम",
       "workspace_name_2": "workspace-name"
+    },
+    "accountDropdown": {
+      "account_aria": "खाता: {{name}}",
+      "locked_tooltip": "खाता बदलने के लिए नया सत्र शुरू करें",
+      "needs_login_tooltip": "इस खाते के लिए पहले claude login चलाएँ",
+      "switch_tooltip": "खाता बदलें"
     }
   },
   "hooks": {
@@ -8002,7 +8008,9 @@
         "shared": "साझा",
         "summary": "सारांश",
         "tag1_tag2_tag3": "tag1, tag2, tag3",
-        "unarchive": "संग्रह से हटाएं"
+        "unarchive": "संग्रह से हटाएं",
+        "rendered": "रेंडर किया गया",
+        "source": "स्रोत"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} एम्बेड किए गए ({{pct}}%)",
@@ -8172,7 +8180,11 @@
         "use_sync_button_to_update": "अपडेट करने के लिए सिंक बटन का उपयोग करें",
         "watch_anyway": "फिर भी नज़र रखें",
         "watches_folder_recursively_supported_files_auto": "फ़ोल्डर पर रिकर्सिव रूप से नज़र रखता है। समर्थित फ़ाइलें अपने आप इनजेस्ट होती हैं। हर स्रोत में अधिकतम 5,000 फ़ाइलें।",
-        "watching_folder": "फ़ोल्डर पर नज़र रखी जा रही है"
+        "watching_folder": "फ़ोल्डर पर नज़र रखी जा रही है",
+        "rebuild_graph": "ग्राफ़ पुनर्निर्माण",
+        "rebuild_entity_graph": "एंटिटी ग्राफ़ पुनर्निर्मित करें",
+        "re_extract_entities_from_the_items_already_store": "पहले से संग्रहीत आइटम से एंटिटी दोबारा निकालें। स्रोत दोबारा नहीं पढ़ा जाता।",
+        "rebuild_failed": "पुनर्निर्माण विफल"
       }
     },
     "localStorageDebug": {
@@ -8401,7 +8413,8 @@
         "using_legacy_mode_agent_default_agent_as_agent_t": "लेगेसी मोड उपयोग में — एजेंट टेम्पलेट के रूप में agent.default_agent",
         "warm_pool": "वॉर्म पूल",
         "workspace": "वर्कस्पेस",
-        "workspaces": "वर्कस्पेस"
+        "workspaces": "वर्कस्पेस",
+        "backend_for_new_sessions_switching_clears_slot_m": "नए सत्रों के लिए बैकएंड। स्विच करने पर स्लॉट मॉडल साफ़ हो जाते हैं।"
       },
       "mcpTab": {
         "actions": "कार्रवाइयाँ",
@@ -9560,7 +9573,13 @@
         "which_model_new_sessions_start_with_pick_a_model": "जब किसी एजेंट का अपना कोई मॉडल तय न हो, तो नए सेशन किस मॉडल से शुरू होते हैं। हर एजेंट के लिए मॉडल क्षमताएँ → Crews में सेट करो, या किसी सेशन के भीतर मॉडल चुनकर वहाँ इसे बदल दो।",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "पैरेंट सेशन में सबएजेंट का कंप्लीशन इवेंट डालते समय उसकी स्ट्रीम का कौन-सा हिस्सा रखा जाए। Head शुरुआत को बनाए रखता है (डिफ़ॉल्ट, पुराने व्यवहार के अनुरूप)। Tail अंतिम सारांश को बनाए रखता है। Both दोनों सिरों से एक-एक हिस्सा रखता है और उनके बीच एक मार्कर लगाता है।",
         "widget_density": "विजेट घनत्व",
-        "your_role": "आपकी भूमिका"
+        "your_role": "आपकी भूमिका",
+        "provider": "प्रोवाइडर",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "नए सत्र किस बैकएंड पर चलते हैं।",
+        "switching_provider_affects_new_sessions_only_run": "यह केवल नए सत्रों पर लागू होता है। चुने गए CLI में साइन इन करें: kiro login या claude login।",
+        "failed_to_save_provider": "प्रोवाइडर सहेजने में विफल"
       },
       "computerUsePanel": {
         "accessibility": "सुगम्यता",

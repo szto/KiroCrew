@@ -6045,6 +6045,12 @@
       "select": "নির্বাচন করুন",
       "workspace_name": "ওয়ার্কস্পেসের নাম",
       "workspace_name_2": "workspace-name"
+    },
+    "accountDropdown": {
+      "account_aria": "অ্যাকাউন্ট: {{name}}",
+      "locked_tooltip": "অ্যাকাউন্ট বদলাতে নতুন সেশন শুরু করুন",
+      "needs_login_tooltip": "এই অ্যাকাউন্টের জন্য আগে claude login চালান",
+      "switch_tooltip": "অ্যাকাউন্ট বদলান"
     }
   },
   "hooks": {
@@ -8002,7 +8008,9 @@
         "shared": "শেয়ার করা",
         "summary": "সারসংক্ষেপ",
         "tag1_tag2_tag3": "ট্যাগ1, ট্যাগ2, ট্যাগ3",
-        "unarchive": "আর্কাইভ থেকে সরান"
+        "unarchive": "আর্কাইভ থেকে সরান",
+        "rendered": "রেন্ডার করা",
+        "source": "সোর্স"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} এমবেড করা ({{pct}}%)",
@@ -8172,7 +8180,11 @@
         "use_sync_button_to_update": "আপডেট করতে সিঙ্ক বোতাম ব্যবহার করুন",
         "watch_anyway": "তবুও নজরে রাখো",
         "watches_folder_recursively_supported_files_auto": "ফোল্ডার রিকার্সিভভাবে পর্যবেক্ষণ করে। সমর্থিত ফাইল স্বয়ংক্রিয়ভাবে ইনজেস্ট হয়। প্রতি সোর্সে সর্বোচ্চ 5,000 ফাইল।",
-        "watching_folder": "ফোল্ডার নজরে রাখা হচ্ছে"
+        "watching_folder": "ফোল্ডার নজরে রাখা হচ্ছে",
+        "rebuild_graph": "গ্রাফ পুনর্গঠন",
+        "rebuild_entity_graph": "এনটিটি গ্রাফ পুনর্গঠন করুন",
+        "re_extract_entities_from_the_items_already_store": "ইতিমধ্যে সংরক্ষিত আইটেম থেকে এনটিটি পুনরায় নিষ্কাশন করে। সোর্স আবার পড়া হয় না।",
+        "rebuild_failed": "পুনর্গঠন ব্যর্থ"
       }
     },
     "localStorageDebug": {
@@ -8401,7 +8413,8 @@
         "using_legacy_mode_agent_default_agent_as_agent_t": "লিগ্যাসি মোড ব্যবহার হচ্ছে — এজেন্ট টেম্পলেট হিসেবে agent.default_agent",
         "warm_pool": "ওয়ার্ম পুল",
         "workspace": "ওয়ার্কস্পেস",
-        "workspaces": "ওয়ার্কস্পেস"
+        "workspaces": "ওয়ার্কস্পেস",
+        "backend_for_new_sessions_switching_clears_slot_m": "নতুন সেশনের ব্যাকএন্ড। পরিবর্তন করলে স্লট মডেল মুছে যায়।"
       },
       "mcpTab": {
         "actions": "অ্যাকশন",
@@ -9560,7 +9573,13 @@
         "which_model_new_sessions_start_with_pick_a_model": "কোনো এজেন্ট নিজের মডেল না বাঁধলে নতুন সেশন কোন মডেল দিয়ে শুরু হবে। প্রতিটি এজেন্টের জন্য মডেল ঠিক করতে এজেন্ট সক্ষমতা → Crews-এ যাও, বা কোনো নির্দিষ্ট সেশনে তা বদলাতে সেই সেশনের ভিতরে একটি মডেল বেছে নাও।",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "প্যারেন্ট সেশনে সাবএজেন্টের সমাপ্তি ইভেন্ট ইনজেক্ট করার সময় তার স্ট্রিমের কোন অংশ রাখা হবে। Head শুরুর অংশ রাখে (ডিফল্ট, পুরোনো আচরণের সঙ্গে মেলে)। Tail চূড়ান্ত সারসংক্ষেপ রাখে। Both দুই প্রান্ত থেকেই একটি অংশ রাখে এবং মাঝে একটি মার্কার বসায়।",
         "widget_density": "উইজেট ঘনত্ব",
-        "your_role": "আপনার ভূমিকা"
+        "your_role": "আপনার ভূমিকা",
+        "provider": "প্রোভাইডার",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "নতুন সেশন কোন ব্যাকএন্ডে চলবে।",
+        "switching_provider_affects_new_sessions_only_run": "শুধু নতুন সেশনে প্রযোজ্য। নির্বাচিত CLI-তে সাইন ইন করুন: kiro login বা claude login।",
+        "failed_to_save_provider": "প্রোভাইডার সেভ করা যায়নি"
       },
       "computerUsePanel": {
         "accessibility": "সহজগম্যতা",

@@ -6215,6 +6215,12 @@
       "select": "Выбрать",
       "workspace_name": "Название рабочей области",
       "workspace_name_2": "workspace-name"
+    },
+    "accountDropdown": {
+      "account_aria": "Аккаунт: {{name}}",
+      "locked_tooltip": "Начните новый сеанс, чтобы сменить аккаунт",
+      "needs_login_tooltip": "Сначала выполните claude login для этого аккаунта",
+      "switch_tooltip": "Сменить аккаунт"
     }
   },
   "hooks": {
@@ -8214,7 +8220,9 @@
         "shared": "общий",
         "summary": "Сводка",
         "tag1_tag2_tag3": "тег1, тег2, тег3",
-        "unarchive": "Из архива"
+        "unarchive": "Из архива",
+        "rendered": "Отрисовка",
+        "source": "Исходник"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} векторизовано ({{pct}}%)",
@@ -8386,7 +8394,11 @@
         "use_sync_button_to_update": "Используйте кнопку «Синхронизировать» для обновления",
         "watch_anyway": "Всё равно отслеживать",
         "watches_folder_recursively_supported_files_auto": "Папка отслеживается рекурсивно. Поддерживаемые файлы импортируются автоматически. Не более 5 000 файлов на источник.",
-        "watching_folder": "Отслеживание папки"
+        "watching_folder": "Отслеживание папки",
+        "rebuild_graph": "Перестроить граф",
+        "rebuild_entity_graph": "Перестроить граф сущностей",
+        "re_extract_entities_from_the_items_already_store": "Повторно извлекает сущности из уже сохранённых элементов. Источник не перечитывается.",
+        "rebuild_failed": "Не удалось перестроить"
       }
     },
     "localStorageDebug": {
@@ -8615,7 +8627,8 @@
         "using_legacy_mode_agent_default_agent_as_agent_t": "Используется устаревший режим — agent.default_agent как шаблон агента",
         "warm_pool": "Тёплый пул",
         "workspace": "Рабочая область",
-        "workspaces": "Рабочие области"
+        "workspaces": "Рабочие области",
+        "backend_for_new_sessions_switching_clears_slot_m": "Бэкенд для новых сессий. Переключение сбрасывает модели слотов."
       },
       "mcpTab": {
         "actions": "Действия",
@@ -9788,7 +9801,13 @@
         "which_model_new_sessions_start_with_pick_a_model": "С какой моделью начинаются новые сессии, если их агент не закрепил свою. Задай модель для каждого агента в «Возможности агента → Crews» или выбери модель внутри сессии, чтобы переопределить её там.",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "Какую часть потока субагента сохранять при вставке события завершения в родительскую сессию. «Начало» сохраняет начало (по умолчанию, как в прежнем поведении). «Хвост» сохраняет итоговую сводку. «Оба» сохраняет по фрагменту с каждого конца с маркером между ними.",
         "widget_density": "Плотность виджетов",
-        "your_role": "Ваша роль"
+        "your_role": "Ваша роль",
+        "provider": "Провайдер",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "Бэкенд, на котором запускаются новые сессии.",
+        "switching_provider_affects_new_sessions_only_run": "Применяется только к новым сессиям. Войдите в выбранный CLI: kiro login или claude login.",
+        "failed_to_save_provider": "Не удалось сохранить провайдера"
       },
       "computerUsePanel": {
         "accessibility": "Универсальный доступ",

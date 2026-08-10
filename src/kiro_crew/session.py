@@ -97,6 +97,7 @@ from kiro_crew.agent_discovery import spec_model
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     POOL_SIZE_MAX,
+    PROVIDER_CLAUDE_CODE,
     build_provider_factory,
     default_project_dir,
     normalize_agent_model,
@@ -152,6 +153,26 @@ from kiro_crew.watchdog import CleanupHook, SessionWatchdog
 ClaudeCodeProvider = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
+
+
+def _configured_acp_backend() -> str:
+    """The ACP backend id implied by ``agent.provider``.
+
+    ``""`` for kiro-cli, ``ACP_BACKEND_CLAUDE`` for claude_code. Used where no
+    parent provider exists to inherit from — notably the task runner, whose
+    runtime parent key names a runtime rather than a registered session, so
+    ``_parent_runtime_kwargs`` has nothing to read. Best-effort: an unreadable
+    config falls back to kiro-cli, which is the historical behaviour.
+    """
+    from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    try:
+        provider = KiroCrewConfig.load().agent.provider
+    except Exception:
+        logger.debug("Could not read agent.provider for runtime backend", exc_info=True)
+        return ""
+    return ACP_BACKEND_CLAUDE if provider == PROVIDER_CLAUDE_CODE else ""
 
 
 def _is_claude_backend(provider: Any) -> bool:
@@ -1098,6 +1119,10 @@ class SessionManager:
                     runtime = AcpRuntime(
                         agent="kirocrew-lite",
                         sandbox_mode=getattr(self._cfg.agent, "sandbox", "auto"),
+                        # Chat titles / suggestions / nav links run here; on
+                        # claude_code they must not fall back to kiro-cli, which
+                        # the operator may not even be signed into.
+                        acp_backend=_configured_acp_backend(),
                     )
                     await runtime.spawn()
                     self._bg_runtime = runtime
@@ -1171,6 +1196,12 @@ class SessionManager:
                 # Mirror the parent's security posture (sandbox + MCP gateway +
                 # env) so companion-runtime subagents never run unsandboxed.
                 rt_kwargs = self._parent_runtime_kwargs(parent_session_key)
+                # A task-runner parent key names a RUNTIME, not a registered
+                # session, so there is no provider to inherit a backend from and
+                # the runtime silently defaulted to kiro-cli — the task runner
+                # ignored agent.provider entirely. Fall back to the configured
+                # provider so it follows the same backend as chat.
+                rt_kwargs.setdefault("acp_backend", _configured_acp_backend())
                 runtime = AcpRuntime(agent=agent, **rt_kwargs)
                 try:
                     await runtime.spawn()
@@ -1498,6 +1529,15 @@ class SessionManager:
             val = getattr(client, attr, None)
             if val is not None:
                 kwargs[key] = val
+        # Inherit the BACKEND too, not only the security posture. Without this the
+        # runtime always spawned kiro-cli, so on the claude_code provider the task
+        # runner ran a different backend than the chat that started it — and on a
+        # host with no kiro login it could not run at all. The parent's
+        # ``extra_env`` (copied above) already carries CLAUDE_CONFIG_DIR, so the
+        # runtime lands on the same account.
+        backend = getattr(client, "backend", "")
+        if backend:
+            kwargs["acp_backend"] = backend
         return kwargs
 
     def is_session_sharing_eligible(self, parent_session_key: str) -> bool:
@@ -2507,7 +2547,9 @@ class SessionManager:
                         else:
                             _switch_model = model_registry.to_acp_id(model)
                             _cmp_pool = (
-                                model_registry.to_acp_id(_pool_model) if _pool_model else _pool_model
+                                model_registry.to_acp_id(_pool_model)
+                                if _pool_model
+                                else _pool_model
                             )
                         if _pool_model and _switch_model != _cmp_pool:
                             # This is an INHERITED value (the slot's persisted
@@ -3341,19 +3383,13 @@ class SessionManager:
                     try:
                         await waiter(timeout=timeout)
                     except asyncio.TimeoutError:
-                        logger.debug(
-                            "drain_active_turns: post-cancel wait_turn_done timed out"
-                        )
+                        logger.debug("drain_active_turns: post-cancel wait_turn_done timed out")
                     except Exception:
-                        logger.debug(
-                            "drain_active_turns: wait_turn_done failed", exc_info=True
-                        )
+                        logger.debug("drain_active_turns: wait_turn_done failed", exc_info=True)
 
         try:
             await asyncio.wait_for(
-                asyncio.gather(
-                    *[_drain_one(p) for p in unfinished], return_exceptions=True
-                ),
+                asyncio.gather(*[_drain_one(p) for p in unfinished], return_exceptions=True),
                 # A hair above the per-session budget so an internally-bounded
                 # cancel resolves as its own timeout rather than the gather being
                 # cancelled out from under it.
@@ -3692,11 +3728,7 @@ class SessionManager:
         key = self._fold_key(key)
         session = self._sessions.get(key)
         if session:
-            if (
-                cleanup
-                and key.startswith(_SUBAGENT_PREFIX)
-                and not self._is_continuable_key(key)
-            ):
+            if cleanup and key.startswith(_SUBAGENT_PREFIX) and not self._is_continuable_key(key):
                 try:
                     session_id = session.provider.session_id
                     if session_id:

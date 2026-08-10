@@ -833,6 +833,17 @@ def _draft_confirmed(link: str, payload: dict) -> str:
              int(c.get("line") or c.get("original_line") or 0),
              _confirm_text(c.get("body")))
             for c in comments)
+        # The list-comments-for-a-review endpoint serves a PENDING draft in the
+        # legacy shape: only `position`/`original_position` are populated, and
+        # `line` AND `original_line` are both null on every comment. There is no
+        # line to compare until the draft is submitted, so when the WHOLE draft
+        # is lineless, identity falls back to (path, body) — still bound to the
+        # marker, the body match, and the anchoring commit checked above. Only
+        # the all-null shape gets the fallback: a single null line among real
+        # ones stays a mismatch, so this cannot loosen the submitted-review path.
+        if got and all(g[1] == 0 for g in got) and any(w[1] != 0 for w in want):
+            want = sorted((p, b) for p, _l, b in want)
+            got = sorted((p, b) for p, _l, b in got)
         return str(rid) if want == got else ""
     return ""
 

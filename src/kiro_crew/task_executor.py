@@ -458,7 +458,22 @@ async def execute_task(
                         run.last_task_time = _time.time()
                         approved = await on_tool_approval(event)
                         if not approved:
-                            await _reject_and_log(client, sel(), session_key, agent, event)
+                            # Record WHY, like every sibling reject path. The
+                            # handler returns a bare bool, so an explicit decline
+                            # and an approval that timed out are indistinguishable
+                            # here — the reason says "not approved" rather than
+                            # claiming which. That matters in practice: a
+                            # background run's Slack prompt denies itself after
+                            # _BACKGROUND_APPROVAL_TIMEOUT_SECS, and with no reason
+                            # on the row the audit log read as "a rule blocked it".
+                            await _reject_and_log(
+                                client,
+                                sel(),
+                                session_key,
+                                agent,
+                                event,
+                                metadata={"reason": "interactive_not_approved"},
+                            )
                             continue
                         approve_reason = "interactive_approved"
                     else:

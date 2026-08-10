@@ -11,13 +11,18 @@ sentinel, not a served model.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from kiro_crew import model_registry
+from kiro_crew.dashboard.handlers import agents
 from kiro_crew.dashboard.handlers.agents import (
     _advertised_cc_models,
     _cc_models,
+    api_models,
 )
 
 # Canonical registry rows now lead the dropdown (replaces _CC_CURATED_MODELS).
@@ -62,9 +67,14 @@ class TestAdvertisedCcModels:
             }
         ]
 
-    def test_known_provider_id_mapped_to_canonical_key(self):
-        # A backend provider id that IS in the registry maps back to its
-        # canonical key so it dedups against the registry rows.
+    def test_provider_id_is_never_folded_onto_a_registry_key(self):
+        """Even a modelId the registry knows stays verbatim.
+
+        It is the value that goes back on the wire to select the model, and the
+        registry's aliases are versionless words pinned to whatever was current
+        when the row was written — folding ``opus`` onto ``opus-4.8-1m`` renames
+        the live model and then sends an id the backend rejects.
+        """
         prov = _FakeProvider(
             [
                 {
@@ -72,10 +82,14 @@ class TestAdvertisedCcModels:
                     "name": "Opus 4.8",
                     "description": "",
                 },
+                {"modelId": "opus", "name": "Opus", "description": ""},
             ]
         )
         out = _advertised_cc_models(_request_with_providers({"s": prov}))
-        assert out[0]["model_name"] == "opus-4.8-1m"
+        assert [e["model_name"] for e in out] == [
+            "global.anthropic.claude-opus-4-8[1m]",
+            "opus",
+        ]
 
     def test_empty_when_no_active_sessions(self):
         assert _advertised_cc_models(_request_with_providers({})) == []
@@ -100,32 +114,29 @@ class TestCcModelsMerge:
         # to sort a specific paid model to the top and present it as the default.
         assert names[0] == "auto"
 
-    def test_advertised_set_filters_the_registry(self):
-        """The advertised set is authoritative: unentitled registry rows go away.
+    def test_advertised_set_replaces_the_registry(self):
+        """What the backend reports IS the offer; the registry does not add to it.
 
-        This is the free-tier case. Previously the registry led unconditionally and
+        This is the free-tier case. The registry used to lead unconditionally and
         the adapter could only ADD, so an account served two models was still
         offered the full flagship list and only found out at prompt time.
         """
-        prov = _FakeProvider(
-            [{"modelId": "global.anthropic.claude-sonnet-4-6[1m]", "name": "Sonnet 4.6"}]
-        )
+        prov = _FakeProvider([{"modelId": "sonnet", "name": "Sonnet"}])
         out = _cc_models(_request_with_providers({"s": prov}))
         names = [m["model_name"] for m in out]
-        assert names[0] == "auto"
-        assert "sonnet-4.6-1m" in names
-        # The flagship is in the registry but was NOT advertised → filtered out.
-        assert "opus-4.8-1m" not in names
-        assert "opus-4.8" not in names
+        assert names == ["auto", "sonnet"]
 
-    def test_registry_display_name_wins_for_survivors(self):
-        """Filtering keeps the registry's cleaner display name, not the adapter's."""
-        prov = _FakeProvider(
-            [{"modelId": "global.anthropic.claude-sonnet-4-6[1m]", "name": "sonnet-4-6-v1-ugly"}]
-        )
+    def test_the_adapter_supplies_its_own_display_name(self):
+        """No registry row survives to relabel an advertised model.
+
+        The registry's label names a specific version ("Sonnet 4.6"); the
+        adapter's names the tier it is actually serving, which is the honest one.
+        """
+        prov = _FakeProvider([{"modelId": "sonnet", "name": "Sonnet", "description": "Sonnet 5"}])
         out = _cc_models(_request_with_providers({"s": prov}))
-        row = next(m for m in out if m["model_name"] == "sonnet-4.6-1m")
-        assert row["display_name"] == "Sonnet 4.6 (1M context)"
+        row = next(m for m in out if m["model_name"] == "sonnet")
+        assert row["display_name"] == "Sonnet"
+        assert row["description"] == "Sonnet 5"
 
     def test_unknown_advertised_models_still_pass_through(self):
         # Forward-compat: a model the registry does not list is still offered when
@@ -168,43 +179,34 @@ class TestCcModelsMerge:
         assert "some-custom-model" in names
         assert names[0] == "auto"  # still after nothing, before everything else
 
-    def test_no_duplicate_when_adapter_lists_known_model(self):
-        # The adapter advertises provider ids that ARE in the registry; mapped
-        # back to canonical keys they collapse to one row each (registry wins).
+    def test_each_advertised_model_appears_once(self):
+        # Spelling variants of one id must not produce two rows: the dropdown is
+        # a pick list, and two entries for the same model read as two models.
         prov = _FakeProvider(
             [
-                {
-                    "modelId": "global.anthropic.claude-sonnet-4-6[1m]",
-                    "name": "Sonnet 4.6",
-                    "description": "",
-                },
-                {
-                    "modelId": "global.anthropic.claude-opus-4-8[1m]",
-                    "name": "Opus 4.8",
-                    "description": "",
-                },
+                {"modelId": "opus", "name": "Opus", "description": ""},
+                {"modelId": "Opus", "name": "Opus again", "description": ""},
+                {"modelId": "sonnet", "name": "Sonnet", "description": ""},
             ]
         )
         out = _cc_models(_request_with_providers({"s": prov}))
         names = [m["model_name"] for m in out]
-        assert names.count("opus-4.8-1m") == 1
-        assert names.count("sonnet-4.6-1m") == 1
+        assert names.count("opus") == 1
+        assert names.count("sonnet") == 1
+        assert "Opus" not in names
 
-    def test_registry_row_keeps_friendly_display_name(self):
-        # When the adapter advertises a known id, the registry row (friendly
-        # display name) wins over the backend's terser name.
+    def test_the_backends_own_default_choice_folds_onto_auto(self):
+        # claude-agent-acp offers a literal "default" ("let me pick"), which is
+        # what "auto" already means. Two rows for one behaviour is a false choice.
         prov = _FakeProvider(
             [
-                {
-                    "modelId": "global.anthropic.claude-opus-4-8[1m]",
-                    "name": "Opus 4.8",
-                    "description": "",
-                },
+                {"modelId": "default", "name": "Default (recommended)", "description": ""},
+                {"modelId": "opus", "name": "Opus", "description": ""},
             ]
         )
         out = _cc_models(_request_with_providers({"s": prov}))
-        opus48 = next(m for m in out if m["model_name"] == "opus-4.8-1m")
-        assert opus48["display_name"] == "Opus 4.8 (1M context)"
+        names = [m["model_name"] for m in out]
+        assert names == ["auto", "opus"]
 
     def test_configured_default_force_included(self):
         out = _cc_models(_request_with_providers({}), configured_default="custom-model-xyz")
@@ -229,3 +231,105 @@ class TestCcModelsMerge:
         assert all(m["model_name"] for m in out)
         # the canonical "auto" row is still present, exactly once.
         assert names.count("auto") == 1
+
+
+def _cc_cfg(model: str = "auto") -> SimpleNamespace:
+    return SimpleNamespace(agent=SimpleNamespace(provider="claude_code", model=model))
+
+
+def _no_probe(*_args, **_kwargs):
+    """Stand in for the cold-start probe so a unit test never spawns an adapter.
+
+    Returning ``[]`` is the "probe found nothing" path, which is what makes the
+    static registry the answer.
+    """
+
+    async def _empty() -> list[dict]:
+        return []
+
+    return _empty()
+
+
+class TestApiModelsClaudeCodeDispatch:
+    """On the claude_code provider /api/models serves _cc_models and never
+    touches kiro: no readiness gate, no kiro-cli subprocess. Those paths gate on
+    kiro login state, which a claude_code gateway does not have."""
+
+    @pytest.mark.asyncio
+    async def test_serves_cc_rows_without_kiro_gate_or_spawn(self):
+        with (
+            patch.object(agents.KiroCrewConfig, "load", return_value=_cc_cfg()),
+            patch(
+                "kiro_crew.providers.claude_code_factory.probe_available_models",
+                _no_probe,
+            ),
+            patch.object(
+                agents,
+                "reject_if_kiro_unverified",
+                side_effect=AssertionError("kiro readiness gate must not run on claude_code"),
+            ),
+        ):
+            resp = await api_models(_request_with_providers({}))
+        assert resp.status == 200
+        body = json.loads(resp.text)
+        names = [e["model_name"] for e in body]
+        # "auto" leads; with the probe empty the claude_code registry is the offer.
+        assert names[0] == "auto"
+        assert set(_REGISTRY_NAMES) <= set(names)
+        # Every row carries the context_window the frontend picker reads.
+        assert all("context_window" in e for e in body)
+
+    @pytest.mark.asyncio
+    async def test_configured_default_flows_into_dropdown(self):
+        with (
+            patch.object(agents.KiroCrewConfig, "load", return_value=_cc_cfg("custom-model-xyz")),
+            patch(
+                "kiro_crew.providers.claude_code_factory.probe_available_models",
+                _no_probe,
+            ),
+            patch.object(
+                agents,
+                "reject_if_kiro_unverified",
+                side_effect=AssertionError("kiro readiness gate must not run on claude_code"),
+            ),
+        ):
+            resp = await api_models(_request_with_providers({}))
+        body = json.loads(resp.text)
+        assert "custom-model-xyz" in [e["model_name"] for e in body]
+
+    @pytest.mark.asyncio
+    async def test_probe_result_replaces_the_static_registry(self):
+        """A cold gateway serves what the adapter reports, not the registry.
+
+        This is the whole point of the probe: claude-agent-acp's vocabulary
+        (``opus``, ``sonnet``, ``haiku``, …) is versionless and moves with Claude
+        Code releases, while the registry's rows are a snapshot that goes stale.
+        """
+
+        def _probe(*_args, **_kwargs):
+            async def _rows() -> list[dict]:
+                return [
+                    {"modelId": "opus", "name": "Opus", "description": "Opus 5"},
+                    {"modelId": "haiku", "name": "Haiku", "description": "Haiku 4.5"},
+                ]
+
+            return _rows()
+
+        with (
+            patch.object(agents.KiroCrewConfig, "load", return_value=_cc_cfg()),
+            patch("kiro_crew.providers.claude_code_factory.probe_available_models", _probe),
+            patch.object(
+                agents,
+                "reject_if_kiro_unverified",
+                side_effect=AssertionError("kiro readiness gate must not run on claude_code"),
+            ),
+        ):
+            resp = await api_models(_request_with_providers({}))
+        names = [e["model_name"] for e in json.loads(resp.text)]
+        assert names[0] == "auto"
+        assert "opus" in names
+        assert "haiku" in names
+        # Registry rows the adapter did NOT report are filtered out — offering
+        # them is what made a prompt fail at turn time instead of at pick time.
+        assert "opus-4.8-1m" not in names
+        assert "sonnet-4.6-1m" not in names

@@ -5960,6 +5960,12 @@
       "select": "選択",
       "workspace_name": "ワークスペース名",
       "workspace_name_2": "workspace-name"
+    },
+    "accountDropdown": {
+      "account_aria": "アカウント: {{name}}",
+      "locked_tooltip": "アカウントを切り替えるには新しいセッションを開始してください",
+      "needs_login_tooltip": "先にこのアカウントで claude login を実行してください",
+      "switch_tooltip": "アカウントを切り替え"
     }
   },
   "hooks": {
@@ -7896,7 +7902,9 @@
         "shared": "共有",
         "summary": "サマリー",
         "tag1_tag2_tag3": "tag1、tag2、tag3",
-        "unarchive": "アーカイブ解除"
+        "unarchive": "アーカイブ解除",
+        "rendered": "レンダリング",
+        "source": "ソース"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}}埋め込み済み（{{pct}}%）",
@@ -8065,7 +8073,11 @@
         "use_sync_button_to_update": "同期ボタンを使用して更新",
         "watch_anyway": "とにかく監視",
         "watches_folder_recursively_supported_files_auto": "フォルダーを再帰的に監視します。対応ファイルは自動取り込みされます。ソースあたり最大 5,000ファイル。",
-        "watching_folder": "フォルダー監視中"
+        "watching_folder": "フォルダー監視中",
+        "rebuild_graph": "グラフを再構築",
+        "rebuild_entity_graph": "エンティティグラフを再構築",
+        "re_extract_entities_from_the_items_already_store": "保存済みのアイテムからエンティティを再抽出します。ソースは再読み込みしません。",
+        "rebuild_failed": "再構築に失敗しました"
       }
     },
     "localStorageDebug": {
@@ -8294,7 +8306,8 @@
         "using_legacy_mode_agent_default_agent_as_agent_t": "レガシーモード使用中 — エージェントテンプレートとして agent.default_agent を使用",
         "warm_pool": "ウォームプール",
         "workspace": "ワークスペース",
-        "workspaces": "ワークスペース"
+        "workspaces": "ワークスペース",
+        "backend_for_new_sessions_switching_clears_slot_m": "新しいセッションのバックエンド。切り替えるとスロットのモデルはクリアされます。"
       },
       "mcpTab": {
         "actions": "アクション",
@@ -9446,7 +9459,13 @@
         "which_model_new_sessions_start_with_pick_a_model": "エージェントがどれもピン留めしないときに新しいセッションが開始するモデル。Capabilities → Crews でエージェントごとにモデルを設定するか、セッション内でそれをオーバーライドするモデルを選択します。",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "完了イベントを親セッションに注入するときにサブエージェントのストリームのどの部分を保持するか。「開始」はストリーム開始を保持します（デフォルト、レガシー動作と一致）。「終了」は最終要約を保持します。「両方」は各端からスライスを保持し、その間にマーカーがあります。",
         "widget_density": "ウィジェット密度",
-        "your_role": "あなたの役割"
+        "your_role": "あなたの役割",
+        "provider": "プロバイダー",
+        "provider_acp": "KiroACP (kiro-cli)",
+        "provider_claude_code": "Claude Code",
+        "which_backend_new_sessions_run_on": "新しいセッションを実行するバックエンド。",
+        "switching_provider_affects_new_sessions_only_run": "新しいセッションにのみ適用されます。選択した CLI にサインインしてください: kiro login または claude login。",
+        "failed_to_save_provider": "プロバイダーを保存できませんでした"
       },
       "computerUsePanel": {
         "accessibility": "アクセシビリティ",
