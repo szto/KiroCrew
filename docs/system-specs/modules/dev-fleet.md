@@ -11,6 +11,26 @@ carries an HMAC signature (`X-KiroCrew-Proxy: <ts>:<hmac>` over
 backend's middleware; the shared secret lives at `apps_dir()/dev-fleet/.app_secret`.
 Gateway session auth (token/cookie) gates the proxy entrance as with all builtin apps.
 
+### Primary checkout resolution
+
+The primary checkout (`MAIN_REPO`) anchors worktree discovery. At module import,
+`_default_main_repo()` resolves a hint without spawning a subprocess (the import
+runs on the async route-registration path); first match wins:
+
+1. `KIROCREW_DEVFLEET_REPO` env var — taken verbatim, no validation.
+2. `dev_fleet.repo` config key (`config.json` + `config.local.json` overlay) —
+   a string path, `~`-expanded, honored only when it holds a `.git` entry
+   (a directory, or the file a linked worktree carries). A missing, non-string,
+   or non-checkout value falls through to the next tier rather than breaking
+   startup. Read via the same best-effort loader as `dev_fleet.ticket_url_template`
+   and `dev_fleet.auto_prune.*` — a direct JSON read that never raises.
+3. `KIROCREW_PROJECT_DIR` env var, when it holds a `.git` entry.
+4. `~/kirocrew`.
+
+`dev_fleet_startup()` then normalizes the hint to the PRIMARY checkout via
+`git rev-parse --git-common-dir` on the subprocess executor, so a hint that
+points at a linked worktree resolves to its primary.
+
 ## Responsibilities
 
 1. **Worktree discovery** — enumerates git worktrees via `git worktree list --porcelain`,

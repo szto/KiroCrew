@@ -138,14 +138,56 @@ def _resolve_primary_checkout(path: str) -> str:
     return path
 
 
+def _load_dev_fleet_cfg() -> dict:
+    """Read the ``dev_fleet`` config section (config.json + local overlay),
+    lazily and best-effort. Never raises; a missing file/section -> {}. Read
+    directly rather than through KiroCrewConfig (a separate process owns the
+    validated loader) so a purely cosmetic template needs no schema dependency
+    and can never break the fleet payload. Also called at module import (from
+    _default_main_repo), so it must stay dependency-light and exception-safe."""
+    section: dict = {}
+    try:
+        from kiro_crew.config.loader import config_dir
+        base = config_dir()
+    except Exception:  # noqa: BLE001
+        return section
+    for fname in ("config.json", "config.local.json"):
+        p = base / fname
+        try:
+            if not p.is_file():
+                continue
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(raw, dict) and isinstance(raw.get("dev_fleet"), dict):
+            section.update(raw["dev_fleet"])
+    return section
+
+
 def _default_main_repo() -> str:
-    """Resolve the main checkout hint from env (NO subprocess at import time —
-    this module is imported from the async route-registration path and a git
-    call here would block the event loop). The hint is normalized to the
-    PRIMARY checkout in dev_fleet_startup() via the subprocess executor."""
+    """Resolve the main checkout hint (NO subprocess at import time — this
+    module is imported from the async route-registration path and a git call
+    here would block the event loop). First match wins:
+
+      1. KIROCREW_DEVFLEET_REPO env var (taken verbatim, no validation)
+      2. ``dev_fleet.repo`` config key (string, ``~`` expands; honored only
+         when the path holds a ``.git`` entry, so a stale config value falls
+         through instead of pinning the fleet to a non-checkout)
+      3. KIROCREW_PROJECT_DIR env var, when it holds a ``.git`` entry
+      4. ``~/kirocrew``
+
+    The hint is normalized to the PRIMARY checkout in dev_fleet_startup() via
+    the subprocess executor."""
     explicit = os.environ.get("KIROCREW_DEVFLEET_REPO")
     if explicit:
         return explicit
+    cfg_repo = _load_dev_fleet_cfg().get("repo")
+    if isinstance(cfg_repo, str) and cfg_repo:
+        cand = Path(cfg_repo).expanduser()
+        # `.git` is a FILE in a linked worktree, so existence — not is_dir —
+        # is the right test (mirrors the KIROCREW_PROJECT_DIR tier below).
+        if (cand / ".git").exists():
+            return str(cand)
     proj = os.environ.get("KIROCREW_PROJECT_DIR")
     if proj and (Path(proj) / ".git").exists():
         return proj
@@ -222,7 +264,8 @@ def _build_pending() -> bool:
 #                    PLATFORM-NEUTRAL helpers (``prov.has_venv`` /
 #                    ``prov.has_dist``, both plain filesystem checks) may be
 #                    called. True on every platform unless the import failed.
-#   _POD_AVAILABLE — pods can actually RUN here, i.e. Linux with ``systemctl``.
+#   _POD_AVAILABLE — pods can actually RUN here: Linux with ``systemctl`` or
+#                    macOS with ``launchctl``.
 # Conflating the two used to report every worktree as "not built" off Linux,
 # even though the build state is knowable everywhere.
 _POD_IMPORTED = False
@@ -239,8 +282,9 @@ try:
     # entirely instead of failing closed on every removal.
     #
     # NOTE this gate is about PODS only. Make-live (repointing the LIVE gateway's
-    # unit) is a separate feature with its own Linux-only gates further down —
-    # macOS support for pods deliberately does not imply macOS make-live.
+    # unit) is a separate feature gated on the live unit being service-managed
+    # (systemd --user on Linux, a LaunchAgent on macOS — see
+    # ``gateway_service.backend``); pod availability implies nothing about it.
     if sys.platform == "linux" and shutil.which("systemctl"):
         _POD_AVAILABLE = True
     elif sys.platform == "darwin" and shutil.which("launchctl"):
@@ -1352,31 +1396,6 @@ async def _html_repo_base() -> str | None:
     if owner_repo:
         _HTML_BASE = f"https://github.com/{owner_repo}"
     return _HTML_BASE
-
-
-def _load_dev_fleet_cfg() -> dict:
-    """Read the ``dev_fleet`` config section (config.json + local overlay),
-    lazily and best-effort. Never raises; a missing file/section -> {}. Read
-    directly rather than through KiroCrewConfig (a separate process owns the
-    validated loader) so a purely cosmetic template needs no schema dependency
-    and can never break the fleet payload."""
-    section: dict = {}
-    try:
-        from kiro_crew.config.loader import config_dir
-        base = config_dir()
-    except Exception:  # noqa: BLE001
-        return section
-    for fname in ("config.json", "config.local.json"):
-        p = base / fname
-        try:
-            if not p.is_file():
-                continue
-            raw = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
-            continue
-        if isinstance(raw, dict) and isinstance(raw.get("dev_fleet"), dict):
-            section.update(raw["dev_fleet"])
-    return section
 
 
 # per-branch context cache (mirrors _PR_CACHE / _PR_TTL)
