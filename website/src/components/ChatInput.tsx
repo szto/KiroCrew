@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, memo } from 'react'
-import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, ChevronDown, Check } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Brain, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, ChevronDown, Check } from 'lucide-react'
 import CopyBranchButton from './CopyBranchButton'
 import { usePointerDrag } from '../hooks/usePointerDrag'
 import VoiceStatusBar from './VoiceStatusBar'
@@ -94,6 +94,12 @@ const INPUT_HEIGHT_LS_KEY = 'mc-input-height'
 // Send behavior while a turn is RUNNING. 'steer' (default) injects the
 // composer into the running turn; 'queue' defers it to the next turn. The
 // user picks via the split send button's dropdown; choice persists.
+/** Shared chrome for the shelf's dropdown-trigger chips (model / effort), so the
+ *  control bar reads as one row of identical triggers. Chrome type: these are
+ *  labels, so no `font-mono` (that would pin `var(--mono)`, which the Font
+ *  Family setting never writes). */
+const SHELF_CHIP_CLS = 'inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted'
+
 const BUSY_SEND_MODE_LS_KEY = 'mc-busy-send-mode'
 type BusySendMode = 'steer' | 'queue'
 /**
@@ -835,8 +841,8 @@ function ChatInput({
   const [plusOpen, setPlusOpen] = useState(false)
   const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false)
   // Shelf responsiveness: measure the shelf row width and collapse chips to
-  // icon-only (agent/project) + drop the model effort label when space is tight.
-  // Truncation handles the in-between cases.
+  // icon-only (agent/project/effort/approval) when space is tight. Truncation
+  // handles the in-between cases.
   const [shelfWidth, setShelfWidth] = useState(9999)
   const shelfRoRef = useRef<ResizeObserver | null>(null)
   const shelfRef = useCallback((el: HTMLDivElement | null) => {
@@ -850,7 +856,8 @@ function ChatInput({
     shelfRoRef.current = ro
   }, [])
   // Below ~340px the labels no longer fit comfortably alongside the context bar
-  // + model chip, so collapse the chips (agent/project) to icon-only.
+  // + control bar, so collapse the chips (agent/project/effort/approval) to
+  // icon-only.
   const shelfCompact = shelfWidth < 340
   // Tooltip for the project chip. The chip itself shows the basename (plus the
   // branch when known); the tooltip carries the full path so nothing that was
@@ -2555,21 +2562,7 @@ function ChatInput({
                   onChange={onAutoNudgeChange || (() => {})}
                 />
               )}
-              {!isMobile && approvalMode && (
-                <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} />
-              )}
-              {!isMobile && (
-                <AccountDropdown
-                  slot={activeSlot || ''}
-                  selected={slotAccount}
-                  disabled={accountLocked}
-                  onSelect={name => { api.chatSlotAccount(activeSlot || '', name).catch(() => {}) }}
-                />
-              )}
             </div>
-            {isMobile && approvalMode && (
-              <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} compact />
-            )}
           </div>
           <div className="flex items-center gap-1 shrink-0">
             {onVoiceToggle && (
@@ -2783,8 +2776,11 @@ function ChatInput({
       </div></motion.div>)}
       </AnimatePresence>
 
-      {/* Context shelf — plain full-width row below input */}
-      {!showGhost && (onProjectClick || (onModelClick && modelName)) && (
+      {/* Context shelf — plain full-width row below input. The right group is
+          the composer control bar: one compact row of dropdown triggers
+          ([model] [effort] [approval mode]) so every session-level picker
+          lives in a single predictable place. */}
+      {!showGhost && (onProjectClick || (onModelClick && modelName) || approvalMode) && (
         <div ref={shelfRef} className="pt-1 flex items-center gap-2 min-w-0">
           <div className="flex items-center gap-2 min-w-0 flex-1">
           {onAgentClick && agentName && (
@@ -2888,19 +2884,44 @@ function ChatInput({
           )}
           {onModelClick && modelName && (
             <button
-              className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
+              className={SHELF_CHIP_CLS}
               onClick={e => onModelClick(e.currentTarget.getBoundingClientRect())}
               disabled={isRunning}
               title={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_model') : i18nT('components.chatInput.model_2', { name: modelName })}
             >
               <span className="truncate max-w-[180px]">{modelName}</span>
-              {onReasoningEffortClick && !shelfCompact && (
-                <>
-                  <span className="opacity-30 select-none shrink-0" aria-hidden="true">·</span>
-                  <span className="opacity-60 shrink-0">{effortLabel(reasoningEffort || '')}</span>
-                </>
-              )}
             </button>
+          )}
+          {onReasoningEffortClick && (
+            /* Dedicated effort trigger — opens ChatPage's ReasoningEffortDropdown
+               portal directly, without the model dropdown's drill-in page. Not
+               disabled while running: effort persists to the slot and applies on
+               the next turn, so mid-turn changes are harmless (the dropdown
+               itself has no running gate either). */
+            <button
+              className={SHELF_CHIP_CLS}
+              onClick={e => onReasoningEffortClick(e.currentTarget.getBoundingClientRect())}
+              title={i18nT('components.reasoningEffortDropdown.reasoning_effort')}
+              aria-label={i18nT('components.reasoningEffortDropdown.reasoning_effort')}
+            >
+              <Brain size={13} className="shrink-0 opacity-70" />
+              {!shelfCompact && <span className="truncate max-w-[90px]">{effortLabel(reasoningEffort || '')}</span>}
+            </button>
+          )}
+          {approvalMode && (
+            <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} compact={isMobile || shelfCompact} />
+          )}
+          {/* Account picker sits with the other session-scoped controls; the
+              account locks once the slot has a session, so it lives beside the
+              pickers that share that lifecycle. Desktop-only: it has no compact
+              form and the mobile shelf has no room for it. */}
+          {!isMobile && (
+            <AccountDropdown
+              slot={activeSlot || ''}
+              selected={slotAccount}
+              disabled={accountLocked}
+              onSelect={name => { api.chatSlotAccount(activeSlot || '', name).catch(() => {}) }}
+            />
           )}
           </div>
         </div>

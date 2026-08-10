@@ -1578,6 +1578,69 @@ async def test_discover_worktrees_git_failure_is_bounded(tmp_path):
 
 
 # =============================================================================
+# primary checkout resolution (_default_main_repo)
+# =============================================================================
+def test_default_main_repo_honors_config_repo_when_env_unset(tmp_path, monkeypatch):
+    """`dev_fleet.repo` points discovery at a checkout without any env var."""
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)
+    with patch.object(mod, "_load_dev_fleet_cfg", return_value={"repo": str(repo)}):
+        assert mod._default_main_repo() == str(repo)
+
+
+def test_default_main_repo_config_repo_expands_tilde(tmp_path, monkeypatch):
+    """A `~/...` config value resolves against the user's home."""
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+    # expanduser reads HOME on POSIX and USERPROFILE on Windows.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)
+    with patch.object(mod, "_load_dev_fleet_cfg", return_value={"repo": "~/checkout"}):
+        assert mod._default_main_repo() == str(repo)
+
+
+def test_default_main_repo_config_repo_accepts_worktree_git_file(tmp_path, monkeypatch):
+    """A linked worktree's `.git` is a FILE; it still counts as a checkout."""
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    (repo / ".git").write_text("gitdir: /elsewhere/.git/worktrees/x\n")
+    with patch.object(mod, "_load_dev_fleet_cfg", return_value={"repo": str(repo)}):
+        assert mod._default_main_repo() == str(repo)
+
+
+def test_default_main_repo_env_var_wins_over_config(tmp_path, monkeypatch):
+    """KIROCREW_DEVFLEET_REPO beats `dev_fleet.repo`, and is taken verbatim."""
+    monkeypatch.setenv("KIROCREW_DEVFLEET_REPO", str(tmp_path / "env-checkout"))
+    repo = tmp_path / "cfg-checkout"
+    (repo / ".git").mkdir(parents=True)
+    with patch.object(mod, "_load_dev_fleet_cfg", return_value={"repo": str(repo)}):
+        assert mod._default_main_repo() == str(tmp_path / "env-checkout")
+
+
+def test_default_main_repo_bad_config_value_falls_through(tmp_path, monkeypatch):
+    """A non-checkout path and non-string types are ignored, not fatal: the
+    KIROCREW_PROJECT_DIR tier (and ultimately ~/kirocrew) still resolves."""
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    proj = tmp_path / "proj"
+    (proj / ".git").mkdir(parents=True)
+    monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
+    for bad in (str(tmp_path / "no-git"), 7, ["x"], None, ""):
+        with patch.object(mod, "_load_dev_fleet_cfg", return_value={"repo": bad}):
+            assert mod._default_main_repo() == str(proj), f"{bad!r} must fall through"
+    # With no valid config and no project dir either, the hardcoded default holds.
+    monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+    with patch.object(mod, "_load_dev_fleet_cfg",
+                      return_value={"repo": str(tmp_path / "no-git")}):
+        assert mod._default_main_repo() == str(Path.home() / "kirocrew")
+
+
+# =============================================================================
 # HMAC middleware tests
 # =============================================================================
 
@@ -5678,17 +5741,19 @@ def test_manifest_declares_every_platform_the_app_runs_on():
     assert manifest["platform"]["os"] == ["macos", "linux", "windows"]
 
     # The pod requirement is carried in the UI copy, not the manifest gate. It
-    # must track reality: pods now run on Linux (systemd --user) AND macOS
-    # (launchd) — with no enforced resource ceiling on macOS — while Make Live
-    # stays Linux-only. The old copy ("pods need Linux systemd") became false
-    # the moment the launchd backend landed, and this test guards the manifest
-    # against lying in either direction.
+    # must track reality: pods run on Linux (systemd --user) AND macOS
+    # (launchd) — with no enforced resource ceiling on macOS — and Make Live
+    # stages its pointer on any platform, restarting automatically only under
+    # an active systemd --user unit or macOS LaunchAgent (staged-only
+    # otherwise). This test guards the manifest against lying in either
+    # direction.
     assert any(
         "launchd" in h and "Linux" in h for h in manifest["highlights"]
     ), "the highlight must state pods' per-platform reality (Linux systemd + macOS launchd)"
     assert any(
-        "Make Live is still Linux-only" in h for h in manifest["highlights"]
-    ), "Make Live remains Linux-only and the manifest copy must keep saying so"
+        "stages its pointer on any platform" in h and "staged-only" in h
+        for h in manifest["highlights"]
+    ), "the highlight must state Make Live's stage-anywhere / staged-only reality"
 
 
 def test_declared_platforms_all_resolve_to_a_real_sys_platform():
