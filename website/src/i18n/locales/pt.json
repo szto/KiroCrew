@@ -1261,7 +1261,7 @@
         "highlight_4": "'Limpar mescladas' se recusa a excluir uma worktree com trabalho não commitado ou não rastreado, em vez de descartá-lo",
         "highlight_5": "Acompanhe os logs do pod e emita tokens de acesso ao pod pela interface",
         "highlight_6": "Feito para quem desenvolve o próprio Kiro Crew — não é necessário no uso diário",
-        "highlight_7": "Os pods rodam em Linux (systemd --user) e macOS (launchd) — mas o pod do macOS não tem limite de memória/CPU aplicado; Make Live continua só no Linux; a visão da frota, o status de PR, a sincronização, o rebase e a limpeza funcionam em qualquer plataforma",
+        "highlight_7": "Os pods executam no Linux (systemd --user) e no macOS (launchd) — mas o pod do macOS não tem limite de memória/CPU aplicado; o Make Live prepara seu ponteiro em qualquer plataforma e reinicia automaticamente sob uma unidade systemd --user ativa ou um LaunchAgent do macOS (caso contrário, apenas preparação); a visão de frota, o status de PR, a sincronização, o rebase e a limpeza funcionam em qualquer plataforma",
         "page_label": "Frota Dev"
       }
     },

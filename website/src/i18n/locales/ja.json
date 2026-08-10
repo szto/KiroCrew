@@ -1203,7 +1203,7 @@
         "highlight_4": "「マージされたものをプルーン」は、破棄する代わりにコミットされていない作業またはトラッキングされていない作業を持つワークツリーの削除を拒否",
         "highlight_5": "UIからポッドログをストリーム配信してポッドアクセストークンを発行",
         "highlight_6": "Kiro Crew自体を開発している人向けに構築 — 日常の使用には不要",
-        "highlight_7": "ポッドは Linux（systemd --user）と macOS（launchd）で実行されます。ただし、macOS のポッドにはメモリ/CPU 上限が強制されません。Make Live は引き続き Linux のみ対応です。フリート表示、PR 状態、同期、リベース、削除はどのプラットフォームでも利用できます",
+        "highlight_7": "ポッドは Linux（systemd --user）と macOS（launchd）で動作します — ただし macOS のポッドにはメモリ/CPU の上限が適用されません。Make Live はどのプラットフォームでもポインタをステージし、アクティブな systemd --user ユニットまたは macOS LaunchAgent があれば自動的に再起動します（なければステージのみ）。フリート表示、PR ステータス、同期、リベース、整理はすべてのプラットフォームで動作します",
         "page_label": "Dev Fleet"
       }
     },

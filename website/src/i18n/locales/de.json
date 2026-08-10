@@ -1232,7 +1232,7 @@
         "highlight_4": "„Zusammengeführte bereinigen“ verweigert das Löschen eines Worktrees mit nicht committeter oder nicht verfolgter Arbeit, statt sie zu verwerfen",
         "highlight_5": "Pod-Protokolle live mitlesen und Pod-Zugriffstoken in der Benutzeroberfläche erzeugen",
         "highlight_6": "Für Leute gebaut, die Kiro Crew selbst entwickeln — für den Alltag nicht nötig",
-        "highlight_7": "Pods laufen unter Linux (systemd --user) und macOS (launchd) — der macOS-Pod hat allerdings keine erzwungene Speicher-/CPU-Obergrenze; „Live schalten“ bleibt auf Linux beschränkt; Flottenansicht, PR-Status, Synchronisieren, Rebasen und Bereinigen funktionieren auf jeder Plattform",
+        "highlight_7": "Pods laufen unter Linux (systemd --user) und macOS (launchd) — der macOS-Pod hat jedoch keine erzwungene Speicher-/CPU-Obergrenze; Make Live stellt seinen Zeiger auf jeder Plattform bereit und startet unter einer aktiven systemd --user-Unit oder einem macOS-LaunchAgent automatisch neu (andernfalls nur Bereitstellung); Flottenansicht, PR-Status, Sync, Rebase und Aufräumen funktionieren auf jeder Plattform",
         "page_label": "Dev Fleet"
       }
     },

@@ -1203,7 +1203,7 @@
         "highlight_4": "“Prune merged”不会删除仍有未提交或未跟踪改动的工作树，而是拒绝操作",
         "highlight_5": "在界面上流式查看 Pod 日志，并签发 Pod 访问令牌",
         "highlight_6": "给开发 Kiro Crew 本身的人用 — 日常使用并不需要它",
-        "highlight_7": "Pod 可以跑在 Linux（systemd --user）和 macOS（launchd）上 — 但 macOS 上的 Pod 没有强制的内存/CPU 上限；Make Live 仍然只支持 Linux；机群视图、PR 状态、同步、变基和清理在任何平台都可用",
+        "highlight_7": "Pod 可在 Linux（systemd --user）和 macOS（launchd）上运行 — 但 macOS Pod 没有强制的内存/CPU 上限；Make Live 可在任何平台暂存其指针，并在存在活动的 systemd --user 单元或 macOS LaunchAgent 时自动重启（否则仅暂存）；舰队视图、PR 状态、同步、变基和清理在所有平台上均可用",
         "page_label": "开发机群"
       }
     },

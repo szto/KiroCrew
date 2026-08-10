@@ -1261,7 +1261,7 @@
         "highlight_4": "« Élaguer les worktrees fusionnés » refuse de supprimer un worktree contenant du travail non commité ou non suivi, au lieu de le jeter",
         "highlight_5": "Diffuse les journaux d’un pod et génère des jetons d’accès au pod depuis l’interface",
         "highlight_6": "Conçu pour les personnes qui développent Kiro Crew lui-même — inutile pour un usage quotidien",
-        "highlight_7": "Les pods tournent sur Linux (systemd --user) et macOS (launchd) — mais le pod macOS n’a aucun plafond mémoire/CPU imposé ; « Mettre en service » reste réservé à Linux ; la vue de flotte, l’état des PR, la synchronisation, le rebase et l’élagage fonctionnent sur toutes les plateformes",
+        "highlight_7": "Les pods s'exécutent sous Linux (systemd --user) et macOS (launchd) — mais le pod macOS n'a pas de plafond mémoire/CPU appliqué ; Make Live prépare son pointeur sur toutes les plateformes et redémarre automatiquement sous une unité systemd --user active ou un LaunchAgent macOS (préparation seule sinon) ; la vue de flotte, l'état des PR, la synchronisation, le rebase et le nettoyage fonctionnent sur toutes les plateformes",
         "page_label": "Flotte de dev"
       }
     },

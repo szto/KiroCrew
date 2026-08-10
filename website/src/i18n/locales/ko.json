@@ -1203,7 +1203,7 @@
         "highlight_4": "‘병합된 항목 정리’는 커밋되지 않았거나 추적되지 않는 작업이 있는 워크트리를 버리지 않고 삭제를 거부합니다",
         "highlight_5": "UI에서 포드 로그를 스트리밍하고 포드 액세스 토큰을 발급",
         "highlight_6": "Kiro Crew 자체를 개발하는 사람을 위해 만들었습니다 — 일상적인 사용에는 필요하지 않습니다",
-        "highlight_7": "포드는 Linux(systemd --user)와 macOS(launchd)에서 실행됩니다 — 다만 macOS 포드에는 메모리/CPU 상한이 적용되지 않습니다. Make Live는 여전히 Linux 전용이며, 플릿 화면, PR 상태, 동기화, 리베이스, 정리는 모든 플랫폼에서 동작합니다",
+        "highlight_7": "포드는 Linux(systemd --user)와 macOS(launchd)에서 실행됩니다 — 다만 macOS 포드에는 메모리/CPU 상한이 적용되지 않습니다. Make Live는 어느 플랫폼에서든 포인터를 스테이징하며, 활성화된 systemd --user 유닛 또는 macOS LaunchAgent가 있으면 자동으로 재시작합니다(없으면 스테이징만 수행). 플릿 화면, PR 상태, 동기화, 리베이스, 정리는 모든 플랫폼에서 동작합니다",
         "page_label": "Dev Fleet"
       }
     },
