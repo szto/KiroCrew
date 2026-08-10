@@ -731,7 +731,7 @@ describe('ChatInput', () => {
     })
   })
 
-  // ── Reasoning effort merged into model button ──
+  // ── Composer control bar: [model] [effort] [approval] triggers in the shelf ──
   describe('reasoning effort button', () => {
     it('renders for acp provider', () => {
       const onClick = vi.fn()
@@ -817,6 +817,49 @@ describe('ChatInput', () => {
       expect(onModelClick).toHaveBeenCalledOnce()
       // First arg should be a DOMRect-like object
       expect(onModelClick.mock.calls[0][0]).toBeTruthy()
+    })
+
+    it('invokes onReasoningEffortClick from the dedicated effort chip, not the model chip', () => {
+      const onEffortClick = vi.fn()
+      const onModelClick = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          reasoningEffort="high"
+          onReasoningEffortClick={onEffortClick}
+          modelName="claude-opus-4.7"
+          onModelClick={onModelClick}
+        />
+      )
+      fireEvent.click(screen.getByLabelText('Reasoning effort'))
+      expect(onEffortClick).toHaveBeenCalledOnce()
+      // First arg should be a DOMRect-like anchor for the dropdown portal
+      expect(onEffortClick.mock.calls[0][0]).toBeTruthy()
+      expect(onModelClick).not.toHaveBeenCalled()
+    })
+
+    it('renders the three control-bar triggers together in the shelf row', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          reasoningEffort="high"
+          onReasoningEffortClick={vi.fn()}
+          modelName="claude-opus-4.7"
+          onModelClick={vi.fn()}
+          approvalMode="normal"
+        />
+      )
+      const model = screen.getByTitle('Model: claude-opus-4.7')
+      const effort = screen.getByLabelText('Reasoning effort')
+      const approval = screen.getByLabelText('Approval mode: Normal')
+      // One control bar: all three triggers are siblings in the same shelf group.
+      expect(effort.parentElement).toBe(model.parentElement)
+      expect(approval.parentElement).toBe(model.parentElement)
+    })
+
+    it('keeps the approval-mode picker available without model/project chips', () => {
+      renderWithProviders(<ChatInput {...defaultProps} approvalMode="normal" />)
+      expect(screen.getByLabelText('Approval mode: Normal')).toBeInTheDocument()
     })
   })
 

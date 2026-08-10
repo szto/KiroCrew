@@ -49,12 +49,20 @@ describe('ChatInput reasoning effort button', () => {
   })
 
 
-  it('calls onModelClick with rect on click (reasoning effort merged into model button)', () => {
+  it('calls onModelClick with rect on model-chip click (effort has its own chip)', () => {
     const onModelClick = vi.fn()
     renderInput({ onModelClick })
     fireEvent.click(screen.getByTitle('Model: claude-opus-4.7'))
     expect(onModelClick).toHaveBeenCalledTimes(1)
     expect(onModelClick.mock.calls[0][0]).toHaveProperty('x')
+  })
+
+  it('calls onReasoningEffortClick with rect on effort-chip click', () => {
+    const onReasoningEffortClick = vi.fn()
+    renderInput({ onReasoningEffortClick })
+    fireEvent.click(screen.getByLabelText('Reasoning effort'))
+    expect(onReasoningEffortClick).toHaveBeenCalledTimes(1)
+    expect(onReasoningEffortClick.mock.calls[0][0]).toHaveProperty('x')
   })
 
   it('shows disabled state when running', () => {
