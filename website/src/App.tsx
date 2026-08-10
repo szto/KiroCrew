@@ -1340,7 +1340,10 @@ export default function App() {
 
   // Kiro CLI monthly credit usage. /api/sessions/usage TRIGGERS the background
   // `kiro-cli /usage` fetch AND returns the cached result, so the pill is
-  // self-sufficient on any page. Month-to-date total = credits_used, which the
+  // self-sufficient on any page. Fetched ONCE per dashboard load — no interval
+  // polling and no focus refetch: each backend refresh can spawn a
+  // credit-spending kiro-cli scrape, so the pill must not re-check on its own.
+  // Month-to-date total = credits_used, which the
   // backend already sets to the TRUE total (covered + overage). Do NOT add
   // credits_covered on top — that double-counts the in-plan portion and is the
   // bug that rendered a capped 10K plan as "20.0K". Returns null until the
@@ -1376,7 +1379,13 @@ export default function App() {
       if (u.available === false) return 'none' as const
       return null
     }),
-    refetchInterval: 30_000,
+    // Warm-up only: the first request kicks off the backend fetch and returns
+    // an empty cache (null → spinner), so poll just until a real value or an
+    // explicit "unavailable" lands, then stop for the rest of the page's life.
+    refetchInterval: (query) => (query.state.data == null ? 15_000 : false),
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
   })
   // Auto-close the details modal if usage resolves to unavailable — the pill
   // hides in that case, so a modal opened during loading would otherwise be stuck.
