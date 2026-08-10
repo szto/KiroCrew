@@ -41,6 +41,7 @@ from kiro_crew.dashboard import (
     handlers_project,
     openai_compat,
     stt_stream,
+    tailnet,
     ws,
 )
 from kiro_crew.dashboard.crash_dump_store import (
@@ -123,10 +124,15 @@ from kiro_crew.dashboard.handlers.source_providers import (
     api_issue_source,
     api_pull_request_auto_merge,
     api_pull_request_checks,
+    api_pull_request_comment,
+    api_pull_request_pending_review,
     api_pull_request_ready,
+    api_pull_request_reply,
     api_pull_request_resolve,
     api_pull_request_source,
     api_pull_request_status,
+    api_pull_request_submit_review,
+    api_pull_request_unresolve,
     register_status_delta_sink,
     unregister_status_delta_sink,
 )
@@ -174,6 +180,7 @@ from kiro_crew.platform import (
     current_context,
     safe_context_call,
 )
+from kiro_crew.power import SleepInhibitor
 from kiro_crew.safety_override import (
     apply_config_duration,
     grant_declared_yolo,
@@ -181,6 +188,7 @@ from kiro_crew.safety_override import (
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.skill_usage import register_skill_read_observer
 from kiro_crew.skills import SkillsLoader, set_pending_staged_hook
 from kiro_crew.suggestions import api_suggestions
 from kiro_crew.tips import api_tips_feedback, api_tips_next, api_tips_status
@@ -214,6 +222,43 @@ logger = logging.getLogger(__name__)
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 _DIST_DIR = _STATIC_DIR / "dist"
+
+# How often the prevent-sleep poll re-evaluates whether the host should be kept
+# awake. It only needs to beat OS idle-sleep timers (minutes), so a coarse
+# interval keeps the overhead negligible; a turn shorter than one interval never
+# outlasts a sleep timer, so not catching it is harmless.
+_PREVENT_SLEEP_POLL_INTERVAL_SECS = 15.0
+
+
+async def _should_prevent_sleep(state: DashboardState) -> bool:
+    """Whether the host should be kept awake right now.
+
+    True only when the user opted in (``dashboard.prevent_sleep``) AND some live
+    session has a turn in flight. Reads config live so toggling the flag takes
+    effect on the next poll without a restart. Fail-closed: any error resolves to
+    "allow sleep" so a config/lookup hiccup can never wedge the machine awake.
+    """
+    try:
+        # KiroCrewConfig.load() does a stat and, on a cache miss, a JSON read +
+        # schema validation. On a slow home filesystem that is a blocking call,
+        # and this runs on the gateway event loop every poll — offload it so a
+        # slow read can never stall chat/heartbeat (no-blocking-call-on-event-loop).
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
+        if not cfg.dashboard.prevent_sleep:
+            return False
+    except Exception:
+        logger.debug("prevent-sleep config read failed", exc_info=True)
+        return False
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return False
+    try:
+        # In-memory dict scan on the loop thread (no await inside, so no
+        # concurrent mutation) — cheap and non-blocking.
+        return sessions.any_active_turn()
+    except Exception:
+        logger.debug("prevent-sleep active-turn check failed", exc_info=True)
+        return False
 
 
 # Strict internal API paths — exact paths that ONLY internal processes
@@ -260,7 +305,16 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/computer-use/frame",
         "/api/session-keepalive",
         "/api/session-tool-policy",
-        "/api/hooks/agent",
+        # NOTE: "/api/hooks/agent" is deliberately NOT here. It is an inbound
+        # webhook for EXTERNAL callers (CI runners, review bots) that hold no
+        # dashboard cookie and no gateway IPC secret, so a strict-internal entry
+        # denies every real caller with 403 before the handler's own bearer check
+        # can run, leaving the webhook token layer unreachable. It lives in
+        # token_auth._BYPASS_EXACT_METHODS, scoped to POST, alongside the
+        # /api/messaging/teams precedent: a self-authenticating external webhook
+        # whose handler (api_hooks_agent -> _verify_hook_token) is the sole auth
+        # gate. The POST scope matters — PUT/DELETE on that same literal path
+        # match the {hook_id} wildcard of the dashboard-authed CRUD routes.
         "/api/outbox/notify",
         "/api/notifications/agent",  # MCP-only (send_notification tool); no browser caller
         "/api/slack/upload-file",
@@ -882,6 +936,10 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/crons/{job_id}/ack", handlers.api_cron_ack)
     app.router.add_get("/api/crons/{job_id}/history", handlers.api_cron_history)
     app.router.add_get("/api/crons/{job_id}/history/{run_id}", handlers.api_cron_history_detail)
+    app.router.add_get("/api/cron-folders", handlers.api_cron_folders)
+    app.router.add_post("/api/cron-folders", handlers.api_cron_folders_create)
+    app.router.add_patch("/api/cron-folders/{folder_id}", handlers.api_cron_folders_update)
+    app.router.add_delete("/api/cron-folders/{folder_id}", handlers.api_cron_folders_delete)
     app.router.add_get("/api/taskrunner", handlers.api_taskrunner_status)
     app.router.add_post("/api/taskrunner", handlers.api_taskrunner_start)
     app.router.add_post("/api/taskrunner/cancel", handlers.api_taskrunner_cancel)
@@ -1194,9 +1252,7 @@ def _claimed_dashboard_slots(state: DashboardState) -> frozenset[str]:
         data = getattr(smap, "_data", None)
         if not isinstance(data, dict):
             return frozenset()
-        return frozenset(
-            k[len("dashboard:"):] for k in data if k.startswith("dashboard:")
-        )
+        return frozenset(k[len("dashboard:") :] for k in data if k.startswith("dashboard:"))
     except Exception:
         logger.debug("could not read claimed dashboard slots", exc_info=True)
         return frozenset()
@@ -1548,6 +1604,77 @@ def _wire_tunnel_shutdown(app: web.Application, state: DashboardState) -> None:
     app.on_cleanup.append(_tunnel_shutdown)
 
 
+def _register_prevent_sleep_shutdown(app: web.Application, state: DashboardState) -> None:
+    """Register the on_cleanup hook that cancels the prevent-sleep poll and
+    releases the OS block.
+
+    MUST be called BEFORE ``runner.setup()`` freezes the app's signal lists. The
+    inhibitor and task are created after setup (by :func:`_arm_prevent_sleep_poll`)
+    and resolved here lazily via ``getattr``. Shared by both ``start_dashboard``
+    and the headless ``start_api_server`` (``--slack-only``) so a graceful stop
+    never leaves caffeinate / systemd-inhibit / the Windows execution-state
+    request dangling, in either mode.
+    """
+
+    async def _prevent_sleep_shutdown(app_: web.Application) -> None:
+        task = getattr(state, "_prevent_sleep_task", None)
+        if task is not None:
+            task.cancel()
+        inhibitor = getattr(state, "_sleep_inhibitor", None)
+        if inhibitor is not None:
+            try:
+                inhibitor.set_active(False)
+            except Exception:
+                logger.debug("prevent-sleep release on shutdown failed", exc_info=True)
+
+    app.on_cleanup.append(_prevent_sleep_shutdown)
+
+
+def _arm_prevent_sleep_poll(state: DashboardState) -> None:
+    """Create the sleep inhibitor and start its poll task on the running loop.
+
+    Keeps the host awake while any session has a turn in flight, but only when
+    the user opted in via ``dashboard.prevent_sleep``. Decoupled from the turn
+    paths on purpose: polling the same active-turn signal the shutdown drain
+    filters on covers every surface (dashboard, Slack, CLI, task runner, and
+    sub-agents running under a parent turn) without threading acquire/release
+    through each path.
+
+    MUST be called AFTER ``runner.setup()`` (it needs a running loop), and paired
+    with :func:`_register_prevent_sleep_shutdown` (registered before setup) for
+    release. Shared by both server entrypoints so headless ``--slack-only`` mode
+    keeps the host awake identically to the full dashboard — a long Slack task
+    on a laptop is the case this feature exists for.
+    """
+    inhibitor = SleepInhibitor()
+    state._sleep_inhibitor = inhibitor  # prevent GC; released on cleanup
+
+    async def _prevent_sleep_poll() -> None:
+        try:
+            while True:
+                await asyncio.sleep(_PREVENT_SLEEP_POLL_INTERVAL_SECS)
+                try:
+                    inhibitor.set_active(await _should_prevent_sleep(state))
+                except Exception:
+                    logger.debug("prevent-sleep poll toggle failed", exc_info=True)
+        except asyncio.CancelledError:
+            # Release the OS block before propagating so a cancel (shutdown)
+            # never leaves the machine unable to sleep.
+            inhibitor.set_active(False)
+            raise
+
+    def _prevent_sleep_done(task: "asyncio.Task") -> None:  # type: ignore[type-arg]
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("prevent-sleep poll task exited unexpectedly", exc_info=exc)
+
+    task = asyncio.create_task(_prevent_sleep_poll())
+    task.add_done_callback(_prevent_sleep_done)
+    state._prevent_sleep_task = task  # prevent GC; cancelled on cleanup
+
+
 async def start_dashboard(
     sessions: SessionManager,
     crons: CronService,
@@ -1649,11 +1776,7 @@ async def start_dashboard(
                 description = str(info.get("description") or "").strip()
                 triggers = str(info.get("triggers") or "").strip()
                 subject = target or name if is_update else name
-                title = (
-                    "Skill update awaiting review"
-                    if is_update
-                    else "New skill awaiting review"
-                )
+                title = "Skill update awaiting review" if is_update else "New skill awaiting review"
                 # The body LEADS with name + description because the feed row
                 # renders only its first ~80 characters, stripped to one line.
                 # The title already says a skill is awaiting review, so opening
@@ -1673,9 +1796,7 @@ async def start_dashboard(
                 if triggers:
                     lines.append(f"\n**Triggers:** {triggers}")
                 if info.get("has_scripts"):
-                    lines.append(
-                        "\n_Bundles executable scripts — review them before approving._"
-                    )
+                    lines.append("\n_Bundles executable scripts — review them before approving._")
                 body = "\n".join(lines)
                 payload = {
                     "slug": slug,
@@ -1852,6 +1973,10 @@ async def start_dashboard(
     state._hook_store = ScriptHookStore()
     set_global_hook_store(state._hook_store)
 
+    # Credit the skill-usage ledger for skill bodies the model reads directly
+    # (a file-read tool or `cat`), which bypass the loader entirely.
+    register_skill_read_observer(state.context_builder)
+
     # Wire script hooks into subagent tool execution path
     if state.subagents is not None:
         state.subagents.hook_store = state._hook_store
@@ -1889,6 +2014,9 @@ async def start_dashboard(
     # and the task is cancelled by the service's shutdown hook.
     app["kiro_prerequisite_service"].warm_up()
     state.load_folders()
+    # Off-loop: a large cron_folders.json would otherwise block the event
+    # loop with synchronous file I/O + JSON parsing during startup.
+    await asyncio.to_thread(state.load_cron_folders)
     state.load_tags()
     app["port"] = port
 
@@ -1920,6 +2048,10 @@ async def start_dashboard(
     # Status / system
     app.router.add_get("/api/status", handlers.api_status)
     app.router.add_get("/api/system", handlers.api_system)
+    app.router.add_get("/api/system/session-storage", handlers.api_session_storage)
+    app.router.add_post("/api/system/session-storage/cleanup", handlers.api_session_storage_cleanup)
+    app.router.add_post("/api/system/session-storage/restore", handlers.api_session_storage_restore)
+    app.router.add_post("/api/system/session-storage/empty", handlers.api_session_storage_empty)
     app.router.add_get("/api/stream", handlers.api_stream)
     app.router.add_get("/api/sso-ttl", handlers.api_sso_ttl)
     app.router.add_get("/api/dashboard/branding", handlers.api_branding)
@@ -1932,13 +2064,12 @@ async def start_dashboard(
         "/api/kiro-prerequisite",
         handlers.api_kiro_prerequisite_status,
     )
+    # POST, not a flag on the status GET: csrf_middleware skips check_origin for
+    # safe methods and sel_audit_middleware logs only mutating ones, so a spec
+    # rewrite reached from the GET would be cross-site triggerable and unaudited.
     app.router.add_post(
-        "/api/kiro-prerequisite/install",
-        handlers.api_kiro_prerequisite_install,
-    )
-    app.router.add_post(
-        "/api/kiro-prerequisite/login",
-        handlers.api_kiro_prerequisite_login,
+        "/api/kiro-prerequisite/repair-specs",
+        handlers.api_kiro_prerequisite_repair_specs,
     )
     app.router.add_get("/api/governance/channels", handlers.api_governance_channels)
 
@@ -2023,6 +2154,15 @@ async def start_dashboard(
     app.router.add_post("/api/hooks/{hook_id}/toggle", handlers.api_hook_toggle)
     app.router.add_post("/api/hooks/{hook_id}/test", handlers.api_hook_test)
 
+    # Inbound webhook management (dashboard-authed — the webhook token itself
+    # only ever authenticates POST /api/hooks/agent, never these).
+    app.router.add_get("/api/webhooks", handlers.api_webhooks)
+    app.router.add_post("/api/webhooks/tokens", handlers.api_webhook_token_create)
+    app.router.add_delete("/api/webhooks/tokens/{token_id}", handlers.api_webhook_token_delete)
+    app.router.add_delete("/api/webhooks/contexts/{hook_id}", handlers.api_webhook_context_delete)
+    app.router.add_post("/api/webhooks/test", handlers.api_webhook_test)
+    app.router.add_post("/api/webhooks/switch", handlers.api_webhooks_switch)
+
     # Prompts (Agent SOPs)
     app.router.add_get("/api/prompts", handlers.api_prompts)
     app.router.add_get("/api/prompts/{name:.+}", handlers.api_prompt_detail)
@@ -2046,6 +2186,9 @@ async def start_dashboard(
     app.router.add_post("/api/skills/-/pending/{slug}/approve", handlers.api_skill_pending_approve)
     app.router.add_post("/api/skills/-/pending/{slug}/dismiss", handlers.api_skill_pending_dismiss)
     app.router.add_post("/api/skills/-/pin", handlers.api_skill_pin)
+    app.router.add_post("/api/skills/-/inject-on-trigger", handlers.api_skill_inject_on_trigger)
+    # Skill context budget (read-only cost analysis with alias folding).
+    app.router.add_get("/api/skills/-/budget", handlers.api_skills_budget)
     app.router.add_get("/api/skills/{name:.+}/-/tree", handlers.api_skill_tree)
     app.router.add_get("/api/skills/{name:.+}/-/file", handlers.api_skill_file)
     app.router.add_get("/api/skills/{name:.+}", handlers.api_skill_detail)
@@ -2146,8 +2289,17 @@ async def start_dashboard(
     app.router.add_post("/api/source/pull-request/checks", api_pull_request_checks)
     app.router.add_post("/api/source/pull-request/status", api_pull_request_status)
     app.router.add_post("/api/source/pull-request/resolve", api_pull_request_resolve)
+    app.router.add_post("/api/source/pull-request/unresolve", api_pull_request_unresolve)
+    app.router.add_post("/api/source/pull-request/reply", api_pull_request_reply)
+    app.router.add_post("/api/source/pull-request/comment", api_pull_request_comment)
     app.router.add_post("/api/source/pull-request/auto-merge", api_pull_request_auto_merge)
     app.router.add_post("/api/source/pull-request/ready", api_pull_request_ready)
+    app.router.add_post(
+        "/api/source/pull-request/pending-review", api_pull_request_pending_review
+    )
+    app.router.add_post(
+        "/api/source/pull-request/submit-review", api_pull_request_submit_review
+    )
     app.router.add_post("/api/source/issue", api_issue_source)
     app.router.add_get("/api/chat/slots", chat.api_chat_slots)
     app.router.add_post("/api/chat/slots", chat.api_chat_slot_create)
@@ -2156,6 +2308,9 @@ async def start_dashboard(
     app.router.add_get("/api/chat/slots/{slot}", chat.api_chat_slot_detail)
     app.router.add_post("/api/chat/slots/{slot}/stop", chat.api_chat_slot_stop)
     app.router.add_post("/api/chat/slots/{slot}/interrupt", chat.api_chat_slot_interrupt)
+    # Deliberately NOT /resume — that path is already taken by "open a history
+    # session into a tab" (api_chat_slot_resume) and means something else.
+    app.router.add_post("/api/chat/slots/{slot}/continue", chat.api_chat_slot_continue)
     app.router.add_delete(
         "/api/chat/slots/{slot}/queue/{queue_id}", chat.api_chat_slot_queue_cancel
     )
@@ -2199,9 +2354,7 @@ async def start_dashboard(
     app.router.add_delete("/api/agents/detail/{name}", handlers.api_agent_detail)
     # KiroCrew Agent CRUD
     app.router.add_get("/api/agents", handlers.api_kirocrew_agents)
-    app.router.add_get(
-        "/api/agents/resolved-model", handlers.api_kirocrew_agent_resolved_model
-    )
+    app.router.add_get("/api/agents/resolved-model", handlers.api_kirocrew_agent_resolved_model)
     app.router.add_post("/api/agents", handlers.api_kirocrew_agents_create)
     app.router.add_post("/api/agents/sync", handlers.api_kirocrew_agents_sync)
     app.router.add_put("/api/agents/{name}", handlers.api_kirocrew_agent_update)
@@ -2313,6 +2466,10 @@ async def start_dashboard(
     app.router.add_get("/api/outbox/{filename}", handlers.api_outbox_download)
     app.router.add_post("/api/screenshot", handlers.api_screenshot)
 
+    # Diagnostics / "Report a Problem" (redacted support bundle)
+    app.router.add_post("/api/diagnostics/collect", handlers.api_diagnostics_collect)
+    app.router.add_get("/api/diagnostics/download/{filename}", handlers.api_diagnostics_download)
+
     # Portability (export/import config+memory as zip)
     app.router.add_get("/api/portability/export", handlers.api_portability_export)
     app.router.add_post("/api/portability/import", handlers.api_portability_import)
@@ -2412,6 +2569,7 @@ async def start_dashboard(
     )
     app.router.add_get("/api/update/check", handlers.api_update_check)
     app.router.add_get("/api/changelog", handlers.api_changelog)
+    app.router.add_get("/api/releases", handlers.api_releases)
     app.router.add_post("/api/update", handlers.api_update_apply)
     app.router.add_post("/api/update/auto", handlers.api_update_auto)
     app.router.add_post("/api/update/cancel", handlers.api_update_cancel)
@@ -2422,6 +2580,7 @@ async def start_dashboard(
     app.router.add_get("/api/sessions", handlers.api_sessions)
     app.router.add_delete("/api/sessions", handlers.api_sessions_clear)
     app.router.add_get("/api/sessions/context", handlers.api_sessions_context)
+    app.router.add_get("/api/sessions/memory", handlers.api_sessions_memory)
     app.router.add_get("/api/sessions/health", handlers.api_sessions_health)
     app.router.add_get("/api/sessions/usage", handlers.api_sessions_usage)
     app.router.add_get("/api/usage/kiro", handlers.api_kiro_usage)
@@ -2429,6 +2588,7 @@ async def start_dashboard(
     app.router.add_get("/api/telemetry/startup", handlers.api_telemetry_startup)
     app.router.add_get("/api/telemetry/context-trace", handlers.api_context_trace)
     app.router.add_get("/api/telemetry/beacon", handlers.api_beacon_status)
+    app.router.add_get("/api/tailnet/status", handlers.api_tailnet_status)
     app.router.add_post("/api/sessions/restart", handlers.api_sessions_restart)
     # NOTE: /search must be registered before /{key} to avoid the path param catching "search"
     app.router.add_get("/api/sessions/search", handlers.api_sessions_search)
@@ -2456,6 +2616,13 @@ async def start_dashboard(
     app.router.add_delete(
         "/api/security/denied-commands/user/{id}", handlers.api_denied_command_user_delete
     )
+    # Per-app third-party execution grants (Settings > Security opt-IN). The
+    # blanket flag is a PUT on a fixed sub-path; grant/revoke are POST/DELETE on
+    # {name}, so the two never collide on method+path.
+    app.router.add_get("/api/security/trusted-apps", handlers.api_trusted_apps_list)
+    app.router.add_put("/api/security/trusted-apps/allow-all", handlers.api_trusted_apps_allow_all)
+    app.router.add_post("/api/security/trusted-apps/{name}", handlers.api_trusted_app_grant)
+    app.router.add_delete("/api/security/trusted-apps/{name}", handlers.api_trusted_app_revoke)
     # Read-only governance policy viewer — effective Level-1 ∩ Level-2 ceiling
     # across every governed scope (no write path; the ceiling is file-authored).
     app.router.add_get("/api/governance/policy", handlers.api_governance_policy)
@@ -2794,7 +2961,32 @@ async def start_dashboard(
                 raise
         return await handler(request)  # type: ignore[operator]
 
-    app["allowed_origins"] = build_allowed_origins(port, local_only, configured_host)
+    # Tailnet origin (RFC §4): this machine's own MagicDNS name, so
+    # `tailscale serve` works without the operator hand-writing dashboard.url.
+    # Off by default; resolved in a thread so the daemon call cannot stall the
+    # loop; "" whenever Tailscale is absent, stopped, or produced nothing that
+    # validated.
+    _tailnet_host = await tailnet.resolve_tailnet_host(
+        KiroCrewConfig.load().dashboard.tailscale.enabled
+    )
+    if _tailnet_host:
+        logger.info(
+            "tailnet access enabled: trusting origin https://%s (bind and auth unchanged)",
+            _tailnet_host,
+        )
+    # Stashed on the app, not left a local, because GET /api/tailnet/status must
+    # report the value the running origin set was actually built from rather than
+    # re-probe the daemon (see handlers/tailnet.py). ``tailnet_resolved_at`` is
+    # stamped unconditionally — it timestamps the resolution ATTEMPT, so an
+    # "unresolved" card can say when we last looked; ``0`` means the derivation
+    # never ran (feature off, or pinned). Both start-up paths set both keys: only
+    # one of them serves this route today, but an earlier round of this feature
+    # already shipped a bug from touching one startup site and not the other.
+    app["tailnet_host"] = _tailnet_host
+    app["tailnet_resolved_at"] = int(time.time()) if _tailnet_host else 0
+    app["allowed_origins"] = build_allowed_origins(
+        port, local_only, configured_host, tailnet_host=_tailnet_host
+    )
     # Exposed to handlers (e.g. knowledge.pick_folder) that only make sense when
     # the browser and gateway are co-located on localhost.
     app["local_only"] = local_only
@@ -2849,6 +3041,12 @@ async def start_dashboard(
     # I/O (or Windows icacls subprocess) lands on the loop on the first auth op.
     await warm_auth_singletons()
 
+    # Cloudflare Access trust (dashboard entrypoint only — the headless
+    # --slack-only server has no browser UI, so Access auto-login does not
+    # apply there). Config load is a stat + cached read; offload anyway to
+    # keep the no-blocking-call-on-event-loop rule uniform.
+    _cf_access_cfg = (await asyncio.to_thread(KiroCrewConfig.load)).dashboard.cf_access
+
     # Explicit middleware ordering — self-documenting and immune to future insertions
     app.middlewares[:] = [
         # Outermost: privacy-safe per-route latency (rec #1). Times the FULL
@@ -2867,6 +3065,8 @@ async def start_dashboard(
             port=port,
             local_only=local_only,
             spa_shell_handler=handlers.index,
+            cf_access_team_domain=_cf_access_cfg.team_domain,
+            cf_access_aud=_cf_access_cfg.aud,
         ),
         sel_audit_middleware,
         spa_fallback,
@@ -2878,7 +3078,7 @@ async def start_dashboard(
         _has_token_auth = any(getattr(mw, "_is_token_auth", False) for mw in app.middlewares)
         if _has_token_auth:
             app["allowed_origins"] = build_allowed_origins(
-                port, local_only, configured_host, dashboard_url
+                port, local_only, configured_host, dashboard_url, tailnet_host=_tailnet_host
             )
             logger.info(
                 "dashboard_url=%s: added to CSRF allowed origins (token auth verified)",
@@ -2904,6 +3104,12 @@ async def start_dashboard(
             wd.stop()
 
     app.on_cleanup.append(_watchdog_shutdown)
+
+    # ── Prevent-sleep inhibitor shutdown ─────────────────────────────────────
+    # Registered HERE (before runner.setup freezes the signal lists) for the
+    # same reason as the watchdog hook above. The inhibitor + poll task are
+    # created after runner.setup by _arm_prevent_sleep_poll and released here.
+    _register_prevent_sleep_shutdown(app, state)
 
     async def _kiro_prerequisite_shutdown(app_: web.Application) -> None:
         await app_["kiro_prerequisite_service"].close()
@@ -3001,6 +3207,11 @@ async def start_dashboard(
     _hb = asyncio.create_task(_loop_heartbeat())
     _hb.add_done_callback(_heartbeat_done)
     state._loop_heartbeat = _hb  # prevent GC
+
+    # ── Prevent-sleep poll ───────────────────────────────────────────────────
+    # Keep the host awake while a turn is in flight (opt-in via
+    # dashboard.prevent_sleep). Shared with the headless --slack-only entrypoint.
+    _arm_prevent_sleep_poll(state)
 
     # Arm the stall watchdog only when faulthandler is enabled — i.e. under the
     # real gateway entrypoint (see cli `gateway` dispatch). Tests that spin up
@@ -3138,9 +3349,7 @@ async def start_dashboard(
         # dashboard session that merely happens to be named like a channel
         # stem is never mistaken for an orphan of it.
         _claimed = await asyncio.to_thread(_claimed_dashboard_slots, state)
-        merged = await asyncio.to_thread(
-            migrate_channel_transcripts, dashboard_slots=_claimed
-        )
+        merged = await asyncio.to_thread(migrate_channel_transcripts, dashboard_slots=_claimed)
         if merged:
             logger.info("Merged %d leftover channel transcript copies", merged)
     except Exception:
@@ -3265,6 +3474,15 @@ async def start_api_server(
     state._hook_store = ScriptHookStore()
     set_global_hook_store(state._hook_store)
 
+    # This path builds its state without a context_builder, so the loader is
+    # reached through the task runner. Logged on a miss rather than silently
+    # recording nothing, since a route that credits no reads is the bias this
+    # observer exists to remove.
+    if not register_skill_read_observer(
+        state.context_builder, getattr(task_runner, "_ctx", None)
+    ):
+        logger.info("skill-read observer not registered: no skills loader reachable")
+
     # Wire script hooks into subagent tool execution path
     if state.subagents is not None:
         state.subagents.hook_store = state._hook_store
@@ -3292,6 +3510,9 @@ async def start_api_server(
     # and the task is cancelled by the service's shutdown hook.
     app["kiro_prerequisite_service"].warm_up()
     state.load_folders()
+    # Off-loop: a large cron_folders.json would otherwise block the event
+    # loop with synchronous file I/O + JSON parsing during startup.
+    await asyncio.to_thread(state.load_cron_folders)
     state.load_tags()
     app["port"] = port
 
@@ -3301,7 +3522,22 @@ async def start_api_server(
     # The MCP route surface is identical to the dashboard's, so the middleware
     # chain must be too. Host-allowlist source of truth is shared with the CSRF
     # Origin check via build_allowed_origins/build_allowed_hosts (see origin.py).
-    app["allowed_origins"] = build_allowed_origins(port, local_only, configured_host)
+    _tailnet_host = await tailnet.resolve_tailnet_host(
+        KiroCrewConfig.load().dashboard.tailscale.enabled
+    )
+    app["allowed_origins"] = build_allowed_origins(
+        port,
+        local_only,
+        configured_host,
+        tailnet_host=_tailnet_host,
+    )
+    # Stashed for the same reason as in start_dashboard, and set here too even
+    # though /api/tailnet/status is registered on the dashboard app: leaving one of
+    # the two startup paths without the keys is exactly the class of bug an earlier
+    # round of this feature already shipped, and a handler moved into the MCP
+    # surface later would silently read "" as "nothing was trusted".
+    app["tailnet_host"] = _tailnet_host
+    app["tailnet_resolved_at"] = int(time.time()) if _tailnet_host else 0
     app["local_only"] = local_only
 
     # Per-session internal secret for machine-to-machine (mcp-core, cron) auth.
@@ -3314,7 +3550,7 @@ async def start_api_server(
     app["local_secret"] = _internal_secret
 
     # SEL audit middleware — log mutating MCP tool calls
-    _sel_methods = {"GET", "POST", "PUT", "DELETE"}
+    _sel_methods = {"GET", "POST", "PUT", "PATCH", "DELETE"}
     _safe_methods = {"GET", "HEAD", "OPTIONS"}
 
     @web.middleware  # type: ignore[misc]
@@ -3422,6 +3658,12 @@ async def start_api_server(
 
     app.on_cleanup.append(_kiro_prerequisite_shutdown)
 
+    # Prevent-sleep shutdown hook — registered before runner.setup freezes the
+    # signal lists; the poll itself is armed after the port binds (below). This
+    # is what makes headless --slack-only keep the host awake during a long
+    # Slack task, identically to the full dashboard.
+    _register_prevent_sleep_shutdown(app, state)
+
     # Hardened runner: same slowloris / CWE-400 mitigation as start_dashboard,
     # plus the raised max_field_size (see start_dashboard for the cookie-jar
     # rationale).
@@ -3450,6 +3692,11 @@ async def start_api_server(
         raise
 
     logger.info("API-only server listening on %s:%d", bind_addr, port)
+
+    # Arm the prevent-sleep poll now the loop is up and the port is bound
+    # (shutdown hook already registered above). Headless --slack-only mode keeps
+    # the host awake during a long Slack task exactly as the full dashboard does.
+    _arm_prevent_sleep_poll(state)
 
     # Boot-to-ready (rec #1): headless API server is bound and ready. Privacy-safe
     # fixed labels only; best-effort.

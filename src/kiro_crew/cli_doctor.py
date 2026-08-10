@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 from kiro_crew import __version__ as _mc_version
-from kiro_crew import platform_compat
+from kiro_crew import diagnostics, platform_compat
 from kiro_crew.acp.client import KIRO_CLI_BIN
 from kiro_crew.agent import AGENT_FILENAME
 from kiro_crew.atomic_write import atomic_write
@@ -41,12 +41,14 @@ from kiro_crew.dashboard.origin import (
     parse_dashboard_url,
 )
 from kiro_crew.embeddings import (
+    _LIB_PATH_ENV,
     _load_llama_class,
     _platform_libs_dirname,
     _resolve_model_url,
     default_model_path,
     model_file_present,
     resolve_custom_model,
+    verify_vendored_libs,
 )
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS as _MANAGED_MCPS
 from kiro_crew.mcp_discovery import McpServerInfo, probe_server
@@ -56,6 +58,7 @@ from kiro_crew.platform import (
     safe_context_call,
 )
 from kiro_crew.platform.governance import CU_MCP_SERVER, may_skip_gate_now
+from kiro_crew.sandbox import warm_backend
 from kiro_crew.sel import sel
 from kiro_crew.transcribe import _find_whisper, ensure_ffmpeg_in_path
 
@@ -215,6 +218,32 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
 
     if not probe_targets:
         return
+
+    # Every probe below spawns its server through the sandbox chokepoint, and
+    # asyncio.gather releases them together. On a cold cache the first arrivals
+    # therefore land on the on-loop deferral path simultaneously and each logs a
+    # transient probe failure — noise that reads as a real sandbox fault during a
+    # health check whose subject is MCP, not the sandbox. Warm the cache here,
+    # off any loop, so the probes see a settled verdict.
+    #
+    # The chokepoint helper is deliberately NOT named here: test_spawn_audit
+    # classifies a spawn as sandbox-routed by substring-scanning the enclosing
+    # function's source, so spelling that identifier even in a comment flips this
+    # function's classification and then demands a resource-limit preexec_fn it
+    # does not own. The routing genuinely happens inside
+    # mcp_discovery.probe_server, not here.
+    #
+    # Failing to warm is non-fatal BY DESIGN (the cache stays cold and the
+    # self-healing transient path applies), so it must not be able to abort the
+    # command. `warm_backend` starts a thread, and `Thread.start()` raises when
+    # the process is out of threads — precisely the degraded state someone runs
+    # `doctor` to diagnose, which is the worst moment for the diagnostic itself
+    # to die. Swallow it here rather than inside the probe `try` below, so a warm
+    # failure is never misreported as an MCP probe failure.
+    try:
+        warm_backend()
+    except Exception:
+        logger.debug("sandbox probe warm failed; probes will re-probe", exc_info=True)
 
     try:
 
@@ -434,7 +463,7 @@ def _doctor_model_url_reachable(issues: list[str]) -> None:
         print("               keep retrying with backoff on every gateway boot.")
 
 
-def _doctor(platform_boot_error: "Exception | None" = None) -> None:
+def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False) -> None:
     """Verify KiroCrew setup — check dependencies, config, credentials, connectivity.
 
     ``platform_boot_error`` carries a :class:`PlatformCompositionError` from
@@ -446,6 +475,34 @@ def _doctor(platform_boot_error: "Exception | None" = None) -> None:
 
     print("Kiro Crew Doctor 👻\n")
     issues: list[str] = []
+
+    # ── Diagnostics bundle (--bundle) ──
+    # Short-circuit: collect logs + crash reports into a redacted zip and print
+    # the local path plus a pre-filled GitHub issue URL, then exit. Shares the
+    # exact collector the dashboard "Report a Problem" button uses.
+    if bundle:
+        print("Collecting diagnostics bundle (secrets are redacted)...\n")
+        # The collector touches the filesystem in several places that can fail for
+        # ordinary reasons — an unwritable data home, a plain FILE sitting where
+        # `diagnostics/` should be, a full disk. Letting OSError escape prints a
+        # traceback at the one moment the user is already trying to report a
+        # failure, so fail with a readable message and a nonzero status instead.
+        try:
+            result = diagnostics.collect_bundle()
+        except OSError as exc:
+            print(f"  ❌ could not write the diagnostics bundle: {exc}")
+            print("     Check that ~/.kiro/crew is writable and has free space.")
+            sys.exit(1)
+        print(f"  ✅ bundle: {result.zip_path}")
+        print(
+            f"     {len(result.included)} file(s) · "
+            f"{result.total_redactions} secret(s) redacted"
+        )
+        if result.skipped:
+            print(f"     skipped (not found): {', '.join(result.skipped)}")
+        print("\n  Open a pre-filled GitHub issue (then drag the zip in):")
+        print(f"  {result.github_issue_url}")
+        return
 
     # ── Platform edition ──
     # Report the composed profile, and surface a boot-composition failure as a
@@ -706,6 +763,11 @@ def _doctor(platform_boot_error: "Exception | None" = None) -> None:
     # ── Vector Memory (in-process embeddings) ──
     print("\nVector Memory (in-process embeddings)")
 
+    # Read BEFORE _load_llama_class(): the loader `setdefault`s this var to its
+    # OWN bundled libs dir, so after the call an unset var is indistinguishable
+    # from an operator override pointing at the bundle.
+    _lib_path_override = os.environ.get(_LIB_PATH_ENV, "")
+
     if _load_llama_class() is not None:
         print("  runtime:     ✅ vendored llama-cpp-python importable")
     elif _platform_libs_dirname() is None:
@@ -718,6 +780,29 @@ def _doctor(platform_boot_error: "Exception | None" = None) -> None:
         )
     else:
         print("  runtime:     ❌ vendored runtime failed to load")
+        # Distinguish an incomplete SHIPPED payload from a load failure on a
+        # complete one. Both surface as the same ctypes "base name 'llama' not
+        # found", but only the former is a packaging defect the user cannot fix
+        # by configuration — and naming the absent files is what stops the
+        # diagnosis from being misread as an unsupported architecture.
+        #
+        # Mirrors the loader's LLAMA_CPP_LIB_PATH exemption: under an override
+        # the libs load from the operator's directory, so blaming the bundled
+        # tree would send them to reinstall a package they are deliberately not
+        # loading from, while saying nothing about the dir that actually failed.
+        _plat_dir = _platform_libs_dirname()
+        _absent = (
+            [] if _lib_path_override else verify_vendored_libs().get(_plat_dir or "", [])
+        )
+        if _absent:
+            print(f"               Missing native libs for {_plat_dir}: {', '.join(_absent)}")
+            print("               This install's vendored llama.cpp is incomplete (packaging")
+            print("               defect, not an unsupported platform) — reinstall Kiro Crew")
+            print("               from a current release to restore vector memory.")
+        elif _lib_path_override:
+            print(f"               {_LIB_PATH_ENV} is set — the libs load from")
+            print(f"               {_lib_path_override}, not the bundled tree.")
+            print("               Verify that directory holds a complete llama.cpp closure.")
         issues.append("embedding runtime")
 
     # FAISS is an optional accelerator — never a dependency, on any platform.

@@ -29,6 +29,7 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.paths import config_dir
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.embeddings import get_shared_embedder, model_file_present
+from kiro_crew.executors import subprocess_executor
 from kiro_crew.platform import current_context
 from kiro_crew.safety_override import safety_override, until_shutdown_permitted
 from kiro_crew.stats import Stats
@@ -160,11 +161,23 @@ async def api_status(request: web.Request) -> web.Response:
     )
     from kiro_crew.dashboard.handlers import updates as _updates_mod
 
-    # Auto-recheck every 12h in background
+    # Auto-recheck every 12h in background. Tracked in ``_background_tasks`` (this
+    # module's own documented pattern) rather than left as a bare create_task: the
+    # check now performs network I/O with a multi-second timeout, so an untracked
+    # task can be garbage-collected mid-flight or still be pending when the loop
+    # closes. ``_do_update_check`` is additionally single-flight, because the
+    # interval clock is only stamped once a check finishes.
     if time.time() - _updates_mod._last_update_check > _UPDATE_CHECK_INTERVAL:
-        asyncio.create_task(_do_update_check())
+        _bg = asyncio.create_task(_do_update_check())
+        state._background_tasks.add(_bg)
+        _bg.add_done_callback(state._background_tasks.discard)
 
-    data = state.status_snapshot(update_available=bool(_update_info.get("available")))
+    data = state.status_snapshot(
+        update_available=bool(_update_info.get("available")),
+        update_self_updatable=bool(_update_info.get("self_updatable")),
+        update_checked=bool(_update_info.get("checked")),
+        update_command=str(_update_info.get("update_command") or ""),
+    )
     static_info = _get_static_system_info()
     if state._owner_hash is not None:
         owner_hash = state._owner_hash
@@ -289,6 +302,173 @@ def _get_owner_hash(state: DashboardState) -> str:
     return h
 
 
+def _parse_vm_stat(vm_stat_output: str) -> tuple[int, dict[str, int]]:
+    """Parse `vm_stat` output into ``(page_size, {stat_name: pages})``.
+
+    Page size defaults to 16 KiB (Apple Silicon) if the header is absent.
+    """
+    page_size = 16384
+    counts: dict[str, int] = {}
+    for line in vm_stat_output.splitlines():
+        if "page size of" in line:
+            with contextlib.suppress(ValueError, IndexError):
+                page_size = int(line.split()[-2])
+            continue
+        key, sep, val = line.partition(":")
+        if not sep:
+            continue
+        val = val.strip().rstrip(".")
+        if val.isdigit():
+            counts[key.strip()] = int(val)
+    return page_size, counts
+
+
+def _macos_memory_gb(total_bytes: int, vm_stat_output: str) -> tuple[float, float]:
+    """Return ``(used_gb, free_gb)`` matching macOS Activity Monitor's numbers.
+
+    Activity Monitor's "Memory Used" is ``App Memory + Wired + Compressed``:
+
+        App Memory = anonymous pages - purgeable pages   (dirty app allocations)
+        Wired      = wired-down pages                     (kernel/non-pageable)
+        Compressed = pages occupied by the compressor
+
+    Everything else — free pages plus the reclaimable file-backed cache
+    ("Cached Files") — is reported as free/available, so ``used + free`` equals
+    total.
+
+    The previous implementation counted *every* inactive page as free and
+    ignored compressed memory entirely, which under-reported "used" by several
+    GB versus Activity Monitor and `memory_pressure` (e.g. it showed 28 GB used
+    where Activity Monitor reported ~33 GB on a 48 GB machine). "Pages inactive"
+    includes dirty anonymous pages that are genuinely in use, not just
+    reclaimable cache, so it must not be treated as free.
+    """
+    page_size, counts = _parse_vm_stat(vm_stat_output)
+
+    anonymous = counts.get("Anonymous pages", 0)
+    purgeable = counts.get("Pages purgeable", 0)
+    wired = counts.get("Pages wired down", 0)
+    compressed = counts.get("Pages occupied by compressor", 0)
+
+    if anonymous:
+        app_pages = max(0, anonymous - purgeable)
+    else:
+        # Legacy vm_stat without the "Anonymous pages" line: fall back to the
+        # active-page count as an approximation of app memory.
+        app_pages = counts.get("Pages active", 0)
+
+    used_bytes = (app_pages + wired + compressed) * page_size
+    # Never exceed physical memory (guards against a parse/field mismatch).
+    used_bytes = max(0, min(used_bytes, total_bytes))
+
+    used_gb = round(used_bytes / (1024**3), 1)
+    free_gb = round((total_bytes - used_bytes) / (1024**3), 1)
+    return used_gb, free_gb
+
+
+#: Process-scan results, cached independently of the rest of the payload.
+_proc_scan_cache: dict[str, object] = {}
+_proc_scan_cache_ts: float = 0.0
+
+#: How long a process COUNT may be reused.
+#:
+#: Deliberately much longer than :data:`_METRICS_CACHE_TTL`, because the two
+#: answer different questions. CPU / memory / network are a live graph and are
+#: meaningless stale; "how many MCP processes exist" is a slow-moving fact that
+#: nobody reads at 2s resolution — and on any host without ``/proc`` it costs a
+#: whole-machine ``ps`` walk to obtain, which grows with the process count the
+#: shared MCP gateway multiplies. Tying it to the graph's refresh rate is what
+#: made every poll pay for it.
+_PROC_SCAN_CACHE_TTL = 15.0
+
+
+def _scan_mcp_processes() -> dict[str, object]:
+    """Count MCP-ecosystem processes by command-line signature.
+
+    A single process may match multiple signatures (e.g. a sandboxed kiro-cli
+    matches both "kirocrew_sandbox" and "kiro-cli"); per-category counts can
+    overlap, while ``mcp_total`` dedups by PID. kiro-cli is an optional backend;
+    the signature is harmless when it is not installed.
+
+    Sandbox counting platform differences:
+      Linux:  The namespace launcher (python3 ~/.kiro/crew/run/kirocrew_sandbox_*.py ...)
+              forks — the parent stays alive with "kirocrew_sandbox" in its
+              /proc/cmdline, so sandbox count is accurate.
+      macOS:  sandbox-exec execs the target command, replacing the process
+              image. The final cmdline becomes "kiro-cli ..." and the
+              "kirocrew_sandbox" string (only in the -f path arg) is lost.
+              Sandbox count will be 0 even when sandboxes are running.
+    """
+    try:
+        _my = os.getpid()
+        _counts: dict[str, int] = {"sandbox": 0, "kiro_cli": 0}
+        _seen: set[str] = set()
+        if sys.platform == "linux":
+            for d in os.listdir("/proc"):
+                if not d.isdigit() or int(d) == _my:
+                    continue
+                try:
+                    cmd = Path(f"/proc/{d}/cmdline").read_bytes()
+                    matched = False
+                    if b"kirocrew_sandbox" in cmd:
+                        _counts["sandbox"] += 1
+                        matched = True
+                    if b"kiro-cli" in cmd:
+                        _counts["kiro_cli"] += 1
+                        matched = True
+                    if matched:
+                        _seen.add(d)
+                except OSError:
+                    pass
+        else:
+            _sigs = {
+                "kirocrew_sandbox": "sandbox",
+                "kiro-cli": "kiro_cli",
+            }
+            try:
+                out = subprocess.check_output(
+                    ["ps", "-eo", "pid,command"],
+                    timeout=5,
+                    text=True,
+                )
+                for line in out.splitlines():
+                    parts = line.split(None, 1)
+                    if len(parts) < 2:
+                        continue
+                    pid_s, cmd = parts
+                    if pid_s.strip() == str(_my):
+                        continue
+                    matched = False
+                    for sig, key in _sigs.items():
+                        if sig in cmd:
+                            _counts[key] += 1
+                            matched = True
+                    if matched:
+                        _seen.add(pid_s.strip())
+            except Exception:
+                pass
+        return {"mcp_processes": _counts, "mcp_total": len(_seen)}
+    except Exception:
+        return {"mcp_processes": {"sandbox": 0, "kiro_cli": 0}, "mcp_total": 0}
+
+
+def _apply_mcp_process_counts(data: dict[str, object]) -> None:
+    """Merge the (separately cached) process counts into a metrics payload.
+
+    Cached rather than recomputed so the expensive scan runs on its own slow
+    cadence while the live numbers around it stay at the graph's refresh rate.
+    Called from the sampling thread, and the write is a single rebind of two
+    module globals, so no lock is needed: a racing pair of samplers publishes
+    one consistent snapshot or the other, never a mixture.
+    """
+    global _proc_scan_cache, _proc_scan_cache_ts
+    now = time.monotonic()
+    if not _proc_scan_cache or now - _proc_scan_cache_ts >= _PROC_SCAN_CACHE_TTL:
+        _proc_scan_cache = _scan_mcp_processes()
+        _proc_scan_cache_ts = now
+    data.update(_proc_scan_cache)
+
+
 def _collect_system_metrics() -> dict[str, object]:
     """Collect system metrics synchronously (runs in thread pool).
 
@@ -310,21 +490,9 @@ def _collect_system_metrics() -> dict[str, object]:
             total_bytes = int(out)
             data["mem_total_gb"] = round(total_bytes / (1024**3), 1)
             vm = subprocess.check_output([_VM_STAT], timeout=2).decode()
-            page_size = 16384
-            for line in vm.splitlines():
-                if "page size of" in line:
-                    page_size = int(line.split()[-2])
-                    break
-            free_pages = 0
-            for line in vm.splitlines():
-                if "Pages free" in line:
-                    free_pages = int(line.split()[-1].rstrip("."))
-                elif "Pages inactive" in line:
-                    free_pages += int(line.split()[-1].rstrip("."))
-            mem_free: float = round(free_pages * page_size / (1024**3), 1)
-            mem_total: float = round(total_bytes / (1024**3), 1)
+            mem_used, mem_free = _macos_memory_gb(total_bytes, vm)
+            data["mem_used_gb"] = mem_used
             data["mem_free_gb"] = mem_free
-            data["mem_used_gb"] = round(mem_total - mem_free, 1)
         elif sys.platform == "win32":
             mem = platform_compat.system_memory()
             if mem:
@@ -489,73 +657,7 @@ def _collect_system_metrics() -> dict[str, object]:
     except Exception:
         data["child_processes"] = 0
 
-    # MCP ecosystem process count — scan for known command-line signatures.
-    # A single process may match multiple signatures (e.g. a sandboxed kiro-cli
-    # matches both "kirocrew_sandbox" and "kiro-cli"); per-category _counts can
-    # overlap, while mcp_total uses _seen for unique PID dedup. kiro-cli is an
-    # optional backend; the signature is harmless when it is not installed.
-    #
-    # Sandbox counting platform differences:
-    #   Linux:  The namespace launcher (python3 ~/.kiro/crew/run/kirocrew_sandbox_*.py ...)
-    #           forks — the parent stays alive with "kirocrew_sandbox" in its
-    #           /proc/cmdline, so sandbox count is accurate.
-    #   macOS:  sandbox-exec execs the target command, replacing the process
-    #           image. The final cmdline becomes "kiro-cli ..." and the
-    #           "kirocrew_sandbox" string (only in the -f path arg) is lost.
-    #           Sandbox count will be 0 even when sandboxes are running.
-    try:
-        _my = os.getpid()
-        _counts: dict[str, int] = {"sandbox": 0, "kiro_cli": 0}
-        _seen: set[str] = set()
-        if sys.platform == "linux":
-            for d in os.listdir("/proc"):
-                if not d.isdigit() or int(d) == _my:
-                    continue
-                try:
-                    cmd = Path(f"/proc/{d}/cmdline").read_bytes()
-                    matched = False
-                    if b"kirocrew_sandbox" in cmd:
-                        _counts["sandbox"] += 1
-                        matched = True
-                    if b"kiro-cli" in cmd:
-                        _counts["kiro_cli"] += 1
-                        matched = True
-                    if matched:
-                        _seen.add(d)
-                except OSError:
-                    pass
-        else:
-            _sigs = {
-                "kirocrew_sandbox": "sandbox",
-                "kiro-cli": "kiro_cli",
-            }
-            try:
-                out = subprocess.check_output(
-                    ["ps", "-eo", "pid,command"],
-                    timeout=5,
-                    text=True,
-                )
-                for line in out.splitlines():
-                    parts = line.split(None, 1)
-                    if len(parts) < 2:
-                        continue
-                    pid_s, cmd = parts
-                    if pid_s.strip() == str(_my):
-                        continue
-                    matched = False
-                    for sig, key in _sigs.items():
-                        if sig in cmd:
-                            _counts[key] += 1
-                            matched = True
-                    if matched:
-                        _seen.add(pid_s.strip())
-            except Exception:
-                pass
-        data["mcp_processes"] = _counts
-        data["mcp_total"] = len(_seen)
-    except Exception:
-        data["mcp_processes"] = {"sandbox": 0, "kiro_cli": 0}
-        data["mcp_total"] = 0
+    _apply_mcp_process_counts(data)
 
     # In-process embedder monitoring — the model runs inside the gateway process
     # now (no external server), so report functional availability instead of a
@@ -573,26 +675,48 @@ def _collect_system_metrics() -> dict[str, object]:
     return data
 
 
-# Cached system metrics (avoid subprocess spawning on every 1s poll)
+# Cached system metrics (avoid subprocess spawning on every poll)
 _metrics_cache: dict[str, object] = {}
 _metrics_cache_ts: float = 0.0
 _METRICS_CACHE_TTL = 2.0  # seconds
+
+#: Guards a single in-flight collection. The TTL alone does NOT bound the work:
+#: it is only stamped AFTER a collection returns, so while one is still running
+#: every further poll saw a stale cache and launched its own. On a host where a
+#: collection is cheap (Linux: pure ``/proc`` reads) that never showed; on a host
+#: where it spawns several subprocesses the duplicate collections stack up,
+#: because the dashboard polls this endpoint at exactly the TTL. Coalescing makes
+#: concurrent pollers await the SAME collection, so N tabs and a slow host cost
+#: one collection, not N.
+_metrics_lock: asyncio.Lock | None = None
 
 
 async def api_system(request: web.Request) -> web.Response:
     """System information endpoint with live CPU, memory, network metrics.
 
-    Caches results for 2 seconds to avoid spawning subprocesses on every
-    poll when multiple dashboard tabs are open.
+    Caches results briefly and coalesces concurrent collections, so several
+    dashboard tabs polling at once cost one collection rather than one each.
     """
-    global _metrics_cache, _metrics_cache_ts
+    global _metrics_cache, _metrics_cache_ts, _metrics_lock
     now = time.monotonic()
     if now - _metrics_cache_ts < _METRICS_CACHE_TTL and _metrics_cache:
         return web.json_response(_metrics_cache)
-    loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _collect_system_metrics)
-    _metrics_cache = data
-    _metrics_cache_ts = now
+    if _metrics_lock is None:
+        _metrics_lock = asyncio.Lock()
+    async with _metrics_lock:
+        # Re-check under the lock: whoever held it may have just refreshed, and
+        # this waiter wants that result rather than a second collection of its own.
+        now = time.monotonic()
+        if now - _metrics_cache_ts < _METRICS_CACHE_TTL and _metrics_cache:
+            return web.json_response(_metrics_cache)
+        loop = asyncio.get_running_loop()
+        # subprocess_executor (mc-subproc), NOT the default pool: this is
+        # browser-triggered on a 2s poll and spawns up to six subprocesses on a
+        # host without /proc, so leaving it in the default pool let it contend
+        # with the getaddrinfo calls the event loop files there.
+        data = await loop.run_in_executor(subprocess_executor(), _collect_system_metrics)
+        _metrics_cache = data
+        _metrics_cache_ts = time.monotonic()
     return web.json_response(data)
 
 
@@ -618,31 +742,15 @@ async def api_compliance_yolo_status(request: web.Request) -> web.Response:
 
 def _channel_members() -> tuple[str, ...]:
     """Canonical ``channel_type`` ids for the messaging channels, derived from
-    each transport's ``channel_type`` class attribute — the single source of
-    truth — so this list can never drift from the transports themselves.
-    Imported here (off the event loop, inside the executor worker) so the
-    transport modules' own imports don't run on the aiohttp loop.
+    the builtin channel registry — the single source of truth — so this list
+    can never drift from the channels themselves. Imported here (off the event
+    loop, inside the executor worker) so the channel modules' own imports don't
+    run on the aiohttp loop; the roster is cached after the first call.
     """
-    from kiro_crew.discord.transport import DiscordTransport
-    from kiro_crew.slack.transport import SlackTransport
-    from kiro_crew.teams.transport import TeamsTransport
-    from kiro_crew.telegram.transport import TelegramTransport
-    from kiro_crew.webex.transport import WebexTransport
-    from kiro_crew.wecom.transport import WeComTransport
-    from kiro_crew.weixin.transport import WeixinTransport
+    from kiro_crew.channels import builtin_channel_descriptors
+    from kiro_crew.messaging.registry import governed_members
 
-    return tuple(
-        t.channel_type
-        for t in (
-            SlackTransport,
-            DiscordTransport,
-            TelegramTransport,
-            WebexTransport,
-            WeComTransport,
-            TeamsTransport,
-            WeixinTransport,
-        )
-    )
+    return governed_members(builtin_channel_descriptors())
 
 
 def _collect_channel_governance() -> dict[str, object]:

@@ -98,6 +98,10 @@ from kiro_crew.dashboard.handlers.cron import (  # noqa: E402, F401
     api_cron_cancel,
     api_cron_delete,
     api_cron_enable,
+    api_cron_folders,
+    api_cron_folders_create,
+    api_cron_folders_delete,
+    api_cron_folders_update,
     api_cron_history,
     api_cron_history_all,
     api_cron_history_detail,
@@ -109,6 +113,12 @@ from kiro_crew.dashboard.handlers.cron import (  # noqa: E402, F401
     api_lessons,
     api_lessons_create,
     api_lessons_delete,
+)
+
+# ── Diagnostics / Report a Problem (handlers/diagnostics.py) ──
+from kiro_crew.dashboard.handlers.diagnostics import (  # noqa: E402, F401
+    api_diagnostics_collect,
+    api_diagnostics_download,
 )
 
 # ── Files & Workspaces (extracted to handlers/files.py) ──
@@ -154,10 +164,15 @@ from kiro_crew.dashboard.handlers.hooks import (  # noqa: E402, F401
     api_hooks_agent,
     api_hooks_create,
     api_kiro_hooks,
+    api_webhook_context_delete,
+    api_webhook_test,
+    api_webhook_token_create,
+    api_webhook_token_delete,
+    api_webhooks,
+    api_webhooks_switch,
 )
 from kiro_crew.dashboard.handlers.kiro_prerequisite import (  # noqa: E402, F401
-    api_kiro_prerequisite_install,
-    api_kiro_prerequisite_login,
+    api_kiro_prerequisite_repair_specs,
     api_kiro_prerequisite_status,
 )
 from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
@@ -276,6 +291,7 @@ from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
     api_prompts,
     api_skill_detail,
     api_skill_file,
+    api_skill_inject_on_trigger,
     api_skill_pending_approve,
     api_skill_pending_detail,
     api_skill_pending_dismiss,
@@ -287,6 +303,12 @@ from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
 )
 
 # ── Sessions (extracted to handlers/sessions.py) ──
+from kiro_crew.dashboard.handlers.session_storage import (  # noqa: E402, F401
+    api_session_storage,
+    api_session_storage_cleanup,
+    api_session_storage_empty,
+    api_session_storage_restore,
+)
 from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     _SHUTDOWN_TIMEOUT_SECS,
     _fetch_usage_bg,
@@ -305,6 +327,7 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     api_sessions_clear,
     api_sessions_context,
     api_sessions_health,
+    api_sessions_memory,
     api_sessions_restart,
     api_sessions_search,
     api_sessions_summarize,
@@ -317,6 +340,11 @@ from kiro_crew.dashboard.handlers.side import (  # noqa: E402, F401
     api_side_open,
     api_side_turn,
 )
+
+# ── Skill context budget (extracted to handlers/skill_budget.py) ──
+from kiro_crew.dashboard.handlers.skill_budget import (  # noqa: E402, F401
+    api_skills_budget,
+)
 from kiro_crew.dashboard.handlers.sso_login import (  # noqa: E402, F401
     api_sso_login_ws,
 )
@@ -328,6 +356,9 @@ from kiro_crew.dashboard.handlers.steering import (  # noqa: E402, F401
     list_steering_blocking,
     resolve_steering_file,
     steering_roots,
+)
+from kiro_crew.dashboard.handlers.tailnet import (  # noqa: E402, F401
+    api_tailnet_status,
 )
 
 # ── Task Runner (extracted to handlers/taskrunner.py) ──
@@ -390,11 +421,12 @@ from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
     _QueueLogHandler,
     _RingLogHandler,
     _update_info,
-    _version_tuple,
+    _version_key,
     api_changelog,
     api_log_level,
     api_log_level_get,
     api_logs,
+    api_releases,
     api_stream,
     api_update_apply,
     api_update_auto,
@@ -471,14 +503,16 @@ def _list_aim_prompts() -> list[dict[str, Any]]:
                 logger.debug("Skipping sensitive path: %s", sop_file)
                 continue
             name = sop_file.stem.removesuffix(".sop")
-            result.append({
-                "name": name,
-                "fullName": f"agent-sop:{name}",
-                "description": _extract_sop_description(sop_file),
-                "path": resolved,
-                "package": root.name,
-                "source": "package",
-            })
+            result.append(
+                {
+                    "name": name,
+                    "fullName": f"agent-sop:{name}",
+                    "description": _extract_sop_description(sop_file),
+                    "path": resolved,
+                    "package": root.name,
+                    "source": "package",
+                }
+            )
 
     # Also scan ~/.kiro/prompts/ for user-created prompts
     home = Path.home()
@@ -577,4 +611,8 @@ from kiro_crew.dashboard.handlers.security import (  # noqa: E402, F401
     api_denied_commands_disable_all,
     api_denied_commands_list,
     api_governance_policy,
+    api_trusted_app_grant,
+    api_trusted_app_revoke,
+    api_trusted_apps_allow_all,
+    api_trusted_apps_list,
 )

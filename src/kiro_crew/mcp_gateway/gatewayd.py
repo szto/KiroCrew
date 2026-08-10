@@ -74,7 +74,7 @@ from kiro_crew.mcp_gateway.rewriter import (
 from kiro_crew.mcp_gateway.shutdown_budget import DRAIN_SECS, POOL_SHUTDOWN_SECS
 from kiro_crew.mcp_gateway.spill import cleanup_old_spill_files
 from kiro_crew.metrics.provider import get_recorder
-from kiro_crew.sandbox import prewarm_backend
+from kiro_crew.sandbox import warm_backend
 from kiro_crew.sel import SecurityEventLog
 from kiro_crew.session_pid_sig import read_session_pid_txt
 
@@ -826,10 +826,18 @@ async def _heartbeat_sweeper(
     stop_event: asyncio.Event,
     backends_pidfile: Optional[Path] = None,
 ) -> None:
-    """Probe every pooled backend's liveness once per ``interval`` and recycle
-    any that are gone or wedged, until ``stop_event`` is set.
+    """Probe stub transports and every pooled backend once per ``interval``,
+    until ``stop_event`` is set.
 
-    For each backend, :meth:`Backend._heartbeat_once` classifies it:
+    Two independent responsibilities, in this order:
+
+    1. **Stub transports** (:func:`_probe_stub_transports`) -- write a keepalive
+       to every live stub connection. A half-open transport is invisible to the
+       parked reader and surfaces only on a write, so without this probe a stub
+       that died mid-session never detaches and its backend's refcount never
+       reaches 0 -- putting it permanently out of reach of the idle sweep. A
+       failed write cancels that stub's handler, whose teardown detaches it.
+    2. **Backends** -- :meth:`Backend._heartbeat_once` classifies each one:
 
     * ``"gone"`` / ``"wedged"`` -- the classify call has already errored every
       attached stub (via ``_broadcast_backend_gone``); the sweeper evicts the
@@ -851,6 +859,14 @@ async def _heartbeat_sweeper(
                 pass
             try:
                 now = time.monotonic()
+                # Probe stub transports FIRST. A dead stub detected here
+                # detaches on this same sweep, so the backend sweep below and
+                # the idle sweep see the corrected refcount immediately rather
+                # than one interval late.
+                try:
+                    await _probe_stub_transports()
+                except Exception:  # pragma: no cover — defensive
+                    logger.exception("stub transport probe crashed")
                 for key, backend in await pool.snapshot():
                     try:
                         state = await backend._heartbeat_once(now)
@@ -1227,6 +1243,123 @@ class _StubConn:
 #: without usable PIDs (old stubs) are simply not indexed — they keep the
 #: recaller-poll fallback.
 _CONN_INDEX: dict[int, set[_StubConn]] = {}
+
+# --- Stub-connection liveness probe -----------------------------------------
+#
+# A stub whose transport dies without a clean close leaves its connection
+# handler parked in ``reader.readuntil()``. The handler's ``finally`` — which
+# owns ``detach_stub`` — therefore never runs, the backend's refcount never
+# drops, and the idle sweep (which keys on ``refcount == 0``) can never reclaim
+# it. Backends then accumulate for the lifetime of the daemon.
+#
+# The asymmetry that makes this possible: a half-open transport is INVISIBLE to
+# a reader and only observable on a WRITE. An idle session performs no writes,
+# so the death has no way to surface. ``_drain_inbox_to_stub`` already handles
+# the write error correctly — it simply never gets a frame to write.
+#
+# So the gateway writes one itself. Each sweep sends a reserved control frame
+# to every live stub; a dead transport fails that write, and the handler is
+# cancelled so its existing teardown runs. Reclamation then follows the normal
+# refcount path — detach -> refcount 0 -> idle eviction — rather than a
+# separate garbage-collection concept layered on top of it.
+#
+# This mirrors the gateway<->backend direction, which has carried a heartbeat
+# under a reserved id since pooling landed. The gateway<->stub direction was
+# the half without one.
+#
+# Reserved ``type`` field, matching the existing ``ping``/``pong`` control
+# frames. The stub consumes it in its gateway->stdout pump and never forwards
+# it to kiro-cli. An older stub that does not know the frame passes it through,
+# where it is inert: it carries no ``jsonrpc``/``id``/``method``, so an MCP
+# client has nothing to dispatch on — the same graceful-degradation property
+# the ``pong`` frame already relies on.
+STUB_KEEPALIVE_TYPE = "keepalive"
+
+#: Bound on a single keepalive write+drain. A stub that has stopped reading
+#: must not pin the sweeper: the drain pump uses the same bound for the same
+#: reason. Exceeding it is treated as a dead transport.
+_STUB_KEEPALIVE_TIMEOUT_SECS = 5.0
+
+
+class _StubProbe:
+    """A live stub connection's write handle plus its owning handler task.
+
+    Registered for the full lifetime of the connection handler and removed in
+    the same ``finally`` that detaches the stub, so the registry can never
+    outlive the attachment it describes.
+    """
+
+    __slots__ = ("stub_uuid", "writer", "task")
+
+    def __init__(
+        self,
+        stub_uuid: str,
+        writer: asyncio.StreamWriter,
+        task: "asyncio.Task[None]",
+    ) -> None:
+        self.stub_uuid = stub_uuid
+        self.writer = writer
+        self.task = task
+
+
+#: Every live stub connection, keyed by identity of the probe record. A set of
+#: records (not a dict keyed by stub_uuid) because a reconnecting stub may
+#: briefly overlap with its predecessor, and clobbering the old entry would
+#: leak the very handler the probe exists to tear down.
+_STUB_PROBES: set[_StubProbe] = set()
+
+
+def _stub_probe_add(probe: _StubProbe) -> None:
+    _STUB_PROBES.add(probe)
+
+
+def _stub_probe_discard(probe: _StubProbe) -> None:
+    _STUB_PROBES.discard(probe)
+
+
+async def _probe_stub_transports() -> int:
+    """Write a keepalive to every live stub; cancel the handler of any that
+    fails. Returns the number of dead transports found.
+
+    The write is the entire point: it converts a silently half-open transport
+    into an observable error. Cancelling the handler is what makes the existing
+    teardown run — this function deliberately does NOT touch refcounts or the
+    pool itself, so there is exactly one code path that detaches a stub.
+
+    Never raises: a probe failure must not take down the sweeper.
+    """
+    payload = json.dumps({"type": STUB_KEEPALIVE_TYPE}).encode() + b"\n"
+    dead = 0
+    for probe in list(_STUB_PROBES):
+        if probe.task.done():
+            # Handler already exiting; its finally owns the teardown.
+            continue
+        lock = getattr(probe.writer, "_mc_write_lock", None)
+        guard: Any = lock if lock is not None else contextlib.nullcontext()
+        try:
+            with _counted_stub_write():
+                async with guard:
+                    probe.writer.write(payload)
+                    await asyncio.wait_for(
+                        probe.writer.drain(),
+                        timeout=_STUB_KEEPALIVE_TIMEOUT_SECS,
+                    )
+        except (ConnectionError, BrokenPipeError, asyncio.TimeoutError) as exc:
+            dead += 1
+            logger.info(
+                "stub %s: transport dead on keepalive (%s) — cancelling handler "
+                "so the stub detaches and its backend can be reclaimed",
+                probe.stub_uuid or "unknown",
+                type(exc).__name__,
+            )
+            probe.task.cancel()
+        except Exception:  # pragma: no cover — defensive
+            logger.warning(
+                "stub %s: keepalive probe raised unexpectedly",
+                probe.stub_uuid or "unknown",
+                exc_info=True,
+            )
+    return dead
 
 
 def _register_pids(register: dict[str, Any]) -> list[int]:
@@ -1813,6 +1946,15 @@ async def _handle_connection(
     conn = _StubConn(stub_uuid, indexed_pids, pool_key.human_readable(), caller)
     _conn_index_add(conn)
 
+    # Register this connection for the keepalive probe. Scoped to the handler's
+    # own task so a dead transport can cancel exactly the coroutine that is
+    # parked on the read, letting its finally run the detach.
+    _probe: Optional[_StubProbe] = None
+    _self_task = asyncio.current_task()
+    if _self_task is not None:
+        _probe = _StubProbe(stub_uuid, writer, _self_task)
+        _stub_probe_add(_probe)
+
     # Provisional backend_id: the real pid isn't known until the backend
     # spawns. Using the pool digest gives operators a stable grep key that
     # ties together every stub sharing the same backend even before spawn.
@@ -1827,7 +1969,14 @@ async def _handle_connection(
             # new gateway and run the ensure_backend pre-flight. Absent on an
             # old gateway, so the new stub skips the pre-flight (no 25s skew
             # penalty) and falls back to the legacy lazy-spawn path.
-            "capabilities": ["ensure_backend"],
+            #
+            # ``bridge_ping`` gates the stub's bridge-phase liveness monitor the
+            # same way. It must be negotiated rather than assumed: a daemon that
+            # outlived a package upgrade has no ``{"type": "ping"}`` handler, so
+            # the frame would fall through to the forward path and no pong would
+            # ever return — turning any call slower than the grace window into a
+            # forced degrade of a perfectly healthy pooled session.
+            "capabilities": ["ensure_backend", "bridge_ping"],
         },
     )
     logger.info(
@@ -1960,6 +2109,17 @@ async def _handle_connection(
                     caller.session_key,
                     caller.session_type,
                 )
+                continue
+
+            # Bridge-phase liveness ping: the stub sends ``{"type": "ping"}``
+            # while it has outstanding requests to verify the gateway is still
+            # responsive. Reply with ``{"type": "pong"}`` — never forwarded
+            # to the backend.
+            if msg.get("type") == "ping":
+                try:
+                    await _write_json_line(writer, {"type": "pong"})
+                except (OSError, ConnectionError):
+                    return
                 continue
 
             # B1 pre-flight: the stub sends ``ensure_backend``
@@ -2188,6 +2348,8 @@ async def _handle_connection(
                 return
     finally:
         _conn_index_discard(conn)
+        if _probe is not None:
+            _stub_probe_discard(_probe)
         if backend is not None:
             # Scope A: before detaching, cancel any in-flight tool calls this
             # stub owned — the backend would otherwise run them to completion
@@ -2614,20 +2776,63 @@ def _zombie_diagnostic_path() -> Path:
 
 
 def _count_open_fds() -> int:
-    """Return the number of open file descriptors for this process.
+    """Return the number of open file descriptors (or handles on Windows).
 
     FD exhaustion is one of the four hypothesised zombie causes; tracking
     the count per snapshot lets us confirm or eliminate that path without
     deploying a separate tracer.
+
+    Platform implementations:
+    - Linux: ``/proc/self/fd``
+    - macOS/BSD: ``/dev/fd``
+    - Windows: ``GetProcessHandleCount`` via ctypes (handle count, not
+      fd count — the field documents this as platform-dependent)
+
+    Returns ``-1`` when the platform cannot provide the value.
     """
+    # Linux — preferred, most precise.
     try:
         return len(os.listdir("/proc/self/fd"))
     except OSError:
-        return -1
+        pass
+
+    # macOS / BSD — /dev/fd is a per-process virtual directory.
+    try:
+        return len(os.listdir("/dev/fd"))
+    except OSError:
+        pass
+
+    # Windows — count kernel handles for the current process.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+            handle_count = wintypes.DWORD()
+            current_process = kernel32.GetCurrentProcess()
+            if kernel32.GetProcessHandleCount(current_process, ctypes.byref(handle_count)):
+                return handle_count.value
+        except (OSError, AttributeError, ValueError):
+            pass
+
+    return -1
 
 
 def _read_rss_kb() -> int:
-    """Return RSS in kilobytes from ``/proc/self/status`` or ``-1``."""
+    """Return current RSS in kilobytes, or ``-1`` if unavailable.
+
+    Platform implementations:
+    - Linux: ``/proc/self/status`` VmRSS field (already in KB).
+    - macOS: ``resource.getrusage`` (``ru_maxrss`` is in bytes on macOS).
+    - Other POSIX: ``resource.getrusage`` (``ru_maxrss`` is in KB on Linux,
+      but this branch only runs on non-Linux where it is bytes; if neither
+      applies we fall through to ``-1``).
+    - Windows: ``GetProcessMemoryInfo`` via ctypes (WorkingSetSize in bytes).
+
+    Returns ``-1`` when the platform cannot provide the value.
+    """
+    # Linux — parse VmRSS from /proc/self/status (current RSS, not peak).
     try:
         with open("/proc/self/status", "r", encoding="ascii") as fh:
             for line in fh:
@@ -2635,6 +2840,54 @@ def _read_rss_kb() -> int:
                     return int(line.split()[1])
     except (OSError, ValueError, IndexError):
         pass
+
+    # macOS / other POSIX — resource.getrusage gives ru_maxrss.
+    # On macOS ru_maxrss is in bytes; on other BSDs it is in KB.
+    if sys.platform != "win32":
+        try:
+            import resource
+
+            ru = resource.getrusage(resource.RUSAGE_SELF)
+            maxrss = ru.ru_maxrss
+            if maxrss > 0:
+                if sys.platform == "darwin":
+                    return maxrss // 1024  # bytes → KB
+                return maxrss  # already in KB on most other POSIX
+        except (OSError, ValueError, AttributeError, ImportError):
+            pass
+
+    # Windows — GetProcessMemoryInfo returns WorkingSetSize in bytes.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            import ctypes.wintypes as wintypes
+
+            SIZE_T = ctypes.c_size_t
+
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", SIZE_T),
+                    ("WorkingSetSize", SIZE_T),
+                    ("QuotaPeakPagedPoolUsage", SIZE_T),
+                    ("QuotaPagedPoolUsage", SIZE_T),
+                    ("QuotaPeakNonPagedPoolUsage", SIZE_T),
+                    ("QuotaNonPagedPoolUsage", SIZE_T),
+                    ("PagefileUsage", SIZE_T),
+                    ("PeakPagefileUsage", SIZE_T),
+                ]
+
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+            pmc = PROCESS_MEMORY_COUNTERS()
+            pmc.cb = ctypes.sizeof(pmc)
+            handle = kernel32.GetCurrentProcess()
+            if psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb):
+                return pmc.WorkingSetSize // 1024  # bytes → KB
+        except (OSError, AttributeError, ValueError):
+            pass
+
     return -1
 
 
@@ -2687,6 +2940,7 @@ def _snapshot_state(
     return {
         "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "ts_epoch": time.time(),
+        "pid": os.getpid(),
         "is_serving": is_serving,
         "task_count": task_count,
         "fd_count": _count_open_fds(),
@@ -2868,8 +3122,14 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
 
     hb_task = asyncio.create_task(_heartbeat(), name="mcp-gateway-heartbeat")
 
-    # Prewarm sandbox probe cache so backends spawned on-loop never hit cold path
-    prewarm_backend()
+    # Fill the sandbox probe cache BEFORE any backend is spawned on-loop. See the
+    # matching site in slack/gateway.py: the wait is what makes the guarantee
+    # hold, since a fire-and-forget prewarm leaves the first spawn racing the
+    # warm thread and reading a cold-cache transient as "no sandbox backend".
+    try:
+        await asyncio.to_thread(warm_backend)
+    except RuntimeError:
+        logger.warning("sandbox warm_backend skipped (thread exhaustion); cache stays cold")
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:

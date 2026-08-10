@@ -57,6 +57,25 @@ def test_custom_work_dir(self, tmp_path):
     client = AcpClient(work_dir=tmp_path)
 ```
 
+### Links: use the conftest helpers, do not skip on Windows
+
+Creating a symlink on Windows needs `SeCreateSymbolicLinkPrivilege`; an unelevated
+developer shell lacks it and `os.symlink` raises `OSError [WinError 1314]`. A
+**directory junction** needs no privilege and is followed by the same reparse
+machinery — `rglob`, `Path.resolve` and `GetFinalPathNameByHandleW` all traverse
+it identically — so a junction exercises the behaviour under test on the platform
+where these path semantics differ most. Two helpers in `test/conftest.py`:
+
+| Need | Helper |
+|------|--------|
+| A path that reaches OUT of a sandbox root through a link | `make_escaping_link(inside, outside)` |
+| A directory link at a chosen location (`ui/` -> the dev source tree) | `make_dir_link(link, target)` |
+
+Prefer either over a bare `Path.symlink_to` plus a `skipif(sys.platform == "win32")`:
+an unconditional skip drops the whole assertion on Windows. Reach for a skip only
+where the *link kind itself* is the subject (a file symlink's `lstat` mode bits,
+say), and then still pair it with a Windows counterpart.
+
 ### Patch the defining module, not a re-export
 
 `monkeypatch.setattr`/`patch` rebind a NAME in one module namespace. Code
@@ -100,6 +119,27 @@ test). The sweep's own behavior belongs in its own module's tests.
   subagents or persists agent folders without isolating the import-time global
   leaks stub folders into `~/.kiro/crew/subagents/`, which a running gateway then
   sweeps as orphans on its next restart.
+- Tests MUST NOT reconfigure or restart a real host service. This is enforced,
+  not just asked for: the **rootdir** `conftest.py` (distinct from
+  `test/conftest.py`, which only applies to `test/` — `testpaths` also collects
+  `transfer` and `src/kiro_crew/apps/builtins`) pins `$XDG_CONFIG_HOME` to a tmp
+  dir so `dev_fleet._dropin_path()` cannot name the operator's real
+  `~/.config/systemd/user/kirocrew-gateway.service.d/`, and traps every stdlib
+  spawn funnel (`subprocess.Popen.__init__`,
+  `BaseEventLoop.subprocess_exec`/`subprocess_shell`, `os.execve`) to
+  refuse a `systemctl`/`launchctl` invocation carrying a **mutating verb**
+  (`restart`, `daemon-reload`, `stop`, `enable`, `load`, `bootout`, …). Read-only
+  queries (`systemctl show`, `cat`, `is-active`) are allowed and need no stub,
+  and `systemd-run` is deliberately NOT guarded because `sandbox` wraps nearly
+  every subprocess in `systemd-run --scope` for cgroup limits — the guard keys on
+  the verb, so it still catches `systemd-run … -- systemctl restart …` on the
+  inner token. A test that reaches the make-live cutover path must stub BOTH
+  `_run_cmd` and `_dropin_path`. Issue #1722: a test asserting that a staged
+  cutover could be *cancelled* rewrote the developer's real unit to point into
+  its own pytest temp dir, and systemd then looped on `203/EXEC` for 25 minutes
+  after that dir was deleted. `test/test_host_service_guard.py` ratchets the
+  guarded set against the service tools `src/` actually names, so a new
+  host-mutating call site cannot land outside the floor.
 - Tests SHOULD be fast (< 1s each)
 - Async tests MUST use `@pytest.mark.asyncio`
 

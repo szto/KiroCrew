@@ -10,8 +10,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro_crew.acp.types import AcpPromptStats
 from kiro_crew.config import KiroCrewConfig
-from kiro_crew.session import BACKGROUND_KEY, SessionManager
+from kiro_crew.session import (
+    _BG_BLIND_RECYCLE_PROMPTS,
+    BACKGROUND_KEY,
+    SessionManager,
+)
 
 
 @pytest.fixture
@@ -28,6 +33,10 @@ def _mock_provider_factory():
         m = AsyncMock()
         m.start = AsyncMock()
         m.shutdown = AsyncMock()
+        # Explicit, not AsyncMock-generated: the post-semaphore re-validate calls
+        # this synchronously, and an auto-generated coroutine would read as
+        # "alive" only by truthiness while leaking an un-awaited coroutine.
+        m.is_process_alive = lambda: True
         m.context_usage_pct = lambda: 0.0
         m.has_active_turn = lambda: False
         return m
@@ -54,6 +63,91 @@ def _alive_provider_factory():
 
 
 class TestSessionManager:
+    @pytest.mark.asyncio
+    async def test_reinjection_flag_is_one_shot(self, cfg):
+        """mark → consume returns True once, then False. If it did not clear,
+        every turn after a compaction would re-pay the skills-index cost."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        mgr.release("thread1")
+
+        assert mgr.consume_needs_reinjection("thread1") is False, "unset by default"
+        mgr.mark_needs_reinjection("thread1")
+        assert mgr.consume_needs_reinjection("thread1") is True, "first read sees it"
+        assert mgr.consume_needs_reinjection("thread1") is False, "cleared on read"
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_reinjection_helpers_tolerate_an_unknown_key(self, cfg):
+        """A compaction callback can fire for a session that has since been
+        evicted; neither helper may raise."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        mgr.mark_needs_reinjection("never-existed")
+        assert mgr.consume_needs_reinjection("never-existed") is False
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_compaction_marks_reinjection_without_any_callback(self, cfg):
+        """The mark lives at the compaction chokepoint, not in one surface.
+
+        Placing it in DashboardState._on_compacted missed every channel-born
+        session (and dashboard sessions with no open tab, whose branch returns
+        before the callback body). Marking here covers all surfaces and works
+        even when no callback is registered at all.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        mgr.release("thread1")
+        assert mgr._on_compacted is None, "precondition: no callback registered"
+
+        await mgr._fire_compact_callback("thread1", 90.0, success=True)
+
+        assert mgr.consume_needs_reinjection("thread1") is True
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_failed_compaction_does_not_mark_reinjection(self, cfg):
+        """A compaction that failed did not drop the context, so there is
+        nothing to re-inject."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        mgr.release("thread1")
+
+        await mgr._fire_compact_callback("thread1", 90.0, success=False)
+
+        assert mgr.consume_needs_reinjection("thread1") is False
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_recycle_does_not_mark_reinjection(self, cfg):
+        """A recycle reports success=True but is NOT a compaction.
+
+        Recycling destroys the session; its successor cold-starts and gets the
+        index through the normal new-session context. The dangerous case is
+        `_recycle_held`'s "entry already replaced" branch: without the guard the
+        mark would land on the fresh replacement via `_sessions.get(key)`,
+        making an un-compacted session re-inject a redundant index.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        mgr.release("thread1")
+        replacement = mgr._sessions[mgr._fold_key("thread1")]
+
+        # Stand in for the in-flight recycle of the session that was REPLACED by
+        # this one -- _recycle_held holds the key in _recycling across its
+        # success callback.
+        mgr._recycling["thread1"] = object()  # type: ignore[assignment]
+        try:
+            await mgr._fire_compact_callback("thread1", 90.0, success=True)
+        finally:
+            mgr._recycling.pop("thread1", None)
+
+        assert replacement.needs_context_reinjection is False, (
+            "a recycle must not flag the fresh replacement session"
+        )
+        assert mgr.consume_needs_reinjection("thread1") is False
+        await mgr.close_all()
+
     @pytest.mark.asyncio
     async def test_creates_session(self, cfg):
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
@@ -475,6 +569,198 @@ class TestRecycleBackground:
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         # Don't start pool — no background session
         await mgr.recycle_background()  # should not raise
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_blind_fallback_counts_its_own_prompts(self, cfg):
+        """The blind fallback must fire on its own counting.
+
+        ``check_context_usage`` is a chat-turn hook and never runs for
+        BACKGROUND_KEY, so if ``recycle_background`` does not count the turn the
+        counter stays at 0 forever and the 40-prompt fallback is dead code.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.start_pool()
+
+        provider = mgr._sessions[BACKGROUND_KEY].provider
+        provider.context_usage_pct = lambda: 0.0  # backend reports no metadata
+        provider.context_usage_unknown = lambda: False
+
+        for _ in range(_BG_BLIND_RECYCLE_PROMPTS - 1):
+            await mgr.recycle_background()
+
+        assert mgr._sessions[BACKGROUND_KEY].provider is provider
+        assert mgr._sessions[BACKGROUND_KEY].prompt_count == _BG_BLIND_RECYCLE_PROMPTS - 1
+
+        await mgr.recycle_background()
+
+        provider.shutdown.assert_awaited_once()
+        assert mgr._sessions[BACKGROUND_KEY].provider is not provider
+        # The replacement starts its own count.
+        assert mgr._sessions[BACKGROUND_KEY].prompt_count == 0
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_just_compacted_zero_pct_does_not_suppress_recycle(self, cfg):
+        """A post-compaction 0% is "unknown", not "empty".
+
+        The backend zeroes the percentage when it compacts in place, which is
+        byte-identical to a brand-new session. Reading it as empty leaves a
+        session that just hit its ceiling in place to be compacted again — and
+        each compaction is a billed summarization turn over the whole transcript.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.start_pool()
+
+        provider = mgr._sessions[BACKGROUND_KEY].provider
+        provider.context_usage_pct = lambda: 0.0
+        provider.context_usage_unknown = lambda: True
+
+        # One turn — far below the blind threshold, so only the unknown signal
+        # can trigger the recycle.
+        await mgr.recycle_background()
+
+        provider.shutdown.assert_awaited_once()
+        assert mgr._sessions[BACKGROUND_KEY].provider is not provider
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_acp_prompt_stats_flag_post_compaction_zero_as_unknown(self):
+        """The provider-level signal the recycle decision rides on."""
+        stats = AcpPromptStats(context_pct=88.0, context_used_tokens=170_000)
+        assert stats.context_pct_unknown is False
+
+        stats.reset_after_compaction()
+        assert stats.context_pct == 0.0
+        assert stats.context_pct_unknown is True
+
+        # Survives the per-turn stats re-init...
+        carried = stats.carry_over()
+        assert carried.context_pct_unknown is True
+
+        # ...and clears as soon as the backend reports a real number.
+        carried.note_pct_reported()
+        assert carried.context_pct_unknown is False
+
+    @pytest.mark.asyncio
+    async def test_recycle_never_kills_a_turn_that_started_after_release(self, cfg):
+        """A turn taken in the release→recycle gap must not be torn down.
+
+        Every call site releases the turn semaphore on the line before calling
+        ``recycle_background``, so a waiter can start a turn in that gap. If the
+        recycle decides and shuts down outside the semaphore it SIGKILLs that
+        live turn.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.start_pool()
+
+        sess = mgr._sessions[BACKGROUND_KEY]
+        old_provider = sess.provider
+        old_provider.context_usage_pct = lambda: 95.0
+        old_provider.context_usage_unknown = lambda: False
+
+        killed_mid_turn: list[str] = []
+        turn_providers: list[object] = []
+        recycle_done = asyncio.Event()
+
+        async def _waiter_turn() -> None:
+            # Mirrors _ProviderBgSession.prompt: take the turn semaphore, then
+            # stream on whatever provider the session holds at that moment.
+            await sess.semaphore.acquire()
+            try:
+                provider = sess.provider
+                turn_providers.append(provider)
+                # Stay in the turn until the recycle attempt finishes. Deadline
+                # is a yield budget, not wall-clock, so the interleaving is
+                # deterministic.
+                for _ in range(200):
+                    if provider.shutdown.await_count:
+                        killed_mid_turn.append("provider shut down mid-turn")
+                        break
+                    if recycle_done.is_set():
+                        break
+                    await asyncio.sleep(0)
+            finally:
+                sess.semaphore.release()
+
+        async def _recycle() -> None:
+            try:
+                await mgr.recycle_background()
+            finally:
+                recycle_done.set()
+
+        # Reproduce the real call-site interleaving: a turn completes and
+        # releases, a waiter wins the gap, THEN the recycle runs.
+        await mgr.get_or_create(BACKGROUND_KEY)
+        mgr.release(BACKGROUND_KEY)
+        waiter = asyncio.create_task(_waiter_turn())
+        await asyncio.sleep(0)  # let the waiter take the semaphore
+
+        recycle = asyncio.create_task(_recycle())
+        await recycle
+        await waiter
+
+        assert killed_mid_turn == []
+        # The turn ran to completion on the provider it picked up...
+        assert turn_providers == [old_provider]
+        # ...and the recycle still happened, once the turn was done.
+        assert sess.provider is not old_provider
+        old_provider.shutdown.assert_awaited_once()
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_turn_starting_after_the_recycle_gets_the_replacement(self, cfg):
+        """The session is recycled in place, so a holder is routed to the new
+        provider rather than to the torn-down one."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.start_pool()
+
+        sess = mgr._sessions[BACKGROUND_KEY]
+        old_provider = sess.provider
+        old_provider.context_usage_pct = lambda: 95.0
+        old_provider.context_usage_unknown = lambda: False
+
+        await mgr.recycle_background()
+
+        # A caller that captured the session before the recycle still finds a
+        # live provider on it, and the registry entry did not go absent.
+        assert mgr._sessions[BACKGROUND_KEY] is sess
+        await sess.semaphore.acquire()
+        try:
+            assert sess.provider is not old_provider
+            assert sess.provider.shutdown.await_count == 0
+        finally:
+            sess.semaphore.release()
+        # Conversation state describing the old transcript does not carry over.
+        assert sess.prompt_count == 0
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_failed_replacement_spawn_keeps_the_working_provider(self, cfg):
+        """A spawn failure must not leave _bg with no provider at all."""
+        calls = {"n": 0}
+        base = _mock_provider_factory()
+
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("no capacity")
+            return base(session_key, agent, channel_id, **kwargs)
+
+        mgr = SessionManager(cfg, provider_factory=factory)
+        await mgr.start_pool()
+
+        sess = mgr._sessions[BACKGROUND_KEY]
+        old_provider = sess.provider
+        old_provider.context_usage_pct = lambda: 95.0
+        old_provider.context_usage_unknown = lambda: False
+
+        await mgr.recycle_background()
+
+        assert sess.provider is old_provider
+        old_provider.shutdown.assert_not_awaited()
+        # The semaphore is handed back even on the failure path.
+        assert not sess.semaphore.locked()
         await mgr.close_all()
 
 
@@ -1738,6 +2024,29 @@ class TestContextInfo:
             result = SessionManager._resolve_agent_model("test-agent")
         assert result == "opus-5"
 
+    def test_resolve_agent_model_coerces_non_string_spec(self, cfg, tmp_path):
+        """A foreign spec's structured ``model`` must not escape as a dict.
+
+        ``~/.kiro/agents`` is shared with other tools; an ACP-style
+        ``{"id": ...}`` here would be CACHED and then handed to
+        ``/api/sessions/context`` (the dashboard calls ``.replace()`` on it) and
+        to the pooled-model comparison in ``claim_pooled``. This method is
+        annotated ``-> str`` and must honour that.
+        """
+        import json
+
+        if hasattr(SessionManager, "_agent_model_cache"):
+            SessionManager._agent_model_cache.clear()
+        agent_file = tmp_path / "foreign.json"
+        agent_file.write_text(
+            json.dumps({"name": "foreign", "model": {"id": "anthropic:claude-opus-4-8"}})
+        )
+
+        with patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path):
+            result = SessionManager._resolve_agent_model("foreign")
+        assert result == "auto"
+        assert isinstance(result, str)
+
 
 class TestWarmPoolInternals:
     """Tests for _fill_warm_pool, _claim_from_pool, _drain_and_claim."""
@@ -2451,7 +2760,7 @@ class TestClaudeBackendCompaction:
 
     @pytest.mark.asyncio
     async def test_get_or_create_during_recycle_teardown_cold_starts(self, cfg):
-        """While the recycle fallback is tearing the entry down (_recycling
+        """While the failure recycle is tearing the entry down (_recycling
         holds the exact object still in the map), get_or_create must not
         reuse the doomed entry — fall through to cold-start."""
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
@@ -2735,20 +3044,110 @@ class TestKiroInPlaceCompaction:
         await mgr.close_all()
 
     @pytest.mark.asyncio
+    async def test_failure_recycle_never_yields_semaphore_to_queued_turn(self, cfg):
+        """Regression (production 2026-08-05): the failure recycle must not
+        open a window in which a queued turn is dispatched into a session that
+        is still compacting.
+
+        The old code released the turn semaphore as soon as the in-place
+        compact reported failure and let the CALLER re-acquire it for the
+        recycle. A queued turn won that gap: it was sent to a kiro-cli that was
+        still finishing its ``/compact``, its stream received the late
+        ``completed`` status instead of an ``end_turn``, and the turn hung
+        holding the semaphore until the 2h prompt timeout — while the recycle
+        that would have rescued it gave up at its own acquire timeout. The kill
+        must therefore land BEFORE any queued turn can run.
+        """
+        order: list[str] = []
+        gate = asyncio.Event()
+
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            m = AsyncMock()
+            m.start = AsyncMock()
+            m.context_usage_pct = lambda: 0.0
+
+            async def _stream(_cmd):
+                if False:  # pragma: no cover - empty async generator
+                    yield
+
+            m.stream_command = MagicMock(side_effect=_stream)
+
+            async def _shutdown() -> None:
+                order.append("shutdown")
+
+            m.shutdown = AsyncMock(side_effect=_shutdown)
+
+            async def _wait(timeout=120.0):
+                # Mirrors production: the async wait gives up while the
+                # compaction is in fact still running on the backend.
+                await gate.wait()
+                return {"type": "timeout"}
+
+            m.wait_for_compaction = _wait
+            return m
+
+        mgr = SessionManager(cfg, provider_factory=factory)
+        await mgr.get_or_create("dashboard:chat-1")
+        mgr.release("dashboard:chat-1")
+        sess = mgr._sessions["dashboard:chat-1"]
+
+        compact = asyncio.create_task(mgr._compact_session("dashboard:chat-1", 92.0))
+        await asyncio.sleep(0.05)
+        assert sess.semaphore.locked()
+
+        # A queued turn parks on the turn semaphore, exactly as a real
+        # dispatch does while a compaction holds it.
+        async def _queued_turn() -> None:
+            async with sess.semaphore:
+                order.append("turn")
+
+        turn = asyncio.create_task(_queued_turn())
+        await asyncio.sleep(0.05)
+        assert not turn.done()
+
+        gate.set()  # compact reports timeout -> recycle, semaphore still held
+        await asyncio.wait_for(compact, timeout=2)
+        await asyncio.wait_for(turn, timeout=2)
+
+        # Kill first, queued turn second: the semaphore was never handed back
+        # while the backend could still have been compacting.
+        assert order == ["shutdown", "turn"]
+        assert "dashboard:chat-1" not in mgr._sessions
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
     async def test_recycle_pop_by_identity_spares_replacement(self, cfg):
-        """If a racing cold-start replaced the entry while the recycle
-        fallback waited on the old turn semaphore, only the OLD session is
-        killed; the fresh replacement (and its session_map entry) survives."""
+        """If a racing cold-start replaced the entry while the in-place
+        compact was still running, the failure recycle kills only the OLD
+        session; the fresh replacement (and its session_map entry) survives."""
         from kiro_crew.session import _Session
 
-        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        gate = asyncio.Event()
+
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            m = AsyncMock()
+            m.start = AsyncMock()
+            m.shutdown = AsyncMock()
+            m.context_usage_pct = lambda: 0.0
+
+            async def _stream(_cmd):
+                if False:  # pragma: no cover - empty async generator
+                    yield
+
+            m.stream_command = MagicMock(side_effect=_stream)
+
+            async def _wait(timeout=120.0):
+                await gate.wait()
+                return {"type": "failed"}
+
+            m.wait_for_compaction = _wait
+            return m
+
+        mgr = SessionManager(cfg, provider_factory=factory)
         old_provider, _, _ = await mgr.get_or_create("k1")
-        old_sess = mgr._sessions["k1"]
-        # Keep the old turn semaphore held so the recycle blocks on acquire.
+        mgr.release("k1")
         cb = AsyncMock()
         mgr.set_compact_callback(cb)
-        # Skip the in-place attempt: force the fallback path directly.
-        mgr._compact_in_place = AsyncMock(return_value="failed")  # type: ignore[method-assign]
 
         task = asyncio.create_task(mgr._compact_session("k1", 92.0))
         await asyncio.sleep(0.05)
@@ -2759,8 +3158,7 @@ class TestKiroInPlaceCompaction:
         new_provider.shutdown = AsyncMock()
         mgr._sessions["k1"] = _Session(provider=new_provider, is_new=False)
 
-        # Old turn ends -> recycle proceeds, pops by identity.
-        old_sess.semaphore.release()
+        gate.set()  # compact fails -> recycle pops by identity
         await asyncio.wait_for(task, timeout=2)
 
         # Replacement untouched; old provider reaped.

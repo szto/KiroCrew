@@ -1,6 +1,6 @@
 # The i18n gate chain
 
-The dashboard ships in ten languages. This doc covers the **gates**: what runs,
+The dashboard ships in twelve languages. This doc covers the **gates**: what runs,
 what can fail a PR, what only reports, and the rule that governs relaxing a
 ratchet. The authoring rules (how to add a catalog key, the `src/i18n/format.ts`
 seam, the glossary) live in the frontend docs under `website/`.
@@ -16,7 +16,7 @@ cd website && npm run i18n:check
 | CI job | Step | What it runs |
 |---|---|---|
 | `frontend-lint` | Check i18n extraction, key references and plurals | `npm run i18n:check` (the runner below) |
-| `frontend-test` | Unit tests | `npx vitest run --coverage`, which includes the diff-scoped `localeFormatting.test.ts` gates |
+| `frontend-test` | Unit tests | `npx vitest run --coverage`, which includes the diff-scoped `localeFormatting.test.ts` gates and the catalog duplicate-key guard `duplicateKeys.test.ts` (see below) |
 | `e2e` | i18n render-time gate | `npm run i18n:render` (`scripts/check-i18n-render.mjs --build`) |
 
 The render gate lives in the `e2e` job to reuse the Chromium install that job
@@ -25,7 +25,7 @@ build over loopback and answers every `/api/**` call from fixtures.
 
 ## `npm run i18n:check` is a RUNNER, not an `&&` chain
 
-`scripts/i18n-check.mjs` spawns seven scripts, keeps every byte of their output,
+`scripts/i18n-check.mjs` spawns eight scripts, keeps every byte of their output,
 then reports the twelve checks they contain in one table.
 
 An `&&` chain short-circuits. With twelve checks that means a PR only ever learns
@@ -58,7 +58,7 @@ conversion path.
 
 ## The table
 
-Twelve checks over seven scripts. The split is by the only question an author
+Thirteen checks over eight scripts. The split is by the only question an author
 has: **is this mine to fix?** A `diff`-scoped finding is on a line this branch
 wrote or in a file it touched. A `repo`-scoped finding is a whole-repo measurement
 the branch may simply have inherited.
@@ -73,6 +73,7 @@ the branch may simply have inherited.
 | `[plurals]` | repo | hard zero | a plural suffix concatenated outside the translation call |
 | `[pseudolocale]` | repo | hard zero | `en-XA.json` stale relative to its generator |
 | `[dnt]` | repo | hard zero | a do-not-translate term respelt in a shipped catalog |
+| `[manifest-sync]` | repo | hard zero | a built-in `app.json` string and its `en.json` value stopped matching |
 | `[dynamic-keys]` | repo | report only | a call site whose key cannot be resolved statically |
 | `[extractable]` | repo | report only | a literal in markup the codemod could have extracted |
 | `[untranslated]` | repo | report only | per-file ceilings over the frozen untranslated debt |
@@ -272,3 +273,29 @@ the whole point of the dynamic ledger is that those sites are the ones it cannot
 verify. The only residual cover is the render gate's `[vs-base]` under `en-XA`, and
 only for surfaces its harness actually mounts. Closing it needs a base-ref-anchored
 per-file dynamic-site diff, the same shape as `[vs-base]`.
+
+## Catalog duplicate keys (`duplicateKeys.test.ts`)
+
+Runs in `frontend-test`, outside the `i18n:check` runner above, because it is a
+plain vitest assertion over the catalog files rather than a diff-scoped gate.
+
+It fails on any key defined **twice inside one object** in any
+`src/i18n/locales/*.json`. Every catalog on disk is covered, so adding a language
+needs no edit.
+
+Why it exists: `ja.json` once carried eleven such keys in
+`components.kiroPrerequisiteGate`. `JSON.parse` keeps the LAST occurrence, so the
+earlier value was dead weight no reader ever saw — and the file could not be
+safely round-tripped, because any tool that reserialised it silently DROPPED the
+shadowed translations. That is exactly how they were eventually removed: as an
+incidental side effect of an unrelated feature PR, with eleven Japanese strings
+changing value inside a diff nobody was reviewing for translation content.
+
+Two properties make it work, and both are asserted directly in the same file:
+
+- It scans **raw text**, not `JSON.parse` output. Parsing collapses duplicates
+  before any reviver runs, so a parse-based check passes on a broken catalog.
+- It compares keys by their **decoded** value, because `"n\u0061me"` and
+  `"name"` are the same key per ECMA-404. A byte-wise comparison would call them
+  distinct and wave a real duplicate through.
+

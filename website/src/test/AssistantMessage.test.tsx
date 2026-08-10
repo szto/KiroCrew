@@ -34,6 +34,22 @@ describe('AssistantMessage', () => {
     expect(screen.queryByText(/Send/)).not.toBeInTheDocument()
   })
 
+  // Regression: OPTION_MARKER_RE anchors on a closing bracket that ends the line,
+  // so a half-arrived marker can't match it and used to type itself out as prose
+  // for the width of the marker line before flipping to pills at turn end.
+  it('hides a half-streamed [OPTIONS: marker from the streamed text', () => {
+    render(<AssistantMessage content={'All done.\n\n[OPTIONS: Merge it now | Show me the d'} isStreaming={true} slotRunning={true} />)
+    expect(screen.getByTestId('md')).toHaveTextContent('All done.')
+    expect(screen.getByTestId('md').textContent).not.toMatch(/\[OPTION/i)
+  })
+
+  // …but on a FINISHED message an unterminated marker is real content (prose about
+  // the syntax, or a truncated turn), so it must render as written.
+  it('keeps an unterminated marker once the message is no longer streaming', () => {
+    render(<AssistantMessage content={'The tag looks like [OPTIONS: A | B'} isStreaming={false} slotRunning={false} />)
+    expect(screen.getByTestId('md')).toHaveTextContent('[OPTIONS: A | B')
+  })
+
   it('shows "Use as Plan" button for valid plan JSON', () => {
     const planContent = '<!-- plan_task_id:test-123 -->\nHere is the plan:\n```json\n[{"title":"Step 1","description":"Do thing"}]\n```'
     render(<AssistantMessage content={planContent} isStreaming={false} slotRunning={false} planTaskId="test-123" onApplyPlan={() => Promise.resolve(true)} />)
@@ -225,6 +241,27 @@ describe('AssistantMessage', () => {
 
 })
 
+describe('action footer on touch devices', () => {
+  // The footer is opacity-0 until group-hover, and a touch pointer never
+  // hovers — without the hover:none override the actions (copy, speak,
+  // regenerate, fork) are permanently invisible on phones. happy-dom does not
+  // evaluate media queries, so pin the utility class itself.
+  const footer = () => screen.getByTitle('Copy').closest('div') as HTMLElement
+
+  it('reveals the footer where the pointer cannot hover', () => {
+    render(<AssistantMessage content="Hello world" isStreaming={false} slotRunning={false} />)
+    expect(footer().className).toContain('[@media(hover:none)]:opacity-100')
+  })
+
+  it('keeps the footer hover-revealed for hover-capable pointers', () => {
+    render(<AssistantMessage content="Hello world" isStreaming={false} slotRunning={false} />)
+    const cls = footer().className
+    expect(cls).toContain('opacity-0')
+    expect(cls).toContain('group-hover/msg:opacity-100')
+    expect(cls).toContain('group-focus-within/msg:opacity-100')
+  })
+})
+
 describe('parseOptions', () => {
   it('parses [OPTIONS: a|b|c] multi syntax', () => {
     const { options, multi, isPlan } = parseOptions('Pick one [OPTIONS: Alpha|Beta|Gamma]')
@@ -242,6 +279,30 @@ describe('parseOptions', () => {
   it('returns empty options for content without markers', () => {
     const { options } = parseOptions('Just regular content')
     expect(options).toEqual([])
+  })
+
+  // A model intermittently substitutes a fullwidth / CJK lookalike for the ASCII
+  // `]`. One wrong codepoint used to break the end anchor, so the marker leaked
+  // into the message as literal text and the turn lost its pills. Mirrors the
+  // backend's MARKER_CLOSERS.
+  it.each([
+    ['\u3011', 'U+3011 】'],
+    ['\uFF3D', 'U+FF3D ］'],
+    ['\u3015', 'U+3015 〕'],
+  ])('accepts %s (%s) as a closing bracket', (close) => {
+    const { options, multi, text } = parseOptions(`Pick one [OPTIONS: Alpha|Beta${close}`)
+    expect(options).toEqual(['Alpha', 'Beta'])
+    expect(multi).toBe(true)
+    expect(text).toBe('Pick one')
+  })
+
+  it('does not treat unrelated CJK closing punctuation as a bracket', () => {
+    // U+300D 」 and U+3009 〉 are not square-bracket lookalikes — widening the
+    // class must not have swept in every CJK closing glyph.
+    for (const ch of ['\u300D', '\u3009']) {
+      const { options } = parseOptions(`Pick [OPTIONS: A|B${ch}`)
+      expect(options).toEqual([])
+    }
   })
 
   it('flags isPlan when both plan header and stage marker present', () => {

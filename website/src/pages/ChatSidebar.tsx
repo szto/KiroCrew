@@ -1,14 +1,14 @@
-import { useState, useRef, useEffect, memo, useMemo, useCallback, Fragment } from 'react'
+import { useState, useRef, useEffect, useLayoutEffect, memo, useMemo, useCallback, Fragment } from 'react'
 import { createPortal } from 'react-dom'
 import { LayoutGroup, AnimatePresence, motion } from 'framer-motion'
-import { Plus, X, Pin, Monitor, Eye, EyeOff, VenetianMask, Droplet, FolderPlus, MessageSquare, MessageSquarePlus, Folder, FolderOpen, ChevronRight, ChevronDown, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns2, Columns3, GripVertical, Zap, Check, Copy, ListFilter, List, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot } from 'lucide-react'
+import { Plus, X, Pin, Monitor, Eye, EyeOff, VenetianMask, Droplet, FolderPlus, MessageSquare, MessageSquarePlus, MessagesSquare, Folder, ChevronRight, ChevronDown, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns2, Columns3, GripVertical, Zap, Check, Copy, ListFilter, List, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot } from 'lucide-react'
 import GithubLogo from '../components/icons/GithubLogo'
 import GitlabLogo from '../components/icons/GitlabLogo'
+import FolderGlyph from '../components/FolderGlyph'
 import { DndContext, closestCenter, pointerWithin, KeyboardSensor, PointerSensor, useSensor, useSensors, useDroppable, DragOverlay, MeasuringStrategy, type DragEndEvent, type DragStartEvent, type DragOverEvent, type CollisionDetection } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy, useSortable, sortableKeyboardCoordinates } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { modelListRefetchInterval } from '../providers/modelListHealth'
 import { shallowEqual } from 'react-redux'
 import { useAppDispatch, useAppSelector } from '../store'
 import { useConnected } from '../hooks/useConnected'
@@ -24,10 +24,12 @@ import { computeActiveSubtree, folderIsHidden, folderOffersHide } from '../utils
 import { groupHistoryByFolder } from '../utils/groupHistoryByFolder'
 import { slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
 import { toolStatusLabel } from '../utils/toolStatusLabel'
+import { sessionRefBlockReason } from '../utils/sessionRefs'
 import { SearchInput, Input, Btn, IconButton, IconButtonGroup } from '../components/ui'
+import SimpleSelect from '../components/SimpleSelect'
 import FolderConfigModal from '../components/FolderConfigModal'
-import { useProvider } from '../providers'
 import ModelDropdownList from '../components/ModelDropdownList'
+import { useAvailableModels } from '../hooks/useAvailableModels'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useSessionPalette } from '../hooks/useSessionPalette'
 import { useMoveSlotToFolder } from '../hooks/useMoveSlotToFolder'
@@ -36,6 +38,7 @@ import { useLanguage } from '../i18n/LanguageProvider'
 import { useSessionActions } from '../hooks/useSessionActions'
 import { useAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
 import { useChatPopouts } from '../hooks/useChatPopouts'
+import { platformShortcut } from '../utils/platform'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { usePointerDrag } from '../hooks/usePointerDrag'
@@ -65,9 +68,12 @@ import {
 } from './recentWindow'
 import { loadChatConfig, saveChatConfig } from './chat/ChatSettings'
 import { focusSiblingSessionRow } from './chat/sessionRowNav'
+import { focusComposer } from './chat/composerFocus'
+import { compareBySort, comparePinnedThenSort, fmtRelativeTime } from './chat/sessionOrder'
+import type { SortKey } from './chat/sessionOrder'
 
 import { i18nT } from '../i18n/t'
-import { compareText, fmtDateFields } from '../i18n/format'
+import { fmtDateFields } from '../i18n/format'
 
 /** Max height (px) of the inline session-rename <textarea> before it scrolls.
  *  ~6 lines at the row's 13px/leading-snug type. Shared by the auto-grow hook
@@ -87,30 +93,6 @@ function slotStatusText(detail: { kind?: string; text?: string; toolName?: strin
   if (detail?.kind === 'streaming') return i18nT('pages.chatSidebar.streaming')
   if (detail?.kind === 'thinking' && detail.text === 'Thinking…') return i18nT('pages.chatSidebar.thinking')
   return toolStatusLabel(detail, simplifiedToolNames, uiLang) || i18nT('pages.chatSidebar.thinking')
-}
-/** Telegram-style relative time: time today, "Yesterday hh:mm", weekday+time this week,
- *  short date this year, full date otherwise.
- *  Accepts ISO string (active slots) or Unix epoch seconds (history `modified`). */
-function fmtRelativeTime(ts: string | number | undefined): string {
-  if (ts == null) return ''
-  const d = typeof ts === 'number' ? new Date(ts * 1000) : new Date(ts)
-  if (isNaN(d.getTime())) return ''
-  const now = new Date()
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-  const startOfYesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
-  const startOf6DaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6)
-  // Every branch read the BROWSER's locale before this, so a zh dashboard on an
-  // en-US browser showed "3:04 PM" and "Jul 30". This is the twin of
-  // `commandPalette/providers/recentsProvider.ts`; the two are now consistent.
-  const time = fmtDateFields(d, { hour: '2-digit', minute: '2-digit' })
-  if (d >= startOfToday) return time
-  // The existing catalog key, NOT `fmtRelative`: CLDR returns a lowercase
-  // "yesterday", which clashed with the capitalized group header two functions
-  // below that already uses this same key. One key, one casing.
-  if (d >= startOfYesterday) return `${i18nT('pages.chatSidebar.yesterday')} ${time}`
-  if (d >= startOf6DaysAgo) return `${fmtDateFields(d, { weekday: 'short' })} ${time}`
-  if (d.getFullYear() === now.getFullYear()) return fmtDateFields(d, { month: 'short', day: 'numeric' })
-  return fmtDateFields(d, { year: 'numeric', month: 'short', day: 'numeric' })
 }
 
 /** Sortable wrapper for a folder block — enables drag-to-reorder */
@@ -166,7 +148,135 @@ const sidebarCollision: CollisionDetection = (args) => {
     return closestCenter({ ...args, droppableContainers: folderContainers })
   }
   const within = pointerWithin(args)
-  return within.length ? within : closestCenter(args)
+  if (within.length) return within
+  // Session drag that is inside no droppable: fall back to the nearest one, but
+  // NEVER to the chat-pane zone. That zone is a pane-sized rect living outside
+  // the sidebar, so by center-distance it would routinely beat the folder row
+  // the user was actually aiming at and steal near-miss drops. A pointer
+  // genuinely inside it still wins above, via `within`.
+  const fallback = args.droppableContainers.filter(
+    c => (c.data?.current as { type?: string } | undefined)?.type !== CHAT_PANE_DROP_TYPE
+  )
+  return closestCenter({ ...args, droppableContainers: fallback })
+}
+
+/** Droppable `type` for the chat-pane target that stages a session reference in
+ *  the composer. Lives outside the sidebar's DOM (portaled into ChatPage's pane)
+ *  but inside its DndContext, so React context reaches it while `useDroppable`
+ *  measures its real on-screen rect. */
+const CHAT_PANE_DROP_TYPE = 'chat-pane-ref'
+
+/**
+ * Full-pane drop affordance for "drag a session into the open chat".
+ *
+ * The HIT AREA is the whole pane — it is ~10x the composer's area and a shorter
+ * travel from the session list, and a release over the transcript that silently
+ * did nothing would read as a broken feature rather than a near-miss. But the
+ * CUE is anchored on the composer, because that is where the chip actually
+ * lands; a label floating mid-transcript taught the wrong mental model (that the
+ * session drops into the conversation itself).
+ *
+ * Rendered only while a session drag is live, so it never sits invisibly over
+ * the transcript at rest. `pointer-events-none` is safe *and* required: dnd-kit
+ * resolves collisions from measured rects, not DOM hit-testing, so the zone
+ * still receives the drop while the chat underneath stays fully interactive.
+ *
+ * When the dragged session is incognito/temporary the zone renders a refusal
+ * state instead of an invitation. Explaining the block beats silently ignoring
+ * the drop — and the drop handler refuses independently, so this is the visible
+ * half of a guard that does not depend on the UI being reached.
+ */
+function ChatPaneDropZone({ refused }: { refused: boolean }) {
+  const { setNodeRef, isOver } = useDroppable({ id: 'chat-pane-ref', data: { type: CHAT_PANE_DROP_TYPE } })
+  const zoneRef = useRef<HTMLDivElement | null>(null)
+  /** The composer's box in zone-local coordinates (plus the zone's own height, so
+   *  the pill's offset is plain arithmetic rather than a `calc()` string — a CSS
+   *  template literal here is exactly the shape the i18n gate flags). */
+  const [target, setTarget] = useState<
+    { left: number; top: number; width: number; height: number; zoneH: number } | null
+  >(null)
+  const attach = useCallback((el: HTMLDivElement | null) => {
+    zoneRef.current = el
+    setNodeRef(el)
+  }, [setNodeRef])
+  // Measured ONCE at mount rather than hardcoded as an offset from the bottom:
+  // the composer band's height moves with the attachment strip, the session-ref
+  // strip, and the approval bar, so any constant would drift. The zone exists
+  // only for the duration of one drag and the pointer is held down throughout,
+  // so a single read cannot go stale.
+  useLayoutEffect(() => {
+    const el = zoneRef.current
+    const composer = el?.parentElement?.querySelector('[data-testid="input-wrapper"]')
+    if (!el || !composer) return
+    const z = el.getBoundingClientRect()
+    const c = composer.getBoundingClientRect()
+    setTarget({
+      left: c.left - z.left,
+      top: c.top - z.top,
+      width: c.width,
+      height: c.height,
+      zoneH: z.height,
+    })
+  }, [])
+  const active = isOver && !refused
+  const tone = refused
+    ? 'border-warn bg-bg-elevated/90 text-warn'
+    : active
+      ? 'border-accent bg-bg-elevated/90 text-accent ring-2 ring-accent'
+      : 'border-border bg-bg-elevated/90 text-muted'
+  const pill = (
+    <div className={`inline-flex items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-[12px] shadow-lg backdrop-blur-sm ${tone}`}>
+      {refused ? <EyeOff size={14} className="shrink-0" /> : <MessagesSquare size={14} className="shrink-0" />}
+      <span>
+        {refused
+          ? i18nT('pages.chatSidebar.private_session_cannot_be_referenced')
+          : i18nT('pages.chatSidebar.drop_to_reference_session')}
+      </span>
+    </div>
+  )
+  return (
+    <div
+      ref={attach}
+      data-testid="chat-pane-drop-zone"
+      data-refused={refused ? '' : undefined}
+      aria-hidden="true"
+      className={`absolute inset-0 z-30 pointer-events-none transition-colors ${
+        active ? 'bg-accent/[0.06]' : isOver && refused ? 'bg-warn/[0.06]' : 'bg-transparent'
+      }`}
+    >
+      {target ? (
+        <>
+          {/* Outline the destination itself, matching the treatment the existing
+              file drop puts on the composer, so both drags land the same way.
+              Suppressed when refused: outlining a destination while the label
+              says the drop is not allowed contradicts itself — a refusal has no
+              destination. The pill still sits over the composer, because that is
+              the context of what was refused. */}
+          {!refused && (
+            <div
+              data-testid="chat-pane-drop-target"
+              className={`absolute rounded-2xl border-2 border-dashed transition-colors ${
+                active ? 'border-accent' : 'border-border-strong'
+              }`}
+              style={{ left: target.left, top: target.top, width: target.width, height: target.height }}
+            />
+          )}
+          {/* Pill sits directly above the composer, pointing at where the chip
+              will appear. 10px of air between the two. */}
+          <div
+            className="absolute flex justify-center"
+            style={{ left: target.left, width: target.width, bottom: target.zoneH - target.top + 10 }}
+          >
+            {pill}
+          </div>
+        </>
+      ) : (
+        // Measurement unavailable (no composer on screen — e.g. an empty state).
+        // Fall back to a centered pill rather than rendering no affordance at all.
+        <div className="absolute inset-0 flex items-center justify-center">{pill}</div>
+      )}
+    </div>
+  )
 }
 
 /** Approximate height (px) of a folder header row. For root folder drags the
@@ -239,7 +349,7 @@ function SortableColumnFolder({ folder, columnId, colSlotKeys, renderColumnFolde
 function FolderDragGhost({ folder }: { folder?: ChatFolder }) {
   return (
     <div className="bg-bg-elevated border border-border rounded-md px-3 py-2 text-[13px] text-text shadow-lg max-w-[240px] truncate pointer-events-none flex items-center gap-2">
-      <FolderGlyph icon={folder?.icon} size={14} />{folder?.name ?? i18nT('pages.chatSidebar.folder')}
+      <FolderGlyph color={folder?.color} size={14} />{folder?.name ?? i18nT('pages.chatSidebar.folder')}
     </div>
   )
 }
@@ -255,6 +365,10 @@ interface Slot {
   mode?: string
   agent?: string
   model?: string  // '' / absent = provider-default ("auto")
+  // Message count from the slot payload. Already carried by every ChatSlot
+  // (redux seeds it in addSlotOptimistic and SessionGridView renders it); it was
+  // simply never declared on this local view of the type.
+  messages?: number
   workspace?: string
   created?: string
   last_ts?: string
@@ -289,6 +403,8 @@ interface Slot {
 }
 
 type SourceLinkState = NonNullable<NonNullable<Slot['source_links']>[number]['state']>
+/** One sidebar chip's payload, as the slot serializer sends it. */
+type SidebarSourceLink = NonNullable<Slot['source_links']>[number]
 
 /** Lifecycle states after which a pull request can never merge, so its CI
  * rollup carries no actionable information and the lifecycle glyph is the only
@@ -476,31 +592,6 @@ function dateSegment(ts: number | string | undefined): string {
   return fmtDateFields(d, { year: 'numeric', month: 'long' })
 }
 
-/** A folder's icon AND its collapse affordance: a Lucide folder glyph that is
- *  the sole open/closed state carrier (the separate chevron was retired — the
- *  open-vs-closed shape now stands alone). When collapsed (resting) it shows the
- *  closed Folder glyph with the folder's custom emoji (if any) overlaid on its
- *  flat face. When expanded it swaps to FolderOpen and drops the emoji, since
- *  FolderOpen's angled flap has no flat face for the emoji to sit on cleanly.
- *  Every folder keeps the same fixed footprint so the sidebar stays aligned, and
- *  the board view shows the emoji too (it previously rendered only the bare glyph).
- *  `testId` lets a caller tag the glyph as the folder-collapse target for tests. */
-function FolderGlyph({ icon, size = 14, open = false, className = 'text-muted shrink-0', testId }: { icon?: string; size?: number; open?: boolean; className?: string; testId?: string }) {
-  const Glyph = open ? FolderOpen : Folder
-  return (
-    <span data-testid={testId} className="relative inline-flex shrink-0 items-center justify-center" style={{ width: size, height: size }}>
-      <Glyph size={size} className={className} />
-      {icon && !open && (
-        <span
-          aria-hidden
-          className="absolute inset-x-0 bottom-0 flex items-center justify-center leading-none pointer-events-none"
-          style={{ top: Math.round(size * 0.42), fontSize: Math.max(7, Math.round(size * 0.52)) }}
-        >{icon}</span>
-      )}
-    </span>
-  )
-}
-
 /** Animated collapsible for unknown-height content (folder bodies).
  *  Uses CSS grid `1fr`/`0fr` trick so we can animate to intrinsic height
  *  without measuring. For fixed-height panels use Framer Motion instead. */
@@ -536,6 +627,15 @@ interface ChatSidebarProps {
    *  When provided, this fires AFTER the switchSlot dispatch so consumers
    *  can react to user-driven selection (e.g. to navigate the URL). */
   onSelectSlot?: (key: string) => void
+  /** Reveal a session's pull request / issue in the side panel instead of
+   *  leaving for the provider's website.
+   *
+   *  Fires AFTER the row's own switchSlot dispatch, so the consumer can address
+   *  the panel of the session the chip belongs to. Returns whether the panel took
+   *  the link: FALSE (or an omitted callback) falls back to plain link
+   *  navigation, which is the correct behaviour both on a surface with no side
+   *  panel (the `/embed/sessions` list) and for a url the panel cannot resolve. */
+  onOpenSource?: (slotKey: string, link: { url: string; kind: 'change' | 'issue' }) => boolean
   /** When true, ChatPage floats a hide-sidebar button over this header's
    *  top-left (open state), so the header reserves left space for it.
    *  Omitted in embed/sessions mode where the sidebar is the whole view. */
@@ -546,9 +646,18 @@ interface ChatSidebarProps {
   splitEnabled?: boolean
   splitActive?: boolean
   onOpenSplit?: () => void
+  /** Element to portal the "drag a session into the chat" drop zone into —
+   *  ChatPage's chat-pane wrapper. The zone renders inside this component's
+   *  DndContext (so dnd-kit sees it) but measures against the pane's rect, which
+   *  is what makes the whole pane a valid target rather than just the composer.
+   *  Omit to disable the gesture (embed/sessions mode has no chat pane). */
+  chatDropTarget?: HTMLElement | null
+  /** Called when a session is dropped on the chat pane. Receives a snapshot,
+   *  not a live slot, because the composer stages it until send. Never fired for
+   *  incognito/temporary sessions or for the already-active session. */
+  onDropSessionRef?: (ref: { key: string; title: string; messages?: number }) => void
 }
 
-type SortKey = 'date-desc' | 'date-asc' | 'created-desc' | 'created-asc' | 'name-asc' | 'name-desc'
 /** Sort options, in menu order. The label lives in `SORT_LABEL_KEY`. */
 const SORT_OPTIONS: { value: SortKey }[] = [
   { value: 'date-desc' },
@@ -571,44 +680,14 @@ const SORT_LS_KEY = 'mc-session-sort'
 /** Flat view ("explode chats out of folders") persistence key. */
 const FLAT_VIEW_LS_KEY = 'mc-sidebar-flat-view'
 
-function compareSlots(a: Slot, b: Slot, key: SortKey): number {
-  return compareBySort(a, b, key)
-}
-
-/** Shared comparator for both active sessions and history items. */
-function compareBySort(a: { title?: string; key: string; created?: string; last_ts?: string; modified?: number }, b: typeof a, key: SortKey): number {
-  if (key === 'name-asc' || key === 'name-desc') {
-    // Session titles are free text, so ordering follows the app language:
-    // `compareText` is case- and accent-insensitive with numeric collation, so
-    // "reviewer-2" precedes "reviewer-10" instead of following it.
-    const na = a.title || a.key
-    const nb = b.title || b.key
-    return key === 'name-asc' ? compareText(na, nb) : compareText(nb, na)
-  }
-  if (key === 'created-desc' || key === 'created-asc') {
-    const ca = a.created || ''
-    const cb = b.created || ''
-    // BYTE order, deliberately not a Collator: `created` is an ISO-8601 string,
-    // where lexicographic order IS chronological order. Collation weights `-`,
-    // `:` and `T` at a lower level, which would make "newest first" depend on
-    // the active language.
-    const cmp = ca < cb ? -1 : ca > cb ? 1 : 0
-    return key === 'created-desc' ? -cmp : cmp
-  }
-  // date-desc / date-asc: use last activity (modified epoch, last_ts ISO, or created ISO)
-  const toEpoch = (item: typeof a) => item.modified ?? (item.last_ts ? new Date(item.last_ts).getTime() / 1000 : item.created ? new Date(item.created).getTime() / 1000 : 0)
-  const ta = toEpoch(a)
-  const tb = toEpoch(b)
-  return key === 'date-desc' ? tb - ta : ta - tb
-}
-
 export const SIDEBAR_MIN = 180
 export const SIDEBAR_MAX = 1400
 const SIDEBAR_LS_KEY = 'mc-sidebar-width'
 
 function ChatSidebar({
   slots, activeSlot, unreadSlots, history, historyHasMore,
-  defaultAgent, installedAgents, mode, onWidthChange, onDragChange, onSelectSlot, collapsible, splitEnabled, splitActive, onOpenSplit,
+  defaultAgent, installedAgents, mode, onWidthChange, onDragChange, onSelectSlot, onOpenSource, collapsible, splitEnabled, splitActive, onOpenSplit,
+  chatDropTarget, onDropSessionRef,
 }: ChatSidebarProps) {
   const dispatch = useAppDispatch()
   const queryClient = useQueryClient()
@@ -678,8 +757,7 @@ function ChatSidebar({
   // `parentId` is the fixed destination for 'create' ('' = top level).
   const [folderModal, setFolderModal] = useState<
     { mode: 'create'; parentId: string } | { mode: 'edit'; folderId: string } | null
-  >(null)
-  // The rename menus are Radix (ContextMenu/DropdownMenu). On close, Radix's
+  >(null)  // The rename menus are Radix (ContextMenu/DropdownMenu). On close, Radix's
   // FocusScope restores focus to its trigger (the card) AFTER the input mounts.
   // That restore blurs the freshly-mounted input, firing its onBlur, which
   // cancels the edit before you can type — so the box flickers open and reverts.
@@ -1081,21 +1159,11 @@ function ChatSidebar({
   })
 
   // Bulk model switch — apply one model to every live session at once.
-  const provider = useProvider()
   const [bulkModelOpen, setBulkModelOpen] = useState(false)
   const [bulkModel, setBulkModel] = useState('')        // pending pick ('auto' = provider default)
   const [bulkSkipRunning, setBulkSkipRunning] = useState(true)
   const [bulkModelError, setBulkModelError] = useState('')
-  const { data: bulkModelOptions = [] } = useQuery({
-    queryKey: ['available-models', provider.id],
-    queryFn: async () => {
-      const models = await provider.fetchAvailableModels()
-      return [{ name: 'auto', description: 'Default' }, ...models.filter(m => m.name && m.name !== 'auto')]
-    },
-    enabled: bulkModelOpen,
-    staleTime: 60_000,
-    refetchInterval: modelListRefetchInterval,
-  })
+  const bulkModelOptions = useAvailableModels({ enabled: bulkModelOpen })
   const bulkRunningCount = useMemo(() => slots.filter(s => s.running).length, [slots])
   // Count only slots that would actually change: model differs from the target
   // (the backend leaves already-on-target slots as `unchanged`), minus running
@@ -1408,12 +1476,7 @@ function ChatSidebar({
         }
         return ((slot.title || '') + slot.key + (slot.agent || '')).toLowerCase().includes(slotFilter.toLowerCase())
       })
-      .sort((a, b) => {
-        const pa = pinned.has(a.key) ? 0 : 1
-        const pb = pinned.has(b.key) ? 0 : 1
-        if (pa !== pb) return pa - pb
-        return compareSlots(a, b, sortKey)
-      })
+      .sort((a, b) => comparePinnedThenSort(a, b, sortKey, pinned))
   },
     [enrichedSlots, slotFilter, slotSearchKeys, pinned, sortKey, activeFilters]
   )
@@ -1583,11 +1646,11 @@ function ChatSidebar({
 
   // Folder mutations
   const createFolderMutation = useMutation({
-    mutationFn: (v: { name: string; parentId?: string; projectDir?: string; defaultAgent?: string; icon?: string }) =>
+    mutationFn: (v: { name: string; parentId?: string; projectDir?: string; defaultAgent?: string; color?: string }) =>
       api.createChatFolder(v.name.trim(), v.parentId, {
         project_dir: v.projectDir || undefined,
         default_agent: v.defaultAgent || undefined,
-        icon: v.icon || undefined,
+        color: v.color || undefined,
       }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['chat-folders'] }),
   })
@@ -1729,12 +1792,26 @@ function ChatSidebar({
     }
     if (a?.type === 'session' && a.key) {
       // Drop targets, innermost-first via pointerWithin:
+      //  chat-pane-ref → stage a LINK to this session in the open chat's composer
       //  folder-drop  → assign to that folder (folderId may be null for root lane)
       //  folder       → sortable folder container (whole block) → assign to its id
+      if (o?.type === CHAT_PANE_DROP_TYPE) {
+        const src = slots.find(x => x.key === a.key)
+        // Re-decide at drop time rather than trusting the drag-start snapshot:
+        // the refusal must not depend on the affordance having been rendered,
+        // and memory_mode can change mid-drag. Same function the zone uses.
+        if (sessionRefBlockReason({ key: a.key, activeSlot, memoryMode: src?.memory_mode })) return
+        onDropSessionRef?.({
+          key: a.key,
+          title: src?.title && src.title !== src.key ? src.title : a.key,
+          messages: src?.messages,
+        })
+        return
+      }
       if (o?.type === 'folder-drop') assignToFolder(a.key, o.folderId ?? null)
       else if (o?.type === 'folder') assignToFolder(a.key, over.id as string)
     }
-  }, [reorderFolders, assignToFolder, moveFolderTo])
+  }, [reorderFolders, assignToFolder, moveFolderTo, slots, activeSlot, onDropSessionRef])
   const handleSidebarDragCancel = useCallback(() => { setActiveDrag(null); if (dragExpandTimer.current) { clearTimeout(dragExpandTimer.current.timer); dragExpandTimer.current = null } }, [])
   // Auto-expand collapsed folders when a dragged item hovers over them for 500ms.
   const dragExpandTimer = useRef<{ id: string; timer: ReturnType<typeof setTimeout> } | null>(null)
@@ -1829,7 +1906,7 @@ function ChatSidebar({
     mutationFn: () => {
       return dispatch(createSlot({ agent: defaultAgent || undefined, mode: 'orchestrator' })).unwrap()
     },
-    onSuccess: () => { requestAnimationFrame(() => { if (!isTouchDevice()) document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message input"]')?.focus() }) },
+    onSuccess: focusComposer,
   })
 
   // Create default chat session mutation
@@ -1916,7 +1993,7 @@ function ChatSidebar({
           onClick={() => toggleCollapse(folder.id)}
           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleCollapse(folder.id) } }}
         >
-          <FolderGlyph icon={folder.icon} size={11} open={!folder.collapsed} className="shrink-0 text-muted" />
+          <FolderGlyph color={folder.color} size={11} open={!folder.collapsed} />
           {editingId === folder.id && editScope === columnId ? (
             /* Inline rename input — board-view parity with renderFolderHeader.
              *  Without this branch the ⋯-menu "Rename" set editingId but no
@@ -1939,7 +2016,7 @@ function ChatSidebar({
              *  the same one-click way to start a session inside a folder. */}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <button type="button" data-testid={`col-${columnId}-folder-${folder.id}-menu`} className="text-muted hover:text-text bg-transparent border-none cursor-pointer p-[2px]" title={i18nT('pages.chatSidebar.more')} aria-label={`Folder options for ${folder.name}`} aria-haspopup="menu" onMouseDown={e => { e.stopPropagation() }} onClick={e => { e.stopPropagation() }} onKeyDown={e => { e.stopPropagation() }}>
+                <button type="button" data-testid={`col-${columnId}-folder-${folder.id}-menu`} className="text-muted hover:text-text bg-transparent border-none cursor-pointer p-[2px]" title={i18nT('pages.chatSidebar.more')} aria-label={i18nT('pages.chatSidebar.folder_options_for', { name: folder.name })} aria-haspopup="menu" onMouseDown={e => { e.stopPropagation() }} onClick={e => { e.stopPropagation() }} onKeyDown={e => { e.stopPropagation() }}>
                   <MoreVertical size={11} />
                 </button>
               </DropdownMenuTrigger>
@@ -1953,10 +2030,10 @@ function ChatSidebar({
                   onPick={pid => moveFolderTo(folder.id, pid)} />
                 <DropdownMenuItem data-testid={`col-${columnId}-folder-${folder.id}-settings`} onClick={() => { setFolderModal({ mode: 'edit', folderId: folder.id }) }}><Settings size={13} /> {i18nT('components.folderConfigModal.folder_settings')}</DropdownMenuItem>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem className="text-danger focus:text-danger" onClick={() => { if (confirm(`Delete "${folder.name}"? Sessions will be ungrouped.`)) deleteFolderMutation.mutate(folder.id) }}><X size={13} /> {i18nT('pages.chatSidebar.delete_folder')}</DropdownMenuItem>
+                <DropdownMenuItem className="text-danger focus:text-danger" onClick={() => { if (confirm(i18nT('pages.chatSidebar.delete_folder_confirm', { name: folder.name }))) deleteFolderMutation.mutate(folder.id) }}><X size={13} /> {i18nT('pages.chatSidebar.delete_folder')}</DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
-            <button type="button" data-testid={`col-${columnId}-folder-${folder.id}-new-chat`} className="text-muted hover:text-accent bg-transparent border-none cursor-pointer p-[2px]" title={i18nT('pages.chatSidebar.new_chat_in_folder')} aria-label={`New chat in folder ${folder.name}`} onClick={e => { e.stopPropagation(); createChatInFolder(folder.id, columnId) }} onMouseDown={e => { e.stopPropagation() }} onKeyDown={e => { e.stopPropagation() }}>
+            <button type="button" data-testid={`col-${columnId}-folder-${folder.id}-new-chat`} className="text-muted hover:text-accent bg-transparent border-none cursor-pointer p-[2px]" title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} onClick={e => { e.stopPropagation(); createChatInFolder(folder.id, columnId) }} onMouseDown={e => { e.stopPropagation() }} onKeyDown={e => { e.stopPropagation() }}>
               <MessageSquarePlus size={11} />
             </button>
           </span>
@@ -1964,18 +2041,14 @@ function ChatSidebar({
         </div>
         <FolderBody open={!folder.collapsed && !forceCollapsed}>
           <div className="border-l border-border ml-2 pl-1">
-            {/* Inline "New chat" affordance at the top of the column folder's
-             *  body, mirroring the list-view folder body. */}
-            <button key={`col-${columnId}-newchat-${folder.id}`} type="button"
-              
-              onClick={() => createChatInFolder(folder.id, columnId)}
-              title={i18nT('pages.chatSidebar.new_chat_in_folder')} aria-label={`New chat in ${folder.name}`}
-              className="w-full flex items-center gap-2.5 px-4 py-2 rounded-md text-[11px] text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none cursor-pointer text-left">
-              {/* Trailing glyph — list-view parity (see renderFolderBlock). */}
-              <span>{i18nT('pages.chatSidebar.new_chat_in_folder')}</span><MessageSquarePlus size={11} className="shrink-0 ml-auto" />
-            </button>
-            {(deepChildren.length > 0 || childSlots.length > 0) && (
-              <div className="mx-3 border-b border-border" />
+            {/* Empty-folder affordance — list-view parity (see renderFolderBlock). */}
+            {deepChildren.length === 0 && childSlots.length === 0 && (
+              <button key={`col-${columnId}-newchat-${folder.id}`} type="button"
+                onClick={() => createChatInFolder(folder.id, columnId)}
+                title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}
+                className="w-full flex items-center gap-2.5 px-4 py-2 rounded-md text-[11px] text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none cursor-pointer text-left">
+                <span>{i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}</span><MessageSquarePlus size={11} className="shrink-0 ml-auto" />
+              </button>
             )}
             {deepChildren.map(cf => renderColumnFolder(cf, columnId, colSlotKeys))}
             {childSlots.map((s, i) => {
@@ -2025,7 +2098,7 @@ function ChatSidebar({
     const subagentLabel = subagentStarted === 0
       ? `${subagentQueuedCount} agent${subagentQueuedCount === 1 ? '' : 's'} queued`
       : subagentQueuedCount > 0
-        ? `${subagentStarted} running · ${subagentQueuedCount} queued`
+        ? i18nT('pages.chatSidebar.running_queued', { started: subagentStarted, queued: subagentQueuedCount })
         : `${subagentStarted} agent${subagentStarted === 1 ? '' : 's'} running`
     // Plain literal, like the running/queued label above it: `en.json` is
     // codemod-generated and carries no interpolated values, so a counted
@@ -2050,8 +2123,8 @@ function ChatSidebar({
     const goalLoopLabel = !goalLoop
       ? ''
       : goalLoop.max_cycles > 0
-        ? `Loop ${goalLoop.cycle_count}/${goalLoop.max_cycles}`
-        : `Loop · ${goalLoop.cycle_count}`
+        ? i18nT('pages.chatSidebar.loop', { count: goalLoop.cycle_count, total: goalLoop.max_cycles })
+        : i18nT('pages.chatSidebar.loop_2', { count: goalLoop.cycle_count })
     // Whatever this row would have said if no loop were running, reused as the
     // loop line's trailing detail. This is why the loop branch can outrank the
     // working signals below without swallowing them: live workflow/subagent/tool
@@ -2240,7 +2313,7 @@ function ChatSidebar({
               {(scope === 'flat' && slotFolders[s.key] && folderNameById[slotFolders[s.key]]) || s.last_ts || s.created ? (
                 <span className="ml-auto inline-flex items-center gap-1 shrink-0">
                   {scope === 'flat' && slotFolders[s.key] && folderNameById[slotFolders[s.key]] && (
-                    <span className="text-[10px] text-muted font-normal inline-flex items-center gap-0.5 max-w-[90px]" title={`In folder: ${folderNameById[slotFolders[s.key]]}`}>
+                    <span className="text-[10px] text-muted font-normal inline-flex items-center gap-0.5 max-w-[90px]" title={i18nT('pages.chatSidebar.in_folder', { name: folderNameById[slotFolders[s.key]] })}>
                       <Folder size={9} className="shrink-0" aria-hidden />
                       <span className="truncate">{folderNameById[slotFolders[s.key]]}</span>
                     </span>
@@ -2286,7 +2359,7 @@ function ChatSidebar({
               // read as unattended progress. Nothing is lost by ranking it high
               // — `goalLoopDetail` carries whatever the lower branch would have
               // shown, so this line reads "Loop 7/24 · 3 agents running".
-              <div className="text-[12px] leading-snug mt-0.5 flex items-center gap-1.5 min-w-0" title={goalLoop.max_cycles > 0 ? `Goal loop · cycle ${goalLoop.cycle_count} of ${goalLoop.max_cycles}` : `Goal loop · cycle ${goalLoop.cycle_count} (no cap)`}>
+              <div className="text-[12px] leading-snug mt-0.5 flex items-center gap-1.5 min-w-0" title={goalLoop.max_cycles > 0 ? i18nT('pages.chatSidebar.goal_loop_cycle', { count: goalLoop.cycle_count, total: goalLoop.max_cycles }) : i18nT('pages.chatSidebar.goal_loop_cycle_no_cap', { count: goalLoop.cycle_count })}>
                 <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse shrink-0" aria-hidden />
                 <span className="truncate"><span className="font-medium text-accent">{goalLoopLabel}</span>{goalLoopDetail ? <span className="text-muted"> · {goalLoopDetail}</span> : null}</span>
               </div>
@@ -2329,25 +2402,62 @@ function ChatSidebar({
               const overflowTitle = issueLinks.length
                 ? i18nT('pages.chatSidebar.more_pull_request_or_issue_in_this_session', { count: hidden })
                 : i18nT('pages.chatSidebar.more_pull_request_in_this_session', { count: hidden })
+              /** Chip tooltip. A plain click now reveals in-panel, so a bare
+               *  "Open <url>" would promise the browser and mislead; naming the
+               *  modifier is also the only way that escape hatch is discoverable
+               *  rather than found by accident. */
+              const chipTitle = (link: SidebarSourceLink) => i18nT('pages.chatSidebar.open_source_link_in_side_panel', {
+                url: link.url,
+                modifier: platformShortcut('Cmd+click'),
+              })
+              /** Chip click: switch to the session the chip belongs to and reveal
+               *  its pull request / issue in that session's side panel, rather
+               *  than sending the user out to the provider's website.
+               *
+               *  The chip stays a real anchor with a real href, so four cases
+               *  deliberately fall through to plain link navigation instead:
+               *    - `onOpenSource` unset — the surface has no side panel to
+               *      reveal into (the `/embed/sessions` list).
+               *    - a modifier click — the user asked for a new tab/window
+               *      explicitly, and "Copy link address" still yields the PR url.
+               *    - offline — the panel loads a PR through the LOCAL provider
+               *      CLI, so with the gateway down the provider's own page is the
+               *      only thing that can answer at all.
+               *    - `onOpenSource` returning false — the panel could not resolve
+               *      this url, so the provider's page is better than a dead click.
+               *  Middle-click never reaches a click handler (it fires auxclick),
+               *  so it opens a background tab natively without a case here.
+               *
+               *  `preventDefault` comes LAST on purpose: the default action runs
+               *  only after every handler returns, so suppressing navigation
+               *  after the reveal is still effective — and it means the reveal
+               *  decides, rather than being assumed to succeed. */
+              const revealInPanel = (link: SidebarSourceLink) => (e: React.MouseEvent<HTMLAnchorElement>) => {
+                // The row is a click-to-switch button; never let a chip click
+                // reach it, whichever branch we take below.
+                e.stopPropagation()
+                if (!onOpenSource || !connected || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+                if (!isActive) { dispatch(switchSlot(s.key)); onSelectSlot?.(s.key) }
+                if (!onOpenSource(s.key, { url: link.url, kind: link.kind ?? 'change' })) return
+                e.preventDefault()
+              }
               return (
                 <div className="flex flex-wrap gap-1.5 mt-1">
                   {changeLinks.map(link => (
-                    // The chip is a real link to the PR/MR. `link.url` is always
-                    // an `https://` URL on an allowlisted host (state.py scans for
-                    // the literal "https://" then validates via parse_source_url),
-                    // so no scheme sanitising is needed here.
+                    // `link.url` is always an `https://` URL on an allowlisted
+                    // host (state.py scans for the literal "https://" then
+                    // validates via parse_source_url), so no scheme sanitising is
+                    // needed for the href.
                     //
-                    // The row itself is a click-to-switch button AND a dnd-kit
-                    // draggable, so the anchor has to opt out of both: stop the
-                    // click from bubbling into the row's switchSlot handler, and
-                    // disable the anchor's own native HTML5 drag, which would
+                    // The row is a dnd-kit draggable as well as a button, so the
+                    // anchor also disables its own native HTML5 drag — that would
                     // otherwise put the URL on the dataTransfer instead of the
                     // slot key in the board/flat scopes that use native drag.
                     <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer"
                       draggable={false}
-                      onClick={e => e.stopPropagation()}
+                      onClick={revealInPanel(link)}
                       className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted no-underline border border-border bg-bg-elevated/60 hover:text-text hover:border-accent"
-                      title={`Open ${link.url}`}>
+                      title={chipTitle(link)}>
                       {link.provider === 'github' ? <GithubLogo size={10} className="shrink-0" /> : <GitlabLogo size={10} className="shrink-0" />}
                       {link.provider === 'github' ? `#${link.number}` : `!${link.number}`}
                       {link.state === 'merged' && (
@@ -2364,7 +2474,7 @@ function ChatSidebar({
                     </a>
                   ))}
                   {issueLinks.map(link => (
-                    // Issue chip: the same anchor discipline (stop propagation,
+                    // Issue chip: the same anchor discipline (reveal in panel,
                     // no native drag) but deliberately NO ci / state / merge
                     // decoration — the chip-status cache is pull-request-only in
                     // this phase, so an issue chip has nothing truthful to colour
@@ -2373,9 +2483,9 @@ function ChatSidebar({
                     <a key={link.url} href={link.url} target="_blank" rel="noopener noreferrer"
                       data-testid={`session-issue-chip-${link.number}`}
                       draggable={false}
-                      onClick={e => e.stopPropagation()}
+                      onClick={revealInPanel(link)}
                       className="inline-flex items-center gap-1 px-1.5 py-[1px] rounded-[4px] text-[10px] leading-none font-medium text-muted no-underline border border-border bg-bg-elevated/60 hover:text-text hover:border-accent"
-                      title={`Open ${link.url}`}>
+                      title={chipTitle(link)}>
                       {link.provider === 'github' ? <GithubLogo size={10} className="shrink-0" /> : <GitlabLogo size={10} className="shrink-0" />}
                       <CircleDot className="lucide-inline shrink-0" aria-hidden="true" />
                       {`#${link.number}`}
@@ -2412,9 +2522,9 @@ function ChatSidebar({
             <div className="absolute top-1/2 -translate-y-1/2 right-1.5 flex items-center gap-0.5">
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <button type="button" className="text-muted/50 active:text-text p-1 cursor-pointer bg-transparent border-none" aria-label={i18nT('pages.chatSidebar.more_options')} onMouseDown={e => e.stopPropagation()}><MoreVertical size={14} /></button>
+                  <button type="button" className="text-muted/50 active:text-text p-1 cursor-pointer bg-transparent border-none" aria-label={i18nT('pages.chatSidebar.more_options')} onMouseDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()}><MoreVertical size={14} /></button>
                 </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="min-w-[160px]" onCloseAutoFocus={onMenuCloseAutoFocus}>
+                <DropdownMenuContent align="end" className="min-w-[160px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
                   <SessionActionsMenu variant="dropdown" {...rowMenuProps} />
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -2423,9 +2533,9 @@ function ChatSidebar({
             <IconButtonGroup reveal className="absolute top-1/2 -translate-y-1/2 right-1.5 has-[[data-state=open]]:opacity-100">
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <IconButton title={i18nT('pages.chatSidebar.more')} aria-label={i18nT('pages.chatSidebar.more_options')} onMouseDown={e => e.stopPropagation()}><MoreVertical size={12} /></IconButton>
+                  <IconButton title={i18nT('pages.chatSidebar.more')} aria-label={i18nT('pages.chatSidebar.more_options')} onMouseDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()}><MoreVertical size={12} /></IconButton>
                 </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="min-w-[160px]" onCloseAutoFocus={onMenuCloseAutoFocus}>
+                <DropdownMenuContent align="end" className="min-w-[160px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
                   <SessionActionsMenu variant="dropdown" {...rowMenuProps} />
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -2435,7 +2545,7 @@ function ChatSidebar({
           ))}
         </div>
           </ContextMenuTrigger>
-          <ContextMenuContent className="min-w-[160px]" onCloseAutoFocus={onMenuCloseAutoFocus}>
+          <ContextMenuContent className="min-w-[160px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
             <SessionActionsMenu variant="context" {...rowMenuProps} />
           </ContextMenuContent>
         </ContextMenu>
@@ -2472,7 +2582,7 @@ function ChatSidebar({
         // an interactive element can't legally contain other interactive
         // elements (invalid ARIA), and a folder row is a grouping, not an action.
         role="group"
-        aria-label={`Folder ${folder.name}`}
+        aria-label={i18nT('pages.chatSidebar.folder_2', { name: folder.name })}
         // The whole header is the drag-to-reorder handle (pointer listeners only,
         // no role override). 8px activation distance keeps the collapse toggle
         // and action buttons clickable; drag is off while renaming.
@@ -2488,7 +2598,7 @@ function ChatSidebar({
         style={{ paddingLeft: '16px' }}>
         {editingId === folder.id && editScope === 'list' ? (
           <>
-            <FolderGlyph icon={folder.icon} size={14} open={!folder.collapsed} />
+            <FolderGlyph color={folder.color} size={14} open={!folder.collapsed} />
             <Input ref={folderEditInputRef} className="flex-1 py-0.5 text-[13px] min-w-0" value={editName} onChange={e => setEditName(e.target.value)} onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} {...ime.bindEnter<HTMLInputElement>({ onEnter: () => renameCommit(folder.id, editName), onEscape: () => setEditingId(null), onBlur: () => renameCommit(folder.id, editName) })} />
             <span className="text-[11px] text-muted tabular-nums shrink-0">{count}</span>
           </>
@@ -2502,7 +2612,7 @@ function ChatSidebar({
               aria-expanded={!folder.collapsed}
               aria-label={folder.collapsed ? i18nT('pages.chatSidebar.expand_folder_name', { name: folder.name }) : i18nT('pages.chatSidebar.collapse_folder_name', { name: folder.name })}
               onClick={() => toggleCollapse(folder.id)}>
-              <FolderGlyph icon={folder.icon} size={14} open={!folder.collapsed} testId={`folder-collapse-${folder.id}`} />
+              <FolderGlyph color={folder.color} size={14} open={!folder.collapsed} testId={`folder-collapse-${folder.id}`} />
               {/* Double-click rename is a mouse-only power shortcut; the accessible
                *  path is the ⋯-menu Rename item, so scope-disable the interaction rule. */}
               {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions */}
@@ -2511,7 +2621,7 @@ function ChatSidebar({
               {hasUnread && folder.collapsed && <span className="w-2 h-2 rounded-full shrink-0" style={{ background: 'var(--accent)' }} />}
               <span className="text-[11px] text-muted tabular-nums shrink-0">{count}</span>
             </button>
-            {folder.default_agent && <span className="text-[10px] text-accent bg-accent/10 px-1.5 py-0.5 rounded-full shrink-0 truncate max-w-[60px]" title={`Default agent: ${folder.default_agent}`}>{folder.default_agent}</span>}
+            {folder.default_agent && <span className="text-[10px] text-accent bg-accent/10 px-1.5 py-0.5 rounded-full shrink-0 truncate max-w-[60px]" title={i18nT('pages.chatSidebar.default_agent', { name: folder.default_agent })}>{folder.default_agent}</span>}
           </>
         )}
         {!(editingId === folder.id && editScope === 'list') && (
@@ -2520,7 +2630,7 @@ function ChatSidebar({
            *  <button>s of the collapse toggle (valid ARIA — no nesting). */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <button type="button" className="cursor-pointer p-[4px] rounded text-muted hover:text-text hover:bg-bg-hover transition-all bg-transparent border-none" title={i18nT('pages.chatSidebar.more')} aria-label={`Folder options for ${folder.name}`} aria-haspopup="menu" data-testid={`folder-menu-${folder.id}`} onMouseDown={e => { e.stopPropagation() }}><MoreVertical size={12} /></button>
+              <button type="button" className="cursor-pointer p-[4px] rounded text-muted hover:text-text hover:bg-bg-hover transition-all bg-transparent border-none" title={i18nT('pages.chatSidebar.more')} aria-label={i18nT('pages.chatSidebar.folder_options_for', { name: folder.name })} aria-haspopup="menu" data-testid={`folder-menu-${folder.id}`} onMouseDown={e => { e.stopPropagation() }}><MoreVertical size={12} /></button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="min-w-[180px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
               <DropdownMenuItem data-testid={`folder-rename-${folder.id}`} onClick={() => { suppressMenuRestoreRef.current = true; setEditingId(folder.id); setEditScope('list'); setEditName(folder.name) }}><Pencil size={13} /> {i18nT('pages.chatSidebar.rename')}</DropdownMenuItem>
@@ -2546,10 +2656,10 @@ function ChatSidebar({
                 <DropdownMenuItem data-testid={`folder-hide-${folder.id}`} onClick={() => { updateFolderMutation.mutate({ id: folder.id, body: { hidden: true } }) }}><EyeOff size={13} /> {i18nT('pages.chatSidebar.hide_when_empty')}</DropdownMenuItem>
               )}
               <DropdownMenuSeparator />
-              <DropdownMenuItem className="text-danger focus:text-danger" data-testid={`folder-delete-${folder.id}`} onClick={() => { if (confirm(`Delete "${folder.name}"? Sessions will be ungrouped.`)) deleteFolderMutation.mutate(folder.id) }}><X size={13} /> {i18nT('pages.chatSidebar.delete_folder')}</DropdownMenuItem>
+              <DropdownMenuItem className="text-danger focus:text-danger" data-testid={`folder-delete-${folder.id}`} onClick={() => { if (confirm(i18nT('pages.chatSidebar.delete_folder_confirm', { name: folder.name }))) deleteFolderMutation.mutate(folder.id) }}><X size={13} /> {i18nT('pages.chatSidebar.delete_folder')}</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-          <button type="button" className="cursor-pointer p-[4px] rounded text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none" title={i18nT('pages.chatSidebar.new_chat_in_folder')} aria-label={i18nT('pages.chatSidebar.new_chat_in_folder')} onClick={e => { e.stopPropagation(); createChatInFolder(folder.id) }}><MessageSquarePlus size={12} /></button>
+          <button type="button" className="cursor-pointer p-[4px] rounded text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none" title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} onClick={e => { e.stopPropagation(); createChatInFolder(folder.id) }}><MessageSquarePlus size={12} /></button>
         </div>
         )}
       </div>
@@ -2636,35 +2746,21 @@ function ChatSidebar({
     // Wrap children in a bordered container so the folder's extent is visually
     // clear when multiple folders are open. Only wrap when there's content,
     // otherwise the FolderBody would render an empty 1px-tall strip with a line.
-    // Inline "New chat" affordance at the end of the slot list when the folder
-    // is expanded — a discoverable, always-visible way to start a session in
-    // this folder (complements the hover ⊕ on the header, which also works when
-    // the folder is collapsed). Hidden while searching/filtering to keep results
-    // clean; always present otherwise, so an empty folder is no longer a dead-end.
-    const showInlineNewChat = !(slotFilter || activeFilters.size > 0)
-    const inlineNewChatBtn = (
-      <button key={`folder-newchat-${folder.id}`} type="button"
-        
-        onClick={() => createChatInFolder(folder.id)}
-        title={i18nT('pages.chatSidebar.new_chat_in_folder')} aria-label={`New chat in ${folder.name}`}
-        className="w-full flex items-center gap-2.5 px-4 py-2 rounded-md text-[12px] text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none cursor-pointer text-left">
-        {/* Label first, glyph trailing: a leading icon pushed this row's text
-         *  ~23px right of the session titles below it, breaking the single left
-         *  text guide the folder-header padding establishes. The ⊕ lands in the
-         *  same right-hand gutter as a session row's relative timestamp. */}
-        <span>{i18nT('pages.chatSidebar.new_chat_in_folder')}</span><MessageSquarePlus size={13} className="shrink-0 ml-auto" />
-      </button>
-    )
-    const bodyNodes: React.ReactNode[] = showInlineNewChat
-      ? (childNodes.length > 0
-          ? [inlineNewChatBtn,
-             <div key={`folder-newchat-sep-${folder.id}`} className="mx-3 border-b border-border" />,
-             ...childNodes]
-          : [inlineNewChatBtn])
-      : childNodes
-    const wrapped = bodyNodes.length > 0 ? (
+    const wrapped = childNodes.length > 0 ? (
       <div key={`folder-children-${folder.id}`} className="border-l border-border mb-1 ml-3 pl-1 rounded-bl-md">
-        {bodyNodes}
+        {childNodes}
+      </div>
+    ) : !(slotFilter || activeFilters.size > 0) ? (
+      // Empty-folder affordance: a newly created (or emptied) expanded folder
+      // would otherwise render nothing, leaving the hover ⊕ on the header as
+      // the only (invisible-at-rest) way to start a session in it.
+      <div key={`folder-children-${folder.id}`} className="border-l border-border mb-1 ml-3 pl-1 rounded-bl-md">
+        <button key={`folder-newchat-${folder.id}`} type="button"
+          onClick={() => createChatInFolder(folder.id)}
+          title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}
+          className="w-full flex items-center gap-2.5 px-4 py-2 rounded-md text-[12px] text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none cursor-pointer text-left">
+          <span>{i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}</span><MessageSquarePlus size={13} className="shrink-0 ml-auto" />
+        </button>
       </div>
     ) : null
     // Outer container wraps header + body so the entire folder block is a
@@ -2693,6 +2789,14 @@ function ChatSidebar({
   // Used to reveal the empty-state drop placeholder inside the "No folder"
   // group so there's always a reachable ungroup target.
   const draggingFolderedSession = activeDrag?.type === 'session' && !!slotFolders[activeDrag.id]
+  // Whether the session being dragged may not be referenced into the open chat
+  // (incognito/temporary, or the session already on screen). Drives the drop
+  // zone's refusal state; the drop handler re-decides with the same function.
+  const draggingRefBlocked = activeDrag?.type === 'session' && !!sessionRefBlockReason({
+    key: activeDrag.id,
+    activeSlot,
+    memoryMode: slots.find(x => x.key === activeDrag.id)?.memory_mode,
+  })
   // True while dragging a folder that currently has a parent — the only case
   // where "drop on the root lane to move to top level" applies.
   const draggingNestedFolder = activeDrag?.type === 'folder' && !!folders.find(f => f.id === activeDrag.id)?.parent_id
@@ -3059,16 +3163,19 @@ function ChatSidebar({
                                   aria-label={i18nT('pages.chatSidebar.custom_recency_amount')}
                                   className="w-12 shrink-0 px-1.5 py-0.5 rounded border border-border bg-bg-elevated text-text text-[12px]"
                                 />
-                                <select
+                                <SimpleSelect
                                   value={recentUnitDraft}
-                                  onChange={e => changeRecentUnit(e.target.value as RecentUnit)}
+                                  onChange={v => changeRecentUnit(v as RecentUnit)}
+                                  className="px-1.5 py-0.5 text-[12px] rounded"
+                                  options={['minutes', 'hours', 'days']}
+                                  optionLabels={[i18nT('pages.chatSidebar.min'), i18nT('pages.chatSidebar.hours'), i18nT('pages.chatSidebar.days')]}
                                   aria-label={i18nT('pages.chatSidebar.custom_recency_unit')}
-                                  className="flex-1 min-w-0 px-1.5 py-0.5 rounded border border-border bg-bg-elevated text-text text-[12px] cursor-pointer"
-                                >
-                                  <option value="minutes">{i18nT('pages.chatSidebar.min')}</option>
-                                  <option value="hours">{i18nT('pages.chatSidebar.hours')}</option>
-                                  <option value="days">{i18nT('pages.chatSidebar.days')}</option>
-                                </select>
+                                  // Was `flex-1 min-w-0` on the old <select>; the
+                                  // trigger's chrome is fixed inside ui/select.tsx,
+                                  // but the flex sizing has to survive on the
+                                  // wrapper div that replaces it as the flex item.
+                                  style={{ flex: '1 1 0%', minWidth: 0 }}
+                                />
                               </div>
                             </div>
                           </div>
@@ -3125,7 +3232,7 @@ function ChatSidebar({
                       <span className="flex-1">
                         {i18nT('pages.chatSidebar.folders')}
                         {filterHiddenFolders.size > 0 && (
-                          <span className="normal-case tracking-normal"> · {filterHiddenFolders.size} hidden</span>
+                          <span className="normal-case tracking-normal"> · {filterHiddenFolders.size} {i18nT('pages.chatSidebar.hidden')}</span>
                         )}
                       </span>
                     </DropdownMenuItem>
@@ -3142,8 +3249,8 @@ function ChatSidebar({
                         key={f.id}
                         style={{ paddingLeft: `${8 + depth * 14}px` }}
                         title={hiddenByAncestor
-                          ? `${f.name} is hidden because a parent folder is hidden`
-                          : hidden ? `Show ${f.name} in flat view` : `Hide ${f.name} from flat view`}
+                          ? i18nT('pages.chatSidebar.hidden_because_parent_hidden', { name: f.name })
+                          : hidden ? i18nT('pages.chatSidebar.show_in_flat_view', { name: f.name }) : i18nT('pages.chatSidebar.hide_from_flat_view', { name: f.name })}
                         // Keep the menu open so several folders can be toggled.
                         onSelect={e => { e.preventDefault(); toggleFolderFilter(f.id) }}
                         data-testid={`folder-filter-${f.id}`}
@@ -3159,7 +3266,7 @@ function ChatSidebar({
                         >
                           {!hidden && !hiddenByAncestor && <Check size={10} className="text-accent-fg" strokeWidth={3} />}
                         </span>
-                        <FolderGlyph icon={f.icon} size={12} className="shrink-0 text-muted" />
+                        <FolderGlyph color={f.color} size={12} className="shrink-0 text-muted" />
                         <span className={`flex-1 truncate${hiddenByAncestor ? ' opacity-50' : ''}`}>{f.name}</span>
                         {count > 0 && <span className="text-muted text-[11px] shrink-0">{count}</span>}
                       </DropdownMenuItem>
@@ -3244,15 +3351,6 @@ function ChatSidebar({
             {/* Flat view has no containers to anchor to — every hide, top-level
              *  or nested, collapses into this one row at the bottom of the lane. */}
             {renderHiddenReveal('flat', allHiddenFolders, 0)}
-            {!historyOpen && (
-              <button
-                type="button"
-                onClick={() => { setHistoryOpen(true); dispatch(fetchHistory(false)) }}
-                className="mt-1 mx-1 px-2 py-1.5 text-left text-[12px] text-muted hover:text-accent hover:bg-accent-subtle rounded-md cursor-pointer bg-transparent border-none transition-colors"
-              >
-                {i18nT('pages.chatSidebar.show_all_older_sessions')}
-              </button>
-            )}
           </motion.div>
         ) : orderedColumns.length === 0 ? (
           // Legacy single-lane layout (identical to pre-columns behavior)
@@ -3279,6 +3377,17 @@ function ChatSidebar({
                 ? { droppable: { strategy: MeasuringStrategy.Always, frequency: 100 } }
                 : { droppable: { strategy: MeasuringStrategy.Always } }}
               onDragStart={handleSidebarDragStart} onDragOver={handleSidebarDragOver} onDragEnd={handleSidebarDragEnd} onDragCancel={handleSidebarDragCancel}>
+              {/* "Drag a session into the open chat" target. Portaled into
+               *  ChatPage's pane so it covers the WHOLE conversation area (not
+               *  just the composer), while staying inside this DndContext —
+               *  React portals preserve context, and useDroppable measures the
+               *  node where it actually renders. Mounted only during a session
+               *  drag, and only when a pane and a handler exist. */}
+              {chatDropTarget && onDropSessionRef && activeDrag?.type === 'session'
+                && createPortal(
+                  <ChatPaneDropZone refused={draggingRefBlocked} />,
+                  chatDropTarget,
+                )}
               {/* Root lane is the fallback drop target: dropping a session on
                *  empty space (not over a folder) ungroups it (folderId: null). */}
               <DndDroppable id="root-lane" data={{ type: 'folder-drop', folderId: null }}>
@@ -3311,18 +3420,6 @@ function ChatSidebar({
                               const showDivider = i < ungroupedSlots.length - 1 && !isActive && !nextIsActive
                               return renderSessionRow(s, 0, showDivider)
                             })}
-                            {/* In-flow discovery affordance: a text button just below the
-                                last session that expands the Older Sessions pane. Hidden
-                                once open. */}
-                            {!historyOpen && (
-                              <button
-                                type="button"
-                                onClick={() => { setHistoryOpen(true); dispatch(fetchHistory(false)) }}
-                                className="mt-1 mx-1 px-2 py-1.5 text-left text-[12px] text-muted hover:text-accent hover:bg-accent-subtle rounded-md cursor-pointer bg-transparent border-none transition-colors"
-                              >
-                                {i18nT('pages.chatSidebar.show_all_older_sessions')}
-                              </button>
-                            )}
                             {ungroupedSlots.length === 0 && draggingFolderedSession && <RootDropHint />}
                           </div>
                         )}
@@ -3436,7 +3533,7 @@ function ChatSidebar({
                        focus, but we deliberately omit aria-modal — the popover has no
                        backdrop and is outside-click-dismissible, so claiming the rest of
                        the page is inert would mislead screen readers. */
-                    <div ref={columnPopoverRef} role="dialog" aria-label={`Filter tags: ${col.name || 'column'}`} tabIndex={-1} data-column-popover={col.id}
+                    <div ref={columnPopoverRef} role="dialog" aria-label={i18nT('pages.chatSidebar.filter_tags', { name: col.name || 'column' })} tabIndex={-1} data-column-popover={col.id}
                       className="fixed z-[9100] bg-bg-elevated border border-border rounded-lg shadow-lg p-2 min-w-[240px] text-[13px] outline-none"
                       style={{ top: popoverPos.top, left: popoverPos.left }}
                       onClick={e => e.stopPropagation()}
@@ -3562,9 +3659,8 @@ function ChatSidebar({
         <div className="border-t border-border" />
       )}
       {/* Older Sessions footer — the persistent collapse/expand header for the
-          history pane. The inline "Show all older sessions" button (above, below
-          the last session) is the in-flow discovery affordance. Whole row is the
-          click target; the Clear button stops propagation. */}
+          history pane. Whole row is the click target; the Clear button stops
+          propagation. */}
       <div
         role="button"
         tabIndex={0}
@@ -3618,14 +3714,29 @@ function ChatSidebar({
                   }
                   return ((s.title || '') + s.key).toLowerCase().includes(historyFilter.toLowerCase())
                 })
+                // One definition of "search active" for every site below: results
+                // are present AND the query is still at/above the search threshold.
+                // The compound check matters on the clear-X frame: historyFilter
+                // empties synchronously but useDebouncedSessionSearch nulls its
+                // result in a passive effect (one render later), so a bare
+                // `historySearchResults` test would treat that stale frame as an
+                // active search and paint date segment headers over a
+                // relevance-ordered list.
+                const searchActive = historyFilter.trim().length >= SEARCH_MIN_CHARS && !!historySearchResults
                 // Hide date segments when the user has an active search — results are
                 // Segments only make sense when the list is date-ordered. For name/created
                 // sorts (or active search, which is relevance-ranked) they'd interleave.
-                const showSegments = !(historyFilter.trim().length >= SEARCH_MIN_CHARS && historySearchResults)
+                const showSegments = !searchActive
                   && (sortKey === 'date-desc' || sortKey === 'date-asc')
-                // Skip the sort only when the backend already returns date-desc order, i.e.
-                // no active search (search results are relevance-ranked, not date-ranked).
-                const sortedHistory = (sortKey === 'date-desc' && !historySearchResults) ? filteredHistory : [...filteredHistory].sort((a, b) => compareBySort(a, b, sortKey))
+                // Active search: keep the backend's relevance ranking (title-boosted;
+                // see search_sessions in history.py). Re-sorting search results by the
+                // sidebar sort key buried an exact title match under fresher sessions
+                // that merely mention the query in their content — and defeated
+                // groupHistoryByFolder's documented order-preserving contract. The
+                // command palette's Sessions tab already preserves backend order.
+                // No search: skip the sort only when the backend already returns
+                // date-desc order.
+                const sortedHistory = (searchActive || sortKey === 'date-desc') ? filteredHistory : [...filteredHistory].sort((a, b) => compareBySort(a, b, sortKey))
                 let prevSeg = ''
                 // Derive agent color the same way renderSessionRow does so history rows
                 // match the session-row visual language (agent name tinted by source).
@@ -3698,7 +3809,7 @@ function ChatSidebar({
                 // Folder-grouped view: during an active content search, regroup the
                 // relevance-ranked results under collapsible folder headers (+ Unfiled)
                 // by the folder each session was filed in, instead of date segments.
-                if (historyFilter.trim().length >= SEARCH_MIN_CHARS && historySearchResults) {
+                if (searchActive) {
                   return groupHistoryByFolder(sortedHistory, folders).map(({ key: gid, folder, rows }) => {
                     const collapsed = collapsedHistoryGroups.has(gid)
                     const groupName = folder ? folder.name : i18nT('pages.chatSidebar.unfiled')
@@ -3706,7 +3817,7 @@ function ChatSidebar({
                       <Fragment key={gid}>
                         <button type="button" aria-expanded={!collapsed} aria-label={collapsed ? i18nT('pages.chatSidebar.expand_group_results', { group: groupName }) : i18nT('pages.chatSidebar.collapse_group_results', { group: groupName })} className="w-full flex items-center gap-1.5 px-2 pt-3 pb-1 text-[11px] font-semibold text-muted select-none bg-transparent border-none cursor-pointer hover:text-text first:pt-1" onClick={() => setCollapsedHistoryGroups(prev => { const next = new Set(prev); if (next.has(gid)) next.delete(gid); else next.add(gid); return next })}>
                           {collapsed ? <ChevronRight size={12} className="shrink-0" /> : <ChevronDown size={12} className="shrink-0" />}
-                          {folder ? <FolderGlyph icon={folder.icon} size={12} open={!collapsed} /> : <Folder size={12} className="text-muted shrink-0" />}
+                          {folder ? <FolderGlyph color={folder.color} size={12} open={!collapsed} /> : <Folder size={12} className="text-muted shrink-0" />}
                           <span className="truncate">{folder ? folder.name : i18nT('pages.chatSidebar.unfiled')}</span>
                           <span className="ml-0.5 text-muted font-normal tabular-nums">· {rows.length}</span>
                         </button>
@@ -3775,27 +3886,20 @@ function ChatSidebar({
                 parentId: folderModal.parentId || undefined,
                 projectDir: draft.projectDir,
                 defaultAgent: draft.defaultAgent,
-                icon: draft.icon,
+                color: draft.color,
               })
             } else {
               // Build the PATCH from what the USER edited (draft.touched, measured
               // against what the modal opened with) — NOT from a diff against live
-              // cache. Folder icons are generated asynchronously after creation, so
-              // a settings modal opened before the icon lands holds icon:'' while
-              // the cache gains the generated one; diffing against cache then made
-              // a name-only save PATCH icon:'' and delete it. The same shape would
-              // revert any field another client changed mid-edit.
+              // cache, whose shape would revert any field another client changed
+              // mid-edit.
               const touched = new Set(draft.touched)
               const body: Record<string, unknown> = {}
               if (touched.has('name')) body.name = draft.name
               if (touched.has('projectDir')) body.project_dir = draft.projectDir
               if (touched.has('defaultAgent')) body.default_agent = draft.defaultAgent
-              // `icon` and `regenerate_icon` are mutually exclusive server-side, so
-              // send at most one. Clearing an icon is expressed ONLY via
-              // regenerate_icon (Reset to auto); an empty `icon` is never a
-              // legitimate instruction, so refuse to send one even if asked.
-              if (draft.regenerateIcon) body.regenerate_icon = true
-              else if (touched.has('icon') && draft.icon) body.icon = draft.icon
+              // '' is a legitimate color instruction: it clears back to gray.
+              if (touched.has('color')) body.color = draft.color
               if (Object.keys(body).length > 0) {
                 await updateFolderMutation.mutateAsync({ id: folderModal.folderId, body })
               }

@@ -10,10 +10,13 @@ Stdlib-only; imported by ``session_map`` (no import cycle).
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 #: Slack ts format: ``"{epoch_seconds}.{microseconds}"`` -- pure digits + one dot.
 #: Both runs are BOUNDED. Unbounded ``\d+`` on either side of the dot makes
@@ -105,6 +108,13 @@ _TELEMETRY_EXACT_KEYS: dict[str, str] = {
     "_hb": "heartbeat",
 }
 
+#: A bare dashboard chat-slot key (``chat-12-1785445181``). The token row store
+#: persists ``_ChatSlot.key``, which carries no namespace prefix, so the prefix
+#: table above cannot see it — without this rule every dashboard turn read back
+#: from that store classifies as ``other``. Anchored and digit-bound so an
+#: arbitrary key that merely starts with "chat" is not absorbed.
+_TELEMETRY_CHAT_SLOT_RE = re.compile(r"^chat-\d+-\d+$")
+
 #: Every value :func:`telemetry_channel_of` can return. Metric attributes must
 #: draw from a closed set — an unbounded label (a raw session key) would mint one
 #: time series per conversation and blow up the metric store.
@@ -139,6 +149,8 @@ def telemetry_channel_of(key: str | None) -> str:
     for prefix, label in _TELEMETRY_LOCAL_PREFIXES:
         if key.startswith((f"{prefix}:", f"{prefix}_")):
             return label
+    if _TELEMETRY_CHAT_SLOT_RE.match(key):
+        return "dashboard"
     return "other"
 
 
@@ -173,6 +185,89 @@ class ChannelLink:
 def session_key(channel_type: str, conversation_id: str) -> str:
     """Build a namespaced session key, e.g. ``slack:123.456``."""
     return f"{channel_type}:{conversation_id}"
+
+
+# ── Canonical address parsing (RFC §9 rule 4: exactly ONE parser module) ──
+
+
+@dataclass(frozen=True)
+class ParsedSessionKey:
+    """A conversational session key decomposed per the RFC §9 grammar.
+
+    ``{surface}:{agent}:{chat_type}:{scope…}[:genN]`` — the first segment is
+    the surface and is the routing authority (``ChannelTurn.channel_type``
+    MUST equal it; the contract tests pin this). ``scope`` is one or more
+    segments carrying the transport's own topology; ``gen`` is the rotating
+    generation (0 = bare bucket, no suffix).
+    """
+
+    surface: str
+    agent: str
+    chat_type: str
+    scope: tuple[str, ...]
+    gen: int = 0
+
+    @property
+    def bucket(self) -> str:
+        """The durable bucket — the key with any generation suffix removed."""
+        parts = [self.surface, self.agent, self.chat_type, *self.scope]
+        return ":".join(parts)
+
+
+_GEN_SUFFIX_RE = re.compile(r"^gen(\d+)$")
+
+
+def parse_session_key(key: str) -> ParsedSessionKey | None:
+    """Parse a canonical conversational key; ``None`` for anything else.
+
+    Deliberately STRICT: only the §9 grammar parses. Legacy shapes — bare
+    Slack ``thread_ts``, two-segment ``slack:<ts>``, ``dashboard:`` keys, the
+    app-platform ``channel:{id}:{agent}`` prefix — return ``None`` rather than
+    a wrong decomposition; they predate the grammar and their migration is
+    explicitly out of scope (§9 accepted debts). Callers that must handle
+    legacy keys keep using the prefix classifiers above.
+
+    Consumers must treat a ``None`` as "not addressable by grammar", never as
+    an error: the dispatch pipeline itself stays address-agnostic and does not
+    call this (pinned in ``dispatch.py`` docstrings).
+    """
+    if not key:
+        return None
+    segments = key.split(":")
+    if len(segments) < 4:
+        return None
+    surface = segments[0]
+    if surface not in CHANNEL_SESSION_NAMESPACES:
+        return None
+    gen = 0
+    tail = segments[-1]
+    m = _GEN_SUFFIX_RE.match(tail)
+    if m is not None:
+        gen = int(m.group(1))
+        segments = segments[:-1]
+        if len(segments) < 4:
+            return None
+    if any(not s for s in segments):
+        return None  # an empty segment means a malformed key, not an address
+    return ParsedSessionKey(
+        surface=surface,
+        agent=segments[1],
+        chat_type=segments[2],
+        scope=tuple(segments[3:]),
+        gen=gen,
+    )
+
+
+def assert_colon_free(segment: str, *, what: str) -> str:
+    """Enforce §9 rule 4 at BUILD time: segments must not contain ``:``.
+
+    A colon inside a segment silently shifts every later segment during
+    parsing — the address becomes wrong, not invalid. Builders call this so
+    the corruption is impossible to construct rather than detected later.
+    """
+    if ":" in segment:
+        raise ValueError(f"session-key {what} must not contain ':': {segment!r}")
+    return segment
 
 
 def is_legacy_slack_key(key: str) -> bool:
@@ -255,9 +350,22 @@ def build_dm_session_key(
     keep their compatibility shim (see ``canonical_key``) untouched.
     """
     if dm_scope == DM_SCOPE_UNIFIED and chat_type == CHAT_TYPE_DIRECT:
-        bucket = f"{DM_SCOPE_UNIFIED}:{agent}"
+        bucket = f"{DM_SCOPE_UNIFIED}:{assert_colon_free(agent, what='agent')}"
     else:
-        bucket = f"{channel}:{agent}:{chat_type}:{user}"
+        # ``user`` is a SCOPE PATH, not a single segment: telegram forum routes
+        # pass "{chat_id}:{thread}" here, which §9 rule 2 blesses as two scope
+        # segments (hierarchy depth lives in the scope). So the colon-free rule
+        # applies to its SUB-segments (none may be empty), not to the whole.
+        if ":" in user and any(not s for s in user.split(":")):
+            raise ValueError(f"session-key scope path has an empty segment: {user!r}")
+        bucket = ":".join(
+            (
+                assert_colon_free(channel, what="channel"),
+                assert_colon_free(agent, what="agent"),
+                assert_colon_free(chat_type, what="chat_type"),
+                user,
+            )
+        )
     return f"{bucket}:gen{gen}" if gen else bucket
 
 
@@ -278,6 +386,51 @@ def legacy_dashboard_mirror_key(channel_session_key: str) -> str:
     from kiro_crew.history import _safe_key
 
     return "dashboard:" + _safe_key(channel_session_key)
+
+
+def release_conversation_location(
+    sessions: Any,
+    *,
+    key: str,
+    location: ChannelLink,
+    channel: str,
+) -> tuple[str, list[str]]:
+    """Free a conversation's mirror LOCATION and shape the unlink reply.
+
+    The in-channel unlink shared by the DM dispatchers. Key-addressed clears
+    only reach rows spelled with the CURRENT session key, but the bindings
+    that block a session resume at this conversation are matched by location
+    value — a mirror row stranded under a rotated DM generation, or a
+    dashboard session mirroring into the conversation, occupies the location
+    while being unreachable by any spelling of *key*. Unlink means "nothing
+    mirrors into this conversation": clear the conversation's own binding
+    (current + legacy spelling), then sweep every binding targeting the exact
+    *location*, so ✅ is only reported when the conversation is actually free.
+
+    A swept key can belong to ANOTHER (dashboard) session — a cross-session
+    write triggered by a one-word channel command — so the sweep is INFO-logged
+    and the reply reports the count when more than one binding fell, rather
+    than a bare ✅ that reads as "just yours".
+
+    Returns ``(reply_text, swept_keys)``. A non-empty sweep is the caller's
+    cue to refresh any dashboard projection of the cleared bindings.
+    """
+    cleared = int(sessions.clear_mirror_link(key))
+    cleared += int(sessions.clear_mirror_link(legacy_dashboard_mirror_key(key)))
+    swept = sessions.clear_mirror_links_at(location)
+    if swept:
+        logger.info(
+            "%s: unlink swept %d mirror binding(s) at this conversation: %s",
+            channel,
+            len(swept),
+            ", ".join(swept),
+        )
+    cleared += len(swept)
+    if cleared > 1:
+        return f"✅ Unlinked ({cleared} bindings).", swept
+    if cleared == 1:
+        return "✅ Unlinked.", swept
+    return "This conversation wasn't linked.", swept
 
 
 def seed_generation(

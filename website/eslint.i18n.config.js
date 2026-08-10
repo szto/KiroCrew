@@ -54,6 +54,12 @@ export default [
       // reports at the whole node — but these quasis are ordinary English sentences, so
       // no regex covers them without also exempting genuine UI copy.
       'src/**/*.prompt.ts',
+      // Color paint plumbing for the sidebar folder glyph: every string is a
+      // CSS value template (color-mix over theme variables), never
+      // user-visible copy. Same named-boundary idiom as `*.prompt.ts` above —
+      // the module may contain ONLY paint data, so the filename IS the
+      // boundary and its consumer (FolderGlyph.tsx) stays fully covered.
+      'src/components/folderColorPaint.ts',
       // Generated and data-only.
       'src/i18n/locales/**',
       // Generated sources: the copy's real home is the panel that declares the
@@ -93,6 +99,30 @@ export default [
       // false positive it fixes. A path this narrow cannot exempt a future file
       // that does hold copy.
       'src/apps/meetings/lib/sketchSrcdoc.ts',
+      // The widget and MCP-app srcdoc builders — the same category as
+      // `sketchSrcdoc.ts` directly above, and listed by the same exact-path rule
+      // rather than a shared `*Srcdoc.ts` glob. Every literal in both is handed to
+      // a PARSER: CSP directives, a DOCTYPE, `<meta>`/`<style>`/`<script>` markup,
+      // the frame's own reset CSS, and two fixed JS bootstraps (the height reporter
+      // and the nav beacon). Translating any of them would not change a word anyone
+      // reads — it would break the policy or blank the frame.
+      //
+      // Verified copy-free rather than assumed: neither module imports `i18nT` /
+      // `useTranslation`, neither renders a text node, and their exports are pure
+      // builders. The consumers that DO show copy (`WidgetFrame.tsx`, the MCP app
+      // host) stay fully gated.
+      //
+      // Two exact paths, not a content regex. The `^(default|script|img|…)-src\b`
+      // exclusion that the `sketchSrcdoc.ts` note above records as tried-and-rejected
+      // is exactly what would cover these, and it leaked into unrelated files; a
+      // measured `^rgba?\(` variant leaked into `apps/issue-radar/lib/format.ts`.
+      // A path this narrow cannot leak.
+      //
+      // Stated as a false-negative class, per this file's convention: any
+      // user-visible copy ever added to these two paths will not be reported —
+      // keep both modules parser-facing only.
+      'src/lib/widgetSrcdoc.ts',
+      'src/lib/mcpAppSrcdoc.ts',
       // The PPTX Maker board-preview builder — the same category as
       // `sketchSrcdoc.ts` directly above, and listed by the same exact-path rule
       // rather than a shared glob. Every literal in it is handed to a PARSER: the
@@ -111,6 +141,11 @@ export default [
       // user-visible copy ever added to THIS path will not be reported — keep the
       // module parser-facing only.
       'src/apps/pptx-maker/lib.ts',
+      // Emits runnable shell text, not copy: the output is pasted into a terminal
+      // and executed, so translating a `curl` invocation, an `openssl` flag or a
+      // header name would produce a snippet that fails. Exempted by exact path;
+      // the Webhooks page itself remains fully gated.
+      'src/pages/webhooks/requestExamples.ts',
       // Model-facing, not user-facing: `planningInstructionForMode` returns the
       // behaviour instruction embedded in the pet's planning PROMPT. Translating it
       // would send the agent a localized instruction while the rest of its prompt
@@ -133,6 +168,39 @@ export default [
       'src/apps/mochi/src/shared/shortcut.ts',
       // CSS text injected through <style>; a stylesheet is not translatable copy.
       'src/apps/spec-builder/inlineStyles.ts',
+      // The theme stylesheet builders, extracted out of `hooks/useTheme.tsx` so
+      // they COULD be exempted by path. Every literal in the module is handed to
+      // the CSS parser: the `--*` custom-property allowlist, the
+      // `[data-theme="custom-<slug>-<mode>"]` selectors, the static font/radius/
+      // color-scheme defaults, `@font-face` blocks, and the `url()` values the
+      // overrides-pipeline rewrites to pack asset routes. Translating any of them
+      // would not change a word anyone reads — it would unstyle the theme or
+      // silently weaken the §4.2/§5.1 selector scoper.
+      //
+      // Verified copy-free rather than assumed, and by a MECHANICAL boundary
+      // rather than a reading: the module imports no `i18nT` / `useTranslation`,
+      // and it does not touch the DOM at all — every export is data in, CSS
+      // `string` out. The `<style>` tags, `document.head` writes and
+      // `style.setProperty` calls all stayed in `useTheme.tsx`, so nothing here
+      // has a path to the screen.
+      //
+      // This split is the whole reason a path exemption is admissible here.
+      // `useTheme.tsx` also declares `THEMES` — 19 theme-picker display names —
+      // so exempting THAT file would hand back real copy, which is what the
+      // `object-properties: next` note above refuses. Extracting the CSS leaves
+      // the 19 names in a still-gated file. Measured: `useTheme.tsx` 34 -> 17
+      // (exactly the 17 CSS findings), the new module contributes 0, and no other
+      // file's count moves.
+      //
+      // Stated as a false-negative class, per this file's convention: any
+      // user-visible copy ever added to THIS path will not be reported — keep the
+      // module parser-facing only, and keep it DOM-free, which is the property
+      // that makes that easy to check.
+      'src/hooks/themeCss.ts',
+      // Same rationale, different convention: this app keeps its seed prompts in a
+      // dedicated `lib/prompts.ts` rather than a `*Prompt.ts` file. Also prompt
+      // payload sent over the wire, never rendered.
+      'src/apps/*/lib/prompts.ts',
     ],
     linterOptions: {
       // Every `eslint-disable` comment in this codebase targets the MAIN config's
@@ -180,6 +248,62 @@ export default [
           // Content-based exemptions, applied wherever the string appears.
           words: {
             exclude: [
+              // CSS transform functions built from numbers, e.g.
+              // `translate(${x}px, ${y}px)` or `rotate(${deg}deg)`. These are style
+              // values written into el.style.transform, not copy.
+              // NOTE the safer alternative was preferred first — moving the value into a
+              // stylesheet — and it is used everywhere it can be. It cannot be used for
+              // per-frame animation, where the numbers come from a rAF loop and no
+              // stylesheet can express them.
+              //
+              // FULL-STRING, not a prefix: the plugin compiles each entry with
+              // `generateFullMatchRegExp`, which appends `$`. Written as a prefix this
+              // matched only the bare `translate(` and exempted nothing else — the exact
+              // trap `i18nLintExemptions.test.ts` was written to catch. Interpolation
+              // splits one template into several literals, so the shapes that must match
+              // are `scale(`, `translate(-50%, -50%) translate(`, `px) scale(`, `px, `
+              // and `)`: a run of transform function names, CSS units, digits and
+              // punctuation, and nothing else. Any other letter makes it prose again, so
+              // real copy ('Preview (', 'Rotate the image') is still reported.
+              String.raw`^(?:(?:translate|translateX|translateY|rotate|scale|scaleX|scaleY|matrix)\(|px|deg|[-\d.%,\s()])+$`,
+
+              // A URL query built from an already-encoded value, e.g.
+              // `${PATH}?id=${encodeURIComponent(x)}`. A request path is a server
+              // contract; translating it would 404. Full-string for the same reason as
+              // above; the literals that reach the linter here are `?id=`, `?since=`
+              // and `&v=`.
+              //
+              // The leading character is `[?&]`, not `?` alone: a CONTINUATION
+              // parameter is exactly the same server contract as the first one, and a
+              // URL carrying two parameters has to spell one of them with `&`. The
+              // shape stays just as tight — prose takes neither a leading `?`/`&` nor
+              // a trailing `=`, so this still reports real copy.
+              String.raw`^[?&][a-z_]+=$`,
+
+              // A catalog KEY assembled at runtime, e.g.
+              // `apps.crewCompanion.state.${slot}`. Translating a key would break the
+              // lookup it performs — the value it resolves to is what gets translated.
+              String.raw`^apps\.[A-Za-z]+\.[A-Za-z]+\.$`,
+
+              // MIME type lists for a file picker's `accept`, e.g.
+              // 'application/json,.json' or 'image/png,image/webp,.png'. These are a
+              // browser API contract, not copy: translating one silently stops the
+              // picker matching any file. Shape: a slash-bearing type or a dot-extension,
+              // in a comma-separated list, with no spaces — which prose never has.
+              String.raw`^(?:[a-z]+\/[a-z0-9.+*-]+|\.[a-z0-9]+)(?:,(?:[a-z]+\/[a-z0-9.+*-]+|\.[a-z0-9]+))*$`,
+
+              // `window.open` feature strings. 'noopener,noreferrer' is a SECURITY
+              // argument — translating it would drop the protection that stops the opened
+              // page reaching back through window.opener. Same shape rule as above would
+              // not catch it (no slash, no dot), so it is named explicitly.
+              String.raw`^(?:noopener|noreferrer|_blank|_self)(?:,(?:noopener|noreferrer))*$`,
+
+              // Identifier PREFIXES that get concatenated with an index to form a slot
+              // id, e.g. 'extra_load_' + i. Snake_case with a trailing underscore is a
+              // shape UI copy never takes, and translating it would rename the slot and
+              // orphan the art already stored under the old id.
+              String.raw`^[a-z][a-z0-9]*(?:_[a-z0-9]+)*_$`,
+
               // Tailwind and CSS: class strings are the single largest false-positive
               // source under `mode: 'all'`.
               //
@@ -272,6 +396,17 @@ export default [
               // debt on the keys that predate this entry, instead of leaving each
               // one to a per-file ceiling that hides it.
               '^mc:[A-Za-z0-9:._-]+$',
+              // The COMPANION's own browser-storage prefix, `cc:` — e.g.
+              // `cc:pendingCursor`, `cc:lastStats`. Exactly the `mc:` case above, for
+              // the app's own namespace: these live at module level under an ALL-CAPS
+              // name, which is where `i18n-strict` looks inside, and the camelCase
+              // pattern cannot reach them because it forbids the colon.
+              //
+              // A separate entry rather than widening the `mc:` one to any prefix: a
+              // generic "word, colon, no spaces" shape would start exempting real copy
+              // the moment a label contains a colon, which several already do
+              // ("Missing:", "Preset name:").
+              '^cc:[A-Za-z0-9:._-]+$',
               '^[\\w.-]+/[\\w./-]*$',
               // EVERY PATTERN IN THIS FILE IS MATCHED FULL-STRING, so a prefix
               // pattern MUST spell out its own tail. `eslint-plugin-i18next` compiles
@@ -298,6 +433,29 @@ export default [
               // slash-prefixed string (`'/Delete'`) is exempt.
               '^https?://\\S*$',
               '^[.~]?/\\S*$',
+              // A GATEWAY WIRE MARKER, e.g. `[Tool refusal — automatic recovery]` or
+              // `[Continue — requested by the user]`. These are matched with
+              // `startsWith` against gateway-authored transcript rows and must stay
+              // BYTE-IDENTICAL to the Python constants in
+              // `src/kiro_crew/dashboard/state.py`; the matched prefix is then SLICED
+              // OFF, so no character of it ever reaches the screen — the card's visible
+              // copy comes from `i18nT()`. Translating one would silently stop every
+              // recovery card from rendering in that locale, which is the failure this
+              // exemption exists to prevent: without it the gate pushes a contributor
+              // toward "fixing" a wire value by translating it.
+              //
+              // Narrow by SHAPE, not by file: bracket-delimited end to end, and it must
+              // carry a spaced em dash. UI copy is neither bracketed nor em-dash-joined,
+              // and the bracketed CSS attribute selector covered above has no em dash.
+              '^\\[[A-Za-z][A-Za-z0-9 ]* — [A-Za-z0-9 ]+\\]$',
+              // The same class of wire marker without an em dash. ENUMERATED, not
+              // shaped: the thing this protects is a small closed set of named
+              // constants, and a shape like "bracketed capitalized words" would
+              // also exempt a future hardcoded placeholder (`[No results found]`),
+              // shipping it untranslated to every locale without tripping the
+              // gate. Adding a marker here is a deliberate one-line act, which is
+              // the right cost for adding one to the wire protocol.
+              '^\\[(Subagent|Subagent batch|Workflow) completion event\\]$',
               // NOTE ON SHAPE: the plugin wraps every pattern as `^<pattern>$`
               // (`generateFullMatchRegExp`), so a pattern must describe the WHOLE
               // string. A prefix-only pattern like `^data:` becomes `^^data:$` and can
@@ -382,6 +540,22 @@ export default [
               // presses, so translating it would mislabel their keyboard. Anchored and
               // enumerated, not a pattern: ordinary copy cannot match it.
               '^(Ctrl|Alt|Shift|Cmd|Win)$',
+              // Wire-protocol marker, not copy: the backend stamps `QUEUED:<fp>` onto a
+              // `pr` value that was queued rather than drafted
+              // (`spine/profile.py`: `return f"QUEUED:{fingerprint}"`), and the client only
+              // ever `startsWith()`-matches it. Translating it would break the match — the
+              // string is compared, never shown. Anchored with the colon so it cannot
+              // swallow the word "queued" used as prose.
+              '^QUEUED:$',
+              // Persisted IDENTITY, not copy: this prefix builds the chat-folder NAME that
+              // is also the lookup key (`folders.find(f => f.name === name)`, because there
+              // is no upsert endpoint). Translating it would make a language switch fail to
+              // find the existing folder and silently create a second one per language,
+              // orphaning every prior session. Anchored WITHOUT the trailing space: the
+              // plugin trims the literal before matching (`no-literal-string.js`: `const
+              // trimed = value.trim()`), so a pattern that requires the space can never
+              // match. Verified — the space-bearing version left the warning in place.
+              '^Auto-Improve -$',
             ],
           },
 
@@ -390,6 +564,21 @@ export default [
             exclude: [
               // Diagnostics and dev-only output.
               '^console\\.\\w+$', '^(Type)?Error$', '^URL(SearchParams)?$',
+              // `popoutController.ts`'s two console shims: `logDebug` is
+              // `console.debug` and `logWarn` is `console.warn`, both behind a debug
+              // flag. Identical class to `^console\.\w+$` one line up — the argument
+              // is operator diagnostics ("direct focus of … vetoed"), never a string
+              // the UI renders.
+              //
+              // A CALLEE exemption and deliberately NOT a whole-file one: the module
+              // also raises a `window.alert(i18nT(…))`, so releasing the file would
+              // release a module that does render copy — it would fail the
+              // "verified copy-free" standard the exact-path precedents above meet.
+              //
+              // Known false negative, stated: a future `logDebug`/`logWarn` defined
+              // in another module inherits this. Both names exist in exactly one
+              // module today (`src/utils/popoutController.ts`).
+              '^log(Debug|Warn)$',
               // Validator diagnostics, for parity with `Error` above. A rejected input's
               // reason names the FIELD that failed (`Missing or invalid "meta" field`,
               // `Invalid meta.format: "…" (expected "svg", "lottie", or "sprite")`) and
@@ -431,6 +620,10 @@ export default [
               // same class as `fetch` directly above. Uniquely named so the
               // exclusion cannot mask a `call(...)`/`vq(...)` callee elsewhere.
               '^mdnbCall$', '^mdnbVaultQuery$',
+              // App-local request helpers. Their first argument is an endpoint path
+              // (often a template literal carrying a query string), which is the
+              // same machine value `fetch` above is excluded for.
+              '^(get|send)JSON$',
               'setAttribute', 'getAttribute', 'removeAttribute', 'classList\\.\\w+',
               // STRING COMPARISON. The argument is the value being compared AGAINST,
               // so that call cannot render it — the same reason the plugin already
@@ -490,6 +683,10 @@ export default [
               // Icon component factory: the string argument is a React DevTools
               // displayName, not user-visible copy.
               '^makePanelIcon$',
+              // Built-in surface fallback labels and group buckets are registry
+              // machine values. The helper is deliberately explicit and narrow;
+              // rendered badgeLabel/activityLabel strings never pass through it.
+              '^surfaceMachineValue$',
               // A per-app `request` wrapper takes an ENDPOINT PATH — the same class as
               // the `fetch` exclusion above, and the only thing standing between a
               // route string and the fetch it performs. Anchored, so it cannot match a
@@ -623,6 +820,72 @@ export default [
   // `object-properties: next` exclusion above refuses. See the module's own header.
   {
     files: ['src/apps/issue-radar/lib/wireValues.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // PROTOCOL KEY NAMES ONLY, same category as `wireValues.ts` above: this module's
+  // entire contents are the two spellings of kiro-cli's reserved tool-purpose
+  // ARGUMENT NAME (`__tool_use_purpose` and the camelCased echo) plus the regex that
+  // recognizes paraphrases of it. Each is compared by value against a key that
+  // arrives on the wire, so translating one silently stops matching and the tool
+  // pill falls back to raw command text in that locale — the exact defect the module
+  // exists to fix.
+  //
+  // The module has no path to user-visible copy of its own: it reads a string OUT of
+  // a payload and returns it verbatim. That returned string is model-authored prose,
+  // not interface copy, and is guarded at RENDER time against the active UI language
+  // by `utils/toolLabel.ts` instead.
+  //
+  // Scoped to this one file for the reason the three exemptions above are: a shape
+  // rule cannot express "reserved argument names, but only in this module". The
+  // dunder prefix looks like a self-anchoring shape, but admitting literals by it
+  // would also release every `__proto__` / `__dirname` guard string elsewhere in the
+  // tree from the gate.
+  {
+    files: ['src/utils/toolPurpose.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // A GLSL-ONLY module: two shader programs (`VERT`, `FRAG`) as template literals,
+  // plus CSS custom-property token names and Tailwind classes. The component
+  // renders exactly one `<canvas aria-hidden="true">` and no text node, so it has
+  // no path to user-visible copy at all.
+  //
+  // A `words.exclude` shape rule was tried first and cannot do this job: WebGL2
+  // makes `#version 300 es` the mandatory first line, so `'#version [\\s\\S]*$'`
+  // looks like a precise, self-anchoring shape — but upstream validates a template
+  // literal QUASI BY QUASI (`no-literal-string.js` -> `TemplateLiteral`), and this
+  // shader interpolates its loop bounds (`uColors[${MAX_COLORS}]`,
+  // `i < ${MAX_STRANDS}`). Only the first chunk carries the version pragma; every
+  // chunk after an interpolation starts mid-program, so the pattern exempts the
+  // first and reports the second. Widening it to "C-like punctuation" would exempt
+  // any prose carrying braces and semicolons.
+  //
+  // Scoped to this one file for the same reason as `styles.ts` above: a shape rule
+  // cannot express "GLSL, but only in this module". Keep this module shader-only —
+  // any copy later added here belongs in the catalog, not behind this exemption.
+  {
+    files: ['src/components/Strands.tsx'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // SEARCH-KEYWORD SYNONYMS ONLY: a manual overlay of extra query terms merged
+  // into the Settings search corpus so a query like "dark mode" finds a setting
+  // whose label does not contain those words. Every value is a term matched
+  // against the user's typed query, never rendered — translating one would break
+  // the match in that locale while adding catalog noise for a word the user
+  // typed in their own language anyway. The keys are setting ids (enforced by
+  // settingsKeywords.test.ts). Scoped to this one file for the same reason as the
+  // modules above: a shape rule cannot express "search synonyms, but only here",
+  // and any real copy later added elsewhere still belongs in the catalog.
+  {
+    files: ['src/components/commandPalette/settingsKeywords.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

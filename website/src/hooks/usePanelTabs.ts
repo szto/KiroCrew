@@ -38,6 +38,20 @@ export interface PanelTab {
   /** Last selected working-tree diff view for file tabs. Persisted with the
    *  tab so leaving and returning to a chat does not re-enable auto-diff. */
   diffMode?: boolean
+  /**
+   * A source line — or line RANGE — the panel should scroll to and flash, set
+   * when the tab is opened from a `file.py:447` or `file.md:10-16` reference.
+   * `endLine` is absent for a single-line citation.
+   *
+   * The `nonce` is what makes a repeat request act: re-clicking the same chip
+   * produces the same `line`, which as a bare number would be `===` to the
+   * previous value and re-trigger nothing.
+   *
+   * TRANSIENT — deliberately stripped in `serializeBucket`. A persisted line
+   * would re-fire the jump on every page reload, days later, at a line number
+   * the file may have long since outgrown.
+   */
+  revealLine?: { line: number; endLine?: number; nonce: number }
   artifactSlug?: string
   artifactKind?: Artifact['kind']
   // ── MCP App fields ──
@@ -138,6 +152,12 @@ export const MAX_APP_TABS_PER_CHAT = 3
 /** Max concurrent terminal tabs per chat (each is a live PTY). At the cap,
  *  openTerminal focuses/reuses the most-recent terminal instead of spawning. */
 export const MAX_TERMINALS_PER_CHAT = 4
+
+/** Monotonic id for reveal requests — see `PanelTab.revealLine`. Module-level so
+ *  it is unique across slots and across tab identities, which is all the
+ *  consumer's effect needs to tell one request from the next. */
+let revealSeq = 0
+const nextRevealNonce = (): number => ++revealSeq
 
 /** Last path segment. Trailing slashes are stripped first: '/a/b/'.split('/')
  *  ends in '' which is falsy, so the naive form would fall back to the whole
@@ -265,6 +285,10 @@ export function useAnyLiveAppTab(): boolean {
 }
 function getSnapshot(): BySlot { return store }
 
+/** Bucket key for "tabs opened while no chat is active". */
+const NO_SLOT_KEY = '__no_slot__'
+const bucketKey = (slotKey: string | null): string => slotKey ?? NO_SLOT_KEY
+
 /** Apply a transform to one slot's bucket, publish the new store, and persist.
  *  A new top-level object is created only on real change so useSyncExternalStore
  *  consumers re-render exactly when their store reference changes. */
@@ -275,6 +299,43 @@ function mutateSlot(key: string, fn: (b: Bucket) => Bucket): void {
   store = { ...store, [key]: nextBucket }
   for (const cb of listeners) cb()
   schedulePersist(key)
+}
+
+/** Add tab if its id is absent, otherwise merge patch into the existing tab;
+ *  either way focus it. When `replaceId` is given (e.g. a file opened FROM the
+ *  Files tab replaces that Files tab), the new tab takes the replaced tab's
+ *  strip position; if the new tab already exists elsewhere, the replaced tab is
+ *  simply closed.
+ *
+ *  Module-level (not a hook callback) because two callers need it: the bound
+ *  `upsert` below, and `openPanelView`, which addresses a slot EXPLICITLY. */
+function upsertInBucket(b: Bucket, tab: PanelTab, replaceId?: string): Bucket {
+  const i = b.tabs.findIndex(t => t.id === tab.id)
+  if (i !== -1) {
+    const next = b.tabs.slice()
+    next[i] = { ...next[i], ...tab }
+    return { tabs: replaceId && replaceId !== tab.id ? next.filter(t => t.id !== replaceId) : next, activeId: tab.id }
+  }
+  if (replaceId) {
+    const r = b.tabs.findIndex(t => t.id === replaceId)
+    if (r !== -1) {
+      const next = b.tabs.slice()
+      next[r] = tab
+      return { tabs: next, activeId: tab.id }
+    }
+  }
+  return { tabs: [...b.tabs, tab], activeId: tab.id }
+}
+
+/** Open (and focus) a singleton view tab in a SPECIFIC slot's strip, with no
+ *  hook binding.
+ *
+ *  The sidebar asks for a panel view on a chat that is not active yet — clicking
+ *  a session row's PR chip switches sessions and opens Changes in one gesture.
+ *  `usePanelTabs` is bound to whichever slot was active when it rendered, so
+ *  going through `openView` there would open the tab on the chat being LEFT. */
+export function openPanelView(slotKey: string | null, kind: ViewKind): void {
+  mutateSlot(bucketKey(slotKey), b => upsertInBucket(b, { id: kind, kind, title: viewTitle(kind) }))
 }
 
 /** Strip heavy bodies (file/diff/artifact content) before persisting — those
@@ -293,7 +354,7 @@ function mutateSlot(key: string, fn: (b: Bucket) => Bucket): void {
 function serializeBucket(b: Bucket): string {
   const tabs = b.tabs
     .filter(t => t.kind !== 'diff' && t.kind !== 'app')
-    .map(t => { const copy = { ...t }; delete copy.content; return copy })
+    .map(t => { const copy = { ...t }; delete copy.content; delete copy.revealLine; return copy })
   // If the focused tab was a dropped diff/app tab, refocus a surviving tab.
   const activeId = tabs.some(t => t.id === b.activeId)
     ? b.activeId
@@ -384,7 +445,7 @@ export function __resetPanelTabs(): void {
  * consumer after a reload (ChatPage's cold-tab hydration effect).
  */
 export function usePanelTabs(slotKey: string | null = null) {
-  const key = slotKey ?? '__no_slot__'
+  const key = bucketKey(slotKey)
   const bySlot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
   const { tabs: storedTabs, activeId } = bySlot[key] ?? EMPTY_BUCKET
   // View-tab labels are re-resolved from `kind` on every read so the strip is in
@@ -403,23 +464,7 @@ export function usePanelTabs(slotKey: string | null = null) {
    *  tab's strip position; if the new tab already exists elsewhere, the
    *  replaced tab is simply closed. */
   const upsert = useCallback((tab: PanelTab, replaceId?: string) => {
-    update(b => {
-      const i = b.tabs.findIndex(t => t.id === tab.id)
-      if (i !== -1) {
-        const next = b.tabs.slice()
-        next[i] = { ...next[i], ...tab }
-        return { tabs: replaceId && replaceId !== tab.id ? next.filter(t => t.id !== replaceId) : next, activeId: tab.id }
-      }
-      if (replaceId) {
-        const r = b.tabs.findIndex(t => t.id === replaceId)
-        if (r !== -1) {
-          const next = b.tabs.slice()
-          next[r] = tab
-          return { tabs: next, activeId: tab.id }
-        }
-      }
-      return { tabs: [...b.tabs, tab], activeId: tab.id }
-    })
+    update(b => upsertInBucket(b, tab, replaceId))
   }, [update])
 
   const openView = useCallback((kind: ViewKind) => {
@@ -452,12 +497,20 @@ export function usePanelTabs(slotKey: string | null = null) {
     })
   }, [update])
 
-  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string }) => {
-    upsert({ id: `file:${path}`, kind: 'file', title: basename(path), path, content, slot }, opts?.replaceId)
+  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number }) => {
+    // `revealLine` is always present in the object, `undefined` when absent:
+    // `upsert` merges onto an existing tab with a spread, which only overwrites
+    // keys the incoming object HAS. Omitting it would leave a previous chip's
+    // line on the tab, so a later plain click on the same file would re-jump to
+    // a line the user did not ask for.
+    upsert({
+      id: `file:${path}`, kind: 'file', title: basename(path), path, content, slot,
+      revealLine: opts?.line != null ? { line: opts.line, endLine: opts.endLine, nonce: nextRevealNonce() } : undefined,
+    }, opts?.replaceId)
   }, [upsert])
 
   const openDiff = useCallback((path: string, modified: string, original = '') => {
-    upsert({ id: `diff:${path}`, kind: 'diff', title: `${basename(path)} - Diff`, path, modified, original })
+    upsert({ id: `diff:${path}`, kind: 'diff', title: i18nT('hooks.usePanelTabs.diff', { name: basename(path) }), path, modified, original })
   }, [upsert])
 
   /** Open a directory listing as its own tab. Keyed `folder:${path}` so a

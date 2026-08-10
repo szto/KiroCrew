@@ -1,11 +1,12 @@
-import { useEffect, useRef, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
   ArrowRight,
+  Check,
   CheckCircle2,
+  Copy,
   ExternalLink,
-  Loader2,
   LogIn,
   Package,
   RefreshCw,
@@ -23,6 +24,7 @@ import {
   ShellAside,
 } from './OnboardingChapterShell'
 import { safeGetItem, safeSetItem } from '../utils/safeStorage'
+import { copyToClipboard } from '../utils/clipboard'
 import { Badge, Btn, Card, SendBtn } from './ui'
 
 import { i18nT } from '../i18n/t'
@@ -31,40 +33,33 @@ const QUERY_KEY = ['kiro-prerequisite'] as const
 export function kiroPrerequisiteRefetchInterval(
   status: KiroPrerequisiteStatus | undefined,
 ): number | false {
-  if (status?.operation.status === 'running') return 1_000
   if (status?.ready) return 30_000
   if (status && status.setup_allowed === false) return 3_000
+  if (kiroPrerequisiteIsBlocking(status)) return 5_000
   return 30_000
 }
 
-function trustedLoginUrl(value: string): string | null {
-  if (!value || value.includes('\\')) return null
-  for (const character of value) {
-    const code = character.charCodeAt(0)
-    if (code < 32 || code === 127) return null
-  }
-  try {
-    const parsed = new URL(value)
-    const host = parsed.hostname.toLowerCase()
-    const trustedPath = host === 'app.kiro.dev'
-      || (host === 'view.awsapps.com'
-        && (parsed.pathname === '/start' || parsed.pathname.startsWith('/start/')))
-    if (
-      parsed.protocol !== 'https:'
-      || (parsed.port !== '' && parsed.port !== '443')
-      || parsed.username !== ''
-      || parsed.password !== ''
-      || !trustedPath
-    ) {
-      return null
-    }
-    return parsed.href
-  } catch {
-    return null
-  }
+// True while the full-screen first-run gate is the only thing the user can see.
+// Two behaviors key off it: the faster poll above, and forcing that poll to probe
+// the HOST rather than read the boot-time latch.
+//
+// Forcing matters because Kiro Crew no longer performs setup — the user installs
+// Kiro CLI from kiro.dev and may sign in from a terminal. Neither of those
+// touches the gateway, and the latched status is refreshed only at boot or on an
+// explicit request, so a latch-reading poll can never observe them and the gate
+// would hold forever behind a Check again button. Bounded deliberately: it costs
+// two short `kiro-cli` spawns per interval, runs ONLY on this blocking screen,
+// and stops the moment `ready` flips. A returning user never reaches it.
+export function kiroPrerequisiteIsBlocking(
+  status: KiroPrerequisiteStatus | undefined,
+): boolean {
+  if (!status || status.ready) return false
+  // A non-owner cannot probe and is shown the "owner must finish setup" screen.
+  if (status.setup_allowed === false) return false
+  return !status.initial_setup_complete
 }
 
-// Gateway error strings arrive unpunctuated ("Token required"), and the gate
+
 // renders them as the first sentence of a paragraph — terminate them so the
 // next sentence does not read as one run-on line.
 export function asSentence(message: string): string {
@@ -81,11 +76,16 @@ export function asSentence(message: string): string {
 // region for assistive tech.
 function SetupShell({
   children,
+  footer,
   cardLabel,
   asideHeadline,
   asideBody,
 }: {
   children: ReactNode
+  // Rendered OUTSIDE the scroll region, so a state whose content overflows the
+  // fixed panel height still shows its closure action whole. A half-clipped
+  // primary button reads as a rendering defect rather than a scroll affordance.
+  footer?: ReactNode
   cardLabel?: string
   // The default aside says "Install Kiro CLI, sign in once…", which contradicts
   // a state whose headline is "already installed" and which deliberately offers
@@ -119,6 +119,9 @@ function SetupShell({
           <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
             <div className="my-auto w-full px-6 py-8 sm:px-10 sm:py-10">{children}</div>
           </div>
+          {footer ? (
+            <div className="shrink-0 border-t border-border px-6 py-4 sm:px-10">{footer}</div>
+          ) : null}
         </section>
       </div>
     </main>
@@ -138,45 +141,6 @@ function StepStatus({
   return <Badge variant={current ? 'aim' : 'muted'}>{current ? i18nT('components.kiroPrerequisiteGate.required') : i18nT('components.kiroPrerequisiteGate.waiting')}</Badge>
 }
 
-function OperationProgress({ status }: { status: KiroPrerequisiteStatus }) {
-  const operation = status.operation
-  if (operation.status === 'idle' && !operation.message) return null
-  const isRunning = operation.status === 'running'
-  const isFailure = operation.status === 'failed'
-  const loginUrl = trustedLoginUrl(operation.url)
-
-  return (
-    <div
-      className={`mt-4 rounded-lg border p-3 ${
-        isFailure
-          ? 'border-danger/20 bg-danger/10'
-          : 'border-border bg-bg-elevated'
-      }`}
-      aria-live="polite"
-    >
-      <div className={`flex items-center gap-2 text-sm ${isFailure ? 'text-danger' : 'text-text'}`}>
-        {isRunning && <Loader2 className="lucide-inline animate-spin" />}
-        {isFailure && <AlertTriangle className="lucide-inline" />}
-        <span>{operation.error || operation.message}</span>
-      </div>
-      {loginUrl && (
-        <a
-          className="mt-3 inline-flex items-center gap-1.5 text-[13px] font-medium text-accent hover:underline focus-ring"
-          href={loginUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          {i18nT('components.kiroPrerequisiteGate.open_kiro_sign_in_page')} <ExternalLink className="lucide-inline" />
-        </a>
-      )}
-      {operation.detail && (
-        <pre className="mt-3 max-h-36 overflow-auto whitespace-pre-wrap break-words rounded-md bg-bg p-3 font-mono text-[12px] leading-relaxed text-muted">
-          {operation.detail}
-        </pre>
-      )}
-    </div>
-  )
-}
 
 function OwnerSetupRequired({
   retrying,
@@ -258,14 +222,192 @@ function SetupStatusError({
   )
 }
 
+// Docs section that explains every user-namespace denial mechanism and the
+// AppArmor profile `service install` writes. Linked from the gate so the screen
+// is a starting point rather than a dead end (issue #1660).
+const SANDBOX_DOCS_URL =
+  'https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/install.md' +
+  '#linux-the-agent-sandbox-and-unprivileged-user-namespaces'
+
+/**
+ * A shell command rendered as a click-to-copy block.
+ *
+ * The whole block is the target rather than a small trailing glyph: this command
+ * has to be retyped on the gateway host, and one typo restarts the loop the user
+ * is already stuck in. The glyph stays faintly visible instead of appearing only
+ * on hover, because a recovery screen is the wrong place to hide an affordance.
+ *
+ * The text is read back out of the DOM rather than taken as a prop. A command is
+ * not translatable copy, and the i18n gate's exemption covers a literal that is
+ * lexically a child of `code`/`pre` — passing it as `command="..."` would make it
+ * a JSX attribute string and trip the zero-tolerance [added-lines] check.
+ */
+function CopyCommand({ children }: { children: ReactNode }) {
+  const hostRef = useRef<HTMLSpanElement>(null)
+  const [copied, setCopied] = useState(false)
+  const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(
+    () => () => {
+      if (resetTimer.current) clearTimeout(resetTimer.current)
+    },
+    [],
+  )
+  const handleCopy = async () => {
+    const text = hostRef.current?.textContent?.trim() ?? ''
+    if (!text) return
+    try {
+      await copyToClipboard(text)
+    } catch {
+      // Both clipboard paths failed (no clipboard API, execCommand denied):
+      // leave the glyph alone rather than announcing a copy that did not happen.
+      return
+    }
+    setCopied(true)
+    if (resetTimer.current) clearTimeout(resetTimer.current)
+    resetTimer.current = setTimeout(() => setCopied(false), 1500)
+  }
+  const label = copied
+    ? i18nT('components.kiroPrerequisiteGate.copied')
+    : i18nT('components.kiroPrerequisiteGate.copy_command')
+  return (
+    <button
+      type="button"
+      onClick={handleCopy}
+      aria-label={label}
+      title={label}
+      className="group/cmd mt-1 flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg border-none bg-surface-2 px-2 py-1.5 text-left hover:bg-bg-hover focus-ring"
+    >
+      <span
+        ref={hostRef}
+        className="min-w-0 overflow-x-auto text-xs text-text-strong [&_code]:font-mono"
+      >
+        {children}
+      </span>
+      {copied ? (
+        <Check className="lucide-inline shrink-0 text-ok" />
+      ) : (
+        <Copy className="lucide-inline shrink-0 text-muted opacity-50 transition-opacity group-hover/cmd:opacity-100" />
+      )}
+    </button>
+  )
+}
+
+/**
+ * The remedy for one `sandbox_remedy` token.
+ *
+ * The backend probe knows WHICH unshare step failed and with which errno, and
+ * those identify the host mechanism — so the gate can name the actual fix
+ * instead of showing `errno 1 (EPERM)` and a retry button. An unrecognised or
+ * empty token renders nothing, and the screen falls back to the doctor
+ * pointer, which is still strictly more than the bare errno it replaced.
+ *
+ * Exactly ONE command per mechanism, deliberately. The AppArmor case previously
+ * also offered `aa-exec -p kirocrew-userns` for a hand-started gateway, which is
+ * worse than no advice: entering a named profile is not permitted for an
+ * unconfined user, and `aa-exec` execs the command anyway instead of failing, so
+ * the user gets a remedy that looks applied and changes nothing. The profile is
+ * attached by systemd (`AppArmorProfile=`), so installing the service is the
+ * only path that actually applies it — and the desktop app reuses an existing
+ * gateway on the port, so the service covers that install too.
+ *
+ * Each command sits directly inside a `<pre>` rather than in a data structure:
+ * a shell command is not copy, and `pre` is the i18n gate's documented
+ * exemption for a literal that must not be translated.
+ */
+function remedySteps(remedy: string): React.ReactNode {
+  switch (remedy) {
+    case 'apparmor_userns':
+      return (
+        <ul className="mt-2 list-none space-y-3">
+          <li className="text-sm leading-relaxed text-muted">
+            {i18nT('components.kiroPrerequisiteGate.remedy_apparmor_service_install')}
+            <CopyCommand>
+              <code>kirocrew service install</code>
+            </CopyCommand>
+          </li>
+        </ul>
+      )
+    case 'max_user_namespaces':
+      return (
+        <ul className="mt-2 list-none space-y-3">
+          <li className="text-sm leading-relaxed text-muted">
+            {i18nT('components.kiroPrerequisiteGate.remedy_max_user_namespaces')}
+            <CopyCommand>
+              <code>sudo sysctl -w user.max_user_namespaces=15000</code>
+            </CopyCommand>
+          </li>
+        </ul>
+      )
+    case 'userns_denied':
+      return (
+        <ul className="mt-2 list-none space-y-3">
+          <li className="text-sm leading-relaxed text-muted">
+            {i18nT('components.kiroPrerequisiteGate.remedy_userns_denied')}
+            <CopyCommand>
+              <code>sudo sysctl -w kernel.unprivileged_userns_clone=1</code>
+            </CopyCommand>
+          </li>
+        </ul>
+      )
+    case 'no_user_ns':
+      return (
+        <p className="mt-2 text-sm leading-relaxed text-muted">
+          {i18nT('components.kiroPrerequisiteGate.remedy_no_user_ns')}
+        </p>
+      )
+    default:
+      return null
+  }
+}
+
+function SandboxRemedy({ remedy, transient }: { remedy: string; transient: boolean }) {
+  const steps = remedySteps(remedy)
+  return (
+    <div className="mt-4 w-full max-w-lg text-left">
+      {/* The heading only appears when there IS a fix to show. Over a section
+          holding nothing but the diagnostic command it would promise a remedy it
+          does not deliver. On the transient path the steps are conditional — the
+          host may simply be busy — so the heading says so rather than asserting a
+          fix the user may not need. */}
+      {steps ? (
+        <>
+          <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted">
+            {transient
+              ? i18nT('components.kiroPrerequisiteGate.if_this_keeps_happening')
+              : i18nT('components.kiroPrerequisiteGate.how_to_fix')}
+          </p>
+          {steps}
+        </>
+      ) : null}
+      <p className="mt-2 text-sm leading-relaxed text-muted">
+        {i18nT('components.kiroPrerequisiteGate.run_kirocrew_doctor_on_the_gateway_host_for_a_ful')}
+      </p>
+      <CopyCommand>
+        <code>kirocrew doctor</code>
+      </CopyCommand>
+      <a
+        className="mt-2 inline-flex items-center gap-1.5 text-[13px] font-medium text-accent hover:underline focus-ring"
+        href={SANDBOX_DOCS_URL}
+        rel="noopener noreferrer"
+        target="_blank"
+      >
+        {i18nT('components.kiroPrerequisiteGate.linux_sandbox_guide')}
+        <ExternalLink className="lucide-inline" />
+      </a>
+    </div>
+  )
+}
+
 function SandboxUnavailable({
   failureKind,
   detail,
+  remedy,
   retrying,
   onRetry,
 }: {
   failureKind: string
   detail: string
+  remedy: string
   retrying: boolean
   onRetry: () => void
 }) {
@@ -274,12 +416,20 @@ function SandboxUnavailable({
   // diverge sharply. A transient failure clears on retry and must NOT push the
   // user toward disabling their own isolation; a foreign outer sandbox means
   // this host's sandbox is fine; only 'no_backend' is a host-level verdict.
+  //
+  // The generic no_backend sentence ("this host provides no OS-level sandbox")
+  // is FALSE under the Ubuntu AppArmor restriction: user namespaces work, the
+  // kernel just denied the second step. That mechanism therefore overrides the
+  // body. The other tokens leave it alone — for them the host genuinely offers
+  // no usable namespace, and their remedy step carries the specifics.
   const body =
     failureKind === 'transient'
       ? i18nT('components.kiroPrerequisiteGate.the_check_hit_a_temporary_limit_and_was_not_cach')
       : failureKind === 'foreign_sandbox'
         ? i18nT('components.kiroPrerequisiteGate.another_sandbox_already_confines_kiro_crew_so_it')
-        : i18nT('components.kiroPrerequisiteGate.this_host_provides_no_os_level_sandbox_so_kiro_c')
+        : remedy === 'apparmor_userns'
+          ? i18nT('components.kiroPrerequisiteGate.this_host_allows_user_namespaces_but_the_kernel_d')
+          : i18nT('components.kiroPrerequisiteGate.this_host_provides_no_os_level_sandbox_so_kiro_c')
   // A momentary failure that clears on retry should not be dressed in the same
   // alarm red as a host-level verdict — the body immediately walks that back.
   const transient = failureKind === 'transient'
@@ -289,6 +439,12 @@ function SandboxUnavailable({
     <SetupShell
       asideHeadline={i18nT('components.kiroPrerequisiteGate.sandbox_unavailable')}
       asideBody={i18nT('components.kiroPrerequisiteGate.kiro_crew_isolates_the_agent_in_an_os_level_sand')}
+      footer={
+        <Btn type="button" disabled={retrying} onClick={onRetry}>
+          <RefreshCw className={`lucide-inline ${retrying ? 'animate-spin' : ''}`} />
+          {i18nT('components.kiroPrerequisiteGate.check_again')}
+        </Btn>
+      }
     >
       <>
         <div className={`flex h-11 w-11 items-center justify-center rounded-xl ${tone}`}>
@@ -301,6 +457,14 @@ function SandboxUnavailable({
           {i18nT('components.kiroPrerequisiteGate.kiro_cli_is_installed_but_could_not_be_verified')}
         </h1>
         <p className="mt-3 max-w-lg text-sm leading-relaxed text-muted">{body}</p>
+        {/* A foreign outer sandbox means this host is fine, so host remedies
+            there would be advice to break a working setup. A transient failure
+            still shows one when the probe named a mechanism: the cap case is
+            reported transient forever, so suppressing it here was the difference
+            between a fixable host and a dead end. */}
+        {(failureKind === 'no_backend' || (transient && remedy)) && (
+          <SandboxRemedy remedy={remedy} transient={transient} />
+        )}
         {detail ? (
           <div className="mt-5 w-full max-w-lg text-left">
             <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted">
@@ -311,9 +475,72 @@ function SandboxUnavailable({
             </pre>
           </div>
         ) : null}
+      </>
+    </SetupShell>
+  )
+}
+
+function AgentSpecsMissing({
+  specs,
+  repairError,
+  retrying,
+  onRepair,
+}: {
+  specs: string[]
+  repairError: string
+  retrying: boolean
+  onRepair: () => void
+}) {
+  return (
+    <SetupShell
+      asideHeadline={i18nT('components.kiroPrerequisiteGate.agent_specs_missing')}
+      asideBody={i18nT('components.kiroPrerequisiteGate.kiro_crew_installs_the_agent_specs_kiro_cli_load')}
+    >
+      <>
+        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-danger/10 text-danger">
+          <AlertTriangle className="lucide-inline" />
+        </div>
+        <p className="mt-6 text-[12px] font-bold uppercase tracking-[0.16em] text-danger">
+          {i18nT('components.kiroPrerequisiteGate.agent_specs_missing')}
+        </p>
+        <h1 className="mt-2 text-3xl font-bold tracking-tight text-text-strong">
+          {i18nT('components.kiroPrerequisiteGate.kiro_crew_s_agent_specs_are_not_installed')}
+        </h1>
+        <p className="mt-3 max-w-lg text-sm leading-relaxed text-muted">
+          {i18nT('components.kiroPrerequisiteGate.kiro_crew_writes_its_own_agent_specs_where_kiro')}
+        </p>
+        <div className="mt-5 w-full max-w-lg text-left">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted">
+            {i18nT('components.kiroPrerequisiteGate.missing')}
+          </p>
+          <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-bg p-3 text-xs text-muted">
+            {specs.join('\n')}
+          </pre>
+        </div>
+        {/* Verbatim and untranslated: it names the failing install step, which is
+            the one thing a support conversation actually needs. Its absence is
+            also informative — it means no repair has been attempted yet.
+            `role="alert"` because it appears in place after the button press with
+            no route change, so a screen reader would otherwise get nothing. */}
+        {repairError ? (
+          <div className="mt-4 w-full max-w-lg text-left" role="alert">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-danger">
+              {i18nT('components.kiroPrerequisiteGate.the_repair_attempt_failed')}
+            </p>
+            <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-lg bg-danger/10 p-3 text-xs text-danger">
+              {repairError}
+            </pre>
+          </div>
+        ) : null}
+        {/* The self-diagnosis dead end: `kiro-cli diagnostic` is the first command
+            anyone reaches for, and it refuses with "Kiro CLI app is not running"
+            until the app is launched — which reads as the cause and is not. */}
+        <p className="mt-5 max-w-lg text-[13px] leading-relaxed text-muted">
+          {i18nT('components.kiroPrerequisiteGate.if_you_are_diagnosing_this_from_a_terminal_kiro')}
+        </p>
         <div className="mt-6">
-          <Btn type="button" disabled={retrying} onClick={onRetry}>
-            <RefreshCw className={`lucide-inline ${retrying ? 'animate-spin' : ''}`} />
+          <Btn type="button" disabled={retrying} onClick={onRepair}>
+            <RefreshCw className="lucide-inline" />
             {i18nT('components.kiroPrerequisiteGate.check_again')}
           </Btn>
         </div>
@@ -331,8 +558,19 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
   const statusQuery = useQuery({
     queryKey: QUERY_KEY,
     queryFn: () => {
-      const refresh = forceProbe.current
+      // Probe the host when the user asked (Check again) OR while the blocking
+      // first-run gate is up — see kiroPrerequisiteIsBlocking for why a
+      // latch-reading poll cannot lift that gate on its own. The two are sent as
+      // DIFFERENT modes: the user's click must always probe, while the automatic
+      // poll is coalesced server-side so several open tabs do not multiply the
+      // gateway's kiro-cli spawns.
+      const explicit = forceProbe.current
       forceProbe.current = false
+      const refresh = explicit
+        ? 'explicit' as const
+        : kiroPrerequisiteIsBlocking(queryClient.getQueryData(QUERY_KEY))
+          ? 'auto' as const
+          : false
       return api.kiroPrerequisite(refresh)
     },
     refetchInterval: (query) => kiroPrerequisiteRefetchInterval(query.state.data),
@@ -340,12 +578,12 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
   const updateStatus = (status: KiroPrerequisiteStatus) => {
     queryClient.setQueryData(QUERY_KEY, status)
   }
-  const installMutation = useMutation({
-    mutationFn: api.installKiroPrerequisite,
-    onSuccess: updateStatus,
-  })
-  const loginMutation = useMutation({
-    mutationFn: api.loginKiroPrerequisite,
+  // The repair is a POST, not a flag on the status GET: the gateway's CSRF check
+  // and its SEL audit are both method-scoped, so a spec rewrite driven from a GET
+  // would be cross-site triggerable and would leave no audit record. Its response
+  // IS the post-repair snapshot, so the result seeds the cache directly.
+  const repairMutation = useMutation({
+    mutationFn: api.repairKiroPrerequisiteSpecs,
     onSuccess: updateStatus,
   })
 
@@ -410,11 +648,36 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
     return <>{children}</>
   }
   const status = prerequisite
-  const busy = status.operation.status === 'running'
-    || installMutation.isPending
-    || loginMutation.isPending
-  const mutationError = installMutation.error || loginMutation.error
   const platform = status.platform || 'local'
+  // Defensive `?? []`: a gateway older than this field, and every test fixture
+  // that builds a partial status object, has no key here.
+  const missingSpecs = status.missing_agent_specs ?? []
+  const repairError = repairMutation.data?.agent_spec_repair_error
+    || (repairMutation.error ? asSentence(repairMutation.error.message) : '')
+    || (status.agent_spec_repair_error ?? '')
+  // Kiro Crew's own agent specs are absent, so kiro-cli answers every
+  // session/set_mode with "Mode '<name>' not found" and not one message can
+  // succeed. Placed BEFORE the `initial_setup_complete` bail-out -- the only
+  // branch here that hijacks an established install -- and gated ON that same
+  // flag, so a GENUINE first run still reaches Install / Sign in instead of a
+  // screen offering to repair specs the installer has not written yet.
+  //
+  // That rule protects against a STALE LATCH: readiness is latched, and blocking
+  // an established user on stale state is the failure it avoids. This check is
+  // not a latch — it is two `stat` calls made while answering the request, so it
+  // cannot be stale, and the condition it reports is total rather than
+  // intermittent. It is also the only affordance in the product for repairing
+  // this state, so an install without it has no route back.
+  if (missingSpecs.length > 0 && status.initial_setup_complete) {
+    return (
+      <AgentSpecsMissing
+        specs={missingSpecs}
+        repairError={repairError}
+        retrying={retrying || repairMutation.isPending}
+        onRepair={() => repairMutation.mutate()}
+      />
+    )
+  }
   // Established install, signed out: render NOTHING and pause nothing. The user
   // is not guided to sign in — the chat error card carries that, in context,
   // only when they actually try to use the agent. A persistent banner nagged
@@ -427,18 +690,19 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
     return <OwnerSetupRequired retrying={retrying} onRetry={retryStatus} />
   }
   // The CLI is present and executable, but verification runs it INSIDE the
-  // sandbox, so a host that cannot build one fails verification. Reporting that
-  // as "Install Kiro CLI" is false on a host whose CLI is installed and signed
-  // in, and it offers a button that cannot possibly help. Placed after
+  // sandbox, so a host that cannot build one fails verification. Telling that
+  // user to go get Kiro CLI is false on a host whose CLI is installed and signed
+  // in, and Kiro's setup page cannot help them. Placed after
   // `initial_setup_complete` deliberately: an established install is not
   // hijacked by a full-screen gate (the chat error card carries it in context,
-  // and since the probe now names the failing step that message is specific) —
+  // and since the probe names the failing step that message is specific) —
   // this branch only replaces the first-run screen that would otherwise lie.
   if (status.sandbox_unavailable) {
     return (
       <SandboxUnavailable
         failureKind={status.sandbox_failure_kind}
         detail={status.sandbox_detail}
+        remedy={status.sandbox_remedy}
         retrying={retrying}
         onRetry={retryStatus}
       />
@@ -468,41 +732,35 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
                   <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent-subtle text-accent">
                     <Package className="lucide-inline" />
                   </span>
-                  {i18nT('components.kiroPrerequisiteGate.install_kiro_cli')}
+                  {i18nT('components.kiroPrerequisiteGate.get_kiro_cli')}
                 </h2>
                 <p className="mt-2 text-sm leading-relaxed text-muted">
-                  {i18nT('components.kiroPrerequisiteGate.kiro_crew_downloads_the_official_kiro_installer')}
+                  {status.installed
+                    ? i18nT('components.kiroPrerequisiteGate.kiro_cli_was_found_on_this_host')
+                    : i18nT('components.kiroPrerequisiteGate.install_kiro_cli_from_kiros_official_setup_page')}
                 </p>
               </div>
               <StepStatus complete={status.installed} current={!status.installed} />
             </div>
-            <div className="mt-4 flex flex-wrap items-center gap-3">
-              <SendBtn
-                type="button"
-                disabled={busy || status.installed || !status.can_auto_install}
-                onClick={() => installMutation.mutate()}
-              >
-                {busy && status.operation.kind === 'install'
-                  ? <><Loader2 className="lucide-inline animate-spin" /> {i18nT('components.kiroPrerequisiteGate.installing')}</>
-                  : status.installed
-                    ? <><CheckCircle2 className="lucide-inline" /> {i18nT('components.kiroPrerequisiteGate.installed')}</>
-                    : <><Package className="lucide-inline" /> {i18nT('components.kiroPrerequisiteGate.install_kiro_cli')}</>}
-              </SendBtn>
-              <a
-                className="inline-flex items-center gap-1.5 text-[13px] font-medium text-accent hover:underline focus-ring"
-                href={status.docs_url}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                {i18nT('components.kiroPrerequisiteGate.installation_guide')} <ExternalLink className="lucide-inline" />
-              </a>
-            </div>
-            {!status.installed && !status.can_auto_install && (
-              <p className="mt-3 text-[13px] leading-relaxed text-muted">
-                {i18nT('components.kiroPrerequisiteGate.automatic_installation_is_unavailable_here_insta')}
-              </p>
+            {/* A link, not a button: Kiro Crew does not install Kiro CLI. Kiro's
+                own page carries the per-platform steps and stays correct as they
+                change, which a digest-pinned in-app installer did not. */}
+            {!status.installed && (
+              <div className="mt-4">
+                <a
+                  className="btn-sweep inline-flex items-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-[13px] font-semibold text-accent-fg hover:bg-accent-hover hover:shadow-[0_0_20px_var(--accent-glow)] transition-all focus-ring"
+                  href={status.docs_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {i18nT('components.kiroPrerequisiteGate.open_kiro_cli_setup')}
+                  <ExternalLink className="lucide-inline" />
+                </a>
+                <p className="mt-3 text-[13px] leading-relaxed text-muted" aria-live="polite">
+                  {i18nT('components.kiroPrerequisiteGate.this_page_detects_kiro_cli_automatically')}
+                </p>
+              </div>
             )}
-            {status.operation.kind === 'install' && <OperationProgress status={status} />}
           </Card>
 
           <Card className={status.installed && !status.authenticated ? 'border-accent/60 shadow-[0_10px_35px_var(--accent-glow)]' : ''}>
@@ -515,7 +773,9 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
                   {i18nT('components.kiroPrerequisiteGate.sign_in_to_kiro')}
                 </h2>
                 <p className="mt-2 text-sm leading-relaxed text-muted">
-                  {i18nT('components.kiroPrerequisiteGate.start_kiro_s_device_sign_in_open_the_secure_page')}
+                  {status.authenticated
+                    ? i18nT('components.kiroPrerequisiteGate.this_kiro_cli_is_signed_in')
+                    : i18nT('components.kiroPrerequisiteGate.sign_in_with_kiro_cli_on_the_gateway_host')}
                 </p>
               </div>
               <StepStatus
@@ -523,50 +783,63 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
                 current={status.installed && !status.authenticated}
               />
             </div>
-            <div className="mt-4">
-              <SendBtn
-                type="button"
-                disabled={
-                  busy
-                  || !status.installed
-                  || status.authenticated
-                }
-                onClick={() => loginMutation.mutate()}
-              >
-                {busy && status.operation.kind === 'login'
-                  ? <><Loader2 className="lucide-inline animate-spin" /> {i18nT('components.kiroPrerequisiteGate.waiting_for_sign_in')}</>
-                  : status.authenticated
-                    ? <><CheckCircle2 className="lucide-inline" /> {i18nT('components.kiroPrerequisiteGate.signed_in')}</>
-                    : <><LogIn className="lucide-inline" /> {i18nT('components.kiroPrerequisiteGate.sign_in_to_kiro')}</>}
-              </SendBtn>
-            </div>
-            {status.operation.kind === 'login' && <OperationProgress status={status} />}
-          </Card>
+            {/* Rendered VERBATIM from the backend constants, never catalog
+                values: a translated command cannot be typed. Shown only once a CLI
+                exists to sign into — before that the step above owns the screen.
+                Kiro Crew does not run them; the footer's Check again reads the
+                result.
 
-          {mutationError && (
-            <div
-              className="mb-4 flex items-start gap-2 rounded-lg border border-danger/20 bg-danger/10 p-3 text-sm text-danger"
-              role="alert"
-            >
-              <AlertTriangle className="lucide-inline" />
-              {mutationError.message || i18nT('components.kiroPrerequisiteGate.kiro_setup_could_not_start')}
-            </div>
-          )}
+                BOTH tiers are offered, because the sign-in page the bare command
+                opens presents a free Builder ID as a peer of organization SSO:
+                a user on an SSO plan who picks the wrong one authenticates
+                successfully and only discovers the mismatch later, as missing
+                models. Naming the tier here makes it a decision instead of a
+                guess. Kiro Crew does not detect which one applies — that would
+                mean inspecting the host's identity configuration — so the copy
+                describes the choice and lets the user make it. */}
+            {status.installed && !status.authenticated && (
+              <div className="mt-4 space-y-4">
+                <div>
+                  <p className="text-[13px] font-medium text-text">
+                    {i18nT('components.kiroPrerequisiteGate.sign_in_personal_label')}
+                  </p>
+                  <code className="mt-1.5 inline-block rounded-lg border border-border bg-bg px-2.5 py-1.5 font-mono text-[13px] text-text">
+                    {status.login_command}
+                  </code>
+                </div>
+                <div>
+                  <p className="text-[13px] font-medium text-text">
+                    {i18nT('components.kiroPrerequisiteGate.sign_in_sso_label')}
+                  </p>
+                  <code className="mt-1.5 inline-block rounded-lg border border-border bg-bg px-2.5 py-1.5 font-mono text-[13px] text-text">
+                    {status.sso_login_command}
+                  </code>
+                  <p className="mt-1.5 text-[12px] leading-relaxed text-muted">
+                    {i18nT('components.kiroPrerequisiteGate.sign_in_sso_hint')}
+                  </p>
+                </div>
+                <p className="text-[12px] leading-relaxed text-muted">
+                  {i18nT('components.kiroPrerequisiteGate.sign_in_method_note')}
+                </p>
+              </div>
+            )}
+          </Card>
 
           <div className="flex items-center justify-between gap-4 border-t border-border pt-5">
             <p className="text-[13px] text-muted" aria-live="polite">
               {status.installed
                 ? i18nT('components.kiroPrerequisiteGate.kiro_cli_is_installed_finish_signing_in_to_conti')
-                : `Kiro CLI is required on the ${platform} gateway host.`}
+                : i18nT('components.kiroPrerequisiteGate.kiro_cli_is_required_on_the_gateway_host', { platform })}
             </p>
-            <Btn
+            <SendBtn
               type="button"
-              disabled={busy || statusQuery.isFetching}
+              className="inline-flex items-center gap-1.5"
+              disabled={statusQuery.isFetching}
               onClick={retryStatus}
             >
               <RefreshCw className={`lucide-inline ${statusQuery.isFetching ? 'animate-spin' : ''}`} />
               {i18nT('components.kiroPrerequisiteGate.check_again')}
-            </Btn>
+            </SendBtn>
           </div>
         </>
     </SetupShell>

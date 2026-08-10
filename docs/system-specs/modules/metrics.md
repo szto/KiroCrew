@@ -80,10 +80,11 @@ second `PeriodicExportingMetricReader` alongside the local JSONL sink
 `pip install "kirocrew[otlp]"`. If the endpoint is set but the package extra is
 not installed, telemetry
 degrades to local-only with a warning instead of crashing. The OTLP exporter
-only ever sees the same redacted, low-cardinality data points as the local sink
-(the `MetricsRecorder` facade sanitises attributes before they reach ANY
-reader), so opting in cannot leak prompts, content, tokens, paths, user ids, or
-secrets.
+sees the same data points as the local sink: the `MetricsRecorder` facade
+sanitises attributes before they reach ANY reader, and call sites are required
+to pass low-cardinality constants rather than prompts, content, tokens, paths or
+user ids. That sanitisation is defence in depth over the requirement, not a
+substitute for it, so egress is only as safe as the call sites feeding it.
 
 **Bounded local retention (rec #14, explicit opt-in):** both destructive caps
 default to `0`, so upgrading cannot delete existing telemetry history. Operators
@@ -118,13 +119,19 @@ can opt in independently to age and/or size bounds:
   dates, symlinks, and the lock sidecar are excluded. It is fully best-effort —
   a rotation/prune failure is logged and swallowed, never breaking export.
 
-**Never recorded:** prompts, message/tool content, token counts, filesystem
-paths, user ids, and secrets. `telemetry.otlp_endpoint` is schema-sensitive so
-credential-bearing collector URLs are masked by config API/UI consumers as well
-as omitted from logs. Enforced structurally at the `MetricsRecorder`
-facade via the `schema.py` guardrails (see below) — call sites emit only
-low-cardinality enum-like attribute values, and any string that looks like a
-credential/PII is redacted to `"[REDACTED]"` before it reaches an instrument.
+**Must never be recorded:** prompts, message/tool content, token counts,
+filesystem paths, user ids, and secrets. `telemetry.otlp_endpoint` is
+schema-sensitive so credential-bearing collector URLs are masked by config
+API/UI consumers as well as omitted from logs.
+
+That is a contract on call sites — they emit only low-cardinality enum-like
+attribute values — backed at the `MetricsRecorder` facade by the `schema.py`
+guardrails (see below), which redact a string matching a known credential shape,
+or clearing the entropy backstop, to `"[REDACTED]"` before it reaches an
+instrument. Namespace validation is exhaustive; attribute redaction is defence
+in depth with a bounded reach (`schema.py` documents where the entropy backstop
+can and cannot fire), so it narrows the blast radius of a call site that breaks
+the contract rather than making one impossible.
 
 Tests: `test/metrics/test_local_exporter.py` (retention: direct age cap,
 oldest-first size cap, live-writer protection, live-shard rotation, non-blocking
@@ -303,11 +310,33 @@ startups multiplies the startup count by the number of phases and sums several
 unrelated latency distributions into one set of buckets, which renders as a
 spurious multi-modal "distribution".
 
+**Failures are reported as counts, not as success rates.** Both outcome
+instruments are fail-closed — `AcpClient.ensure_ready` and
+`AcpSessionProvider._start_kiro_runtime` each default their outcome to `error`
+and overwrite it with `ready` only on the success path, and `_turn_outcome` maps
+a real `stop_reason` — so a zero here is a measurement rather than an instrument
+that cannot report bad news. What a *rate* over these populations cannot do is
+survive rounding: a window of ~1400 startups makes one failed startup 99.93%,
+which renders as a flawless `100%`. A rate had no reachable value between
+"perfect" and a problem big enough to clear half a percent, and it saturated in
+the direction that hides failure. A count has no such ceiling, so the page shows
+the absolute number of non-`ready` startups and of non-`ok` turns. Where a rate
+is still shown (turn fault rate, which answers a different question — faults per
+unit of work), a non-zero value below the rounding threshold renders as `<1%`
+and never in the success colour.
+
+Both figures count *everything* outside the success value rather than naming the
+failure values. Enumerating them (`error` + `timeout`) silently excluded any
+third outcome — `auth_required`, and the `unknown` that shards predating the
+attribute aggregate under — which put the displayed count and the rate beside it
+on two different populations.
+
 **`context` block.** The response also carries per-turn context-window
 occupancy — `{turns, p50_pct, p90_pct, max_pct, sessions[]}` — sourced from the
 per-turn token row store below, NOT from the OTEL shards: occupancy is a
 per-session ratio and slot keys are unbounded-cardinality, which must not become
-a metric label. `sessions[]` is the top 8 by peak occupancy, each reporting peak
+a metric label. `sessions[]` is EVERY session in the window ordered by peak
+occupancy (bounded only by a payload backstop of 500), each reporting peak
 plus the LATEST turn's identity (agent/model/surface) and absolute
 used/window. Rows whose window is missing or zero are skipped rather than
 defaulted. The block is `null` when no row carries the fields, and is served
@@ -335,7 +364,7 @@ Each row (`_build_token_record`) carries:
 | `ts` | str | ISO-8601 local timestamp of the turn |
 | `slot` | str | chat slot / session key |
 | `provider` | str | LLM backend (`acp` / `claude_code` / `bedrock` / …), `""` if unknown |
-| `model` | str | model id for the turn |
+| `model` | str | resolved model id for the turn; `"auto"` when the completed turn only exposes the Auto request; `""` if no model source is available |
 | `input` / `output` | int | prompt / completion tokens (structurally `0` on the ACP backend — kiro-cli bills credits only) |
 | `cache_create` / `cache_read` | int | cache-write / cache-read tokens |
 | `cost` | float | provider-reported USD cost (`0.0` on ACP) |
@@ -410,6 +439,29 @@ comparing one turn against another (the whole point of the breakdown) wants an
 exact unit rather than an approximate one. `phase` separates the one-off
 session-start injection from the much smaller per-turn one so a reader never
 pools the two populations.
+**Non-finite floats are rejected at the single write chokepoint.**
+`_write_token_record` dumps with `allow_nan=False` and, only on the resulting
+`ValueError`, rewrites non-finite floats to `0.0` — so the common path pays no
+per-turn scan. The guard lives there rather than per field because provider
+floats (`cost_usd`, `credits`) reach the record unvalidated and a float is
+exactly what a bad one looks like, so a type check cannot catch it. Without it,
+`json.dumps` writes the bare tokens `NaN` / `Infinity`, which are **not** valid
+JSON while `json.loads` still accepts them: one such row travels silently into a
+`web.json_response` body no browser can parse, taking down every panel that
+reads the store instead of losing one turn's numbers. `cost_breakdown`
+additionally skips non-finite rows on read, because shards written before this
+guard can already contain them.
+
+**Subagent turns are excluded from both readers.** `usage.is_session_slot(slot)`
+drops any row whose `telemetry_channel_of` is `subagent`, at the point the row is
+READ rather than where it is grouped — so the window totals, the prior-period
+deltas, `by_model`, `by_channel`, `by_category`, the context bands, the priciest
+turn and the occupancy percentiles are all computed over one population and cannot
+contradict each other. A subagent is a fragment of another session's turn rather
+than a session with its own lifecycle, and its usage row carries no field pointing
+back at the session that spawned it, so it can be neither listed nor attributed.
+The consequence is deliberate and worth stating: these totals are the totals of the
+sessions the panel lists, NOT of the account.
 
 **Read side.** `usage.context_occupancy(days)` aggregates these rows into
 per-turn occupancy percentiles plus a per-session peak ranking (own
@@ -456,13 +508,68 @@ label → size, aggregated — is what could belong on a metric; this per-sessio
 half is the drill-down. Without these readers the fields were write-only:
 recorded on every turn, read by nothing.
 
+`usage.cost_breakdown(days)` is the second reader, same cache contract, serving
+the `cost` block of the same endpoint. It answers "where did the credits go"
+from fields the row store already carries — no new instrumentation:
+
+| sub-block | derivation |
+|-----------|-----------|
+| totals | `credits` summed over the window, plus the preceding window of equal length and the delta between them |
+| `by_model` | per-`model` credits, share, credits-per-turn, and per-model delta vs the prior window. **Every model, never truncated** — a top-N cut hides exactly the cheap-model-creep this block exists to show |
+| `by_channel` | same shape, keyed by `telemetry_channel_of(slot)` |
+| `context_bands` | mean credits per turn bucketed by absolute `context_used`, which is what makes the cost/context relationship legible (a turn at 900k costs ~4.7x one at 100k) |
+| `conversations` | EVERY session in the window (not a top-N), each with its `category`, the unollapsed `channel` beneath it, peak occupancy, span, per-turn growth rate, and a projected turns-to-compaction. Named `conversations` for payload compatibility; the entity is a session |
+| `by_category` | same shape as `by_model`, keyed by `usage.session_category(slot)` — the taxonomy the panel groups by: `bg` for an unattended session (cron, heartbeat, task runner), otherwise the transport (`dashboard`, `telegram`, `slack`, …) |
+
+**Channel comes from the slot key, not from `surface`.** `surface` cannot
+separate transports: `chat_runner` stamps `surface="dashboard"` for every turn
+that flows through it regardless of where the message arrived from, so a
+Telegram turn is booked as dashboard spend (observable in the row store as a
+`telegram_*` slot carrying `surface="dashboard"`). The slot key is assigned by
+the transport that created the session and is therefore the only field that
+distinguishes them.
+
+**A conversation's `title` is attached by the endpoint, from two sources in
+order.** `cost_breakdown` names nothing — slot keys are all the row store holds.
+`handlers/telemetry._with_conversation_titles` resolves the live slot's
+`display_title` first, so a rename shows before it has been flushed; a session
+with no live slot falls back to the `title` on its transcript's metadata line,
+read through `ConversationLog.get_metadata` off the event loop and keyed by
+`slot_transcript_key(slot)`, which is what folds a channel-born slot onto the
+channel's own transcript. Only an explicit metadata title counts: `list_sessions`
+would answer with the first user message and then with the session key, which
+turns a ranking label into prompt text and leaves no way to tell a named
+conversation from an unnamed one. A row with neither source reports an absent
+title rather than its key. Both sources pass the same two scanners on the way
+out, so where a title came from cannot change what leaves the endpoint.
+
+**The growth slope is fitted per segment, never across the window.** Occupancy
+is a sawtooth: a compaction drops it back toward empty, and 7 of the 8
+top-spending conversations measured carry one to four such drops. A secant from
+the first turn to the last therefore crosses discontinuities and is dragged down
+by every reset, understating the live rate by ~47x on real data — one 104-turn
+conversation projected 795 turns of headroom while its current segment climbed
+at 4%/turn, i.e. ~17 turns from compaction. Erring toward "plenty of room" is
+the damaging direction for a figure whose only purpose is a warning, so the
+slope is fitted on the stretch since the last fall larger than
+`_COMPACTION_DROP_PCT` (sub-threshold drift is ordinary jitter in what counts
+toward `context_used`, not a compaction). Growth and the projection are
+**withheld** unless that CURRENT segment holds `_COST_MIN_GROWTH_TURNS` points —
+a long conversation freshly past a compaction knows nothing about its new
+trajectory, and withholding is the honest answer rather than extrapolating from
+two or three points.
+
 Tests: `test/test_usage.py` (`TestReadContextTokens`,
 `TestBuildTokenRecordContextFields`, `TestBuildTokenRecordCtxBlocks`,
-`TestPersistTokenRecord*`), `test/metrics/test_context_occupancy.py` (occupancy
-aggregation, skips, latest-turn wins), `test/metrics/test_context_blocks.py`
-(`split_blocks` closure + per-marker correctness + reply-format collapse), and
-`test/metrics/test_context_trace.py` (the per-turn trace reader and the
-`context-trace` endpoint).
+`TestPersistTokenRecord*`), `test/metrics/test_context_occupancy.py`
+(aggregation, skips, latest-turn wins), `test/metrics/test_cost_breakdown.py`
+(channel attribution incl. the bare dashboard slot form, no-truncation,
+prior-window deltas, band bucketing, post-compaction slope, growth
+withholding, non-finite rejection) and `test/metrics/test_telemetry_titles.py`
+(title redaction + cache purity, and the closed-conversation fallback: the
+canonical transcript key, live-wins-over-persisted, one read per shared
+transcript, and no title where the metadata line names none), plus the
+`context-trace` endpoint.
 
 ## Circular-import rule
 
@@ -821,8 +928,11 @@ always matches and the suppression would never fire (a real bug caught by
 `TestDefaultHomeDetection`).
 
 `kirocrew telemetry status | disable | enable` — `status` prints the exact
-payload and never materializes an id (`install_id(create=False)`); `disable`
-persists to `config.json` so the choice survives a new shell.
+payload and never materializes an id (`install_id(create=False)`). Its numbered,
+choose-one opt-out list leads with `kirocrew telemetry disable` because that choice
+persists to `config.json` and survives a new shell. Each method is a separate visual
+block: the environment override groups separately labelled macOS/Linux, PowerShell,
+and Command Prompt syntax, followed by the equivalent config key.
 
 `beacon.is_env_opted_out()` is the public probe for "the env var pins this off".
 It exists so the dashboard can distinguish *off because the stored flag is false*

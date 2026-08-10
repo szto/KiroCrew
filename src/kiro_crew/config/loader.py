@@ -224,6 +224,53 @@ def normalize_agent_model(model: object) -> str:
     return "" if m == DEFAULT_MODEL else m
 
 
+# Per-task-class model overrides (agent.role_models). These are the ONLY
+# sanctioned place to pin a model for a class of work — never hardcode a model
+# id in code. Every role defaults to "" ("inherit"), which resolves down to
+# agent.model and finally to DEFAULT_MODEL ("auto"), so an unpinned role is
+# entitlement-safe on every subscription tier (the provider picks a served
+# model). An operator who deliberately wants a cheaper model for background /
+# sub-agent work pins it here without changing the interactive chat default.
+ROLE_MODEL_KEYS: tuple[str, ...] = ("background", "subagent")
+
+
+def coerce_role_models(raw: object) -> dict[str, str]:
+    """Normalize the per-role model map from hand-edited config / request bodies.
+
+    Only the known :data:`ROLE_MODEL_KEYS` are kept; each value passes through
+    :func:`normalize_agent_model`, so an ``"auto"`` or non-string entry collapses
+    to ``""`` ("inherit the next tier down"). Empty results are dropped so the
+    stored map only ever carries real pins — a role absent from the map and a
+    role explicitly set to ``"auto"`` behave identically (both inherit).
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for role in ROLE_MODEL_KEYS:
+        val = normalize_agent_model(raw.get(role))
+        if val:
+            out[role] = val
+    return out
+
+
+def coerce_role_efforts(raw: object) -> dict[str, str]:
+    """Normalize the per-role reasoning-effort map (agent.role_efforts).
+
+    Same role keys as :data:`ROLE_MODEL_KEYS`. Each value must be a concrete,
+    valid effort level; ``""`` / an invalid / non-string entry is dropped so the
+    stored map carries only real pins — an absent role and an empty one both
+    mean "inherit the chat default effort, then the provider/model default".
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for role in ROLE_MODEL_KEYS:
+        val = raw.get(role)
+        if isinstance(val, str) and val.strip() and is_valid_effort(val.strip()):
+            out[role] = val.strip()
+    return out
+
+
 _DEFAULT_PORT = 5476
 
 # KIROCREW_PORT is validated at CLI entry (cli.py main()).
@@ -765,6 +812,29 @@ class AgentConfig:
         default=DEFAULT_MODEL,
         metadata=_meta("Model", "LLM model identifier. 'auto' resolves from agent config."),
     )
+    role_models: dict[str, str] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Per-role models",
+            "Optional per-task-class model overrides. Keys: 'background' "
+            "(lite / heartbeat background workers) and 'subagent' (spawned "
+            "sub-agents). An empty value or 'auto' defers to the chat default "
+            "(agent.model) and then to the provider default, so an unpinned "
+            "role stays usable on every subscription tier. Pin a cheaper model "
+            "here to run background / sub-agent work on it without changing the "
+            "interactive chat default.",
+        ),
+    )
+    role_efforts: dict[str, str] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Per-role reasoning effort",
+            "Optional per-task-class reasoning effort, paired with role_models "
+            "(keys: 'background', 'subagent'). Empty for a role inherits the chat "
+            "default (agent.reasoning_effort) and then the provider/model default. "
+            "Only applies on reasoning-capable models.",
+        ),
+    )
     reasoning_effort: str = field(
         default="",
         metadata=_meta(
@@ -799,14 +869,17 @@ class AgentConfig:
         metadata=_meta("Default Agent", "Default agent name for new sessions."),
     )
     sandbox: str = field(
-        default="off",
+        default="auto",
         metadata=_meta(
             "Sandbox",
-            "Sandbox mode for ACP provider. Default 'off' defers isolation to "
-            "kiro-cli's internal agent sandbox (kiro-cli >= 2.13). Set to 'auto' "
-            "to re-enable Kiro Crew's OS-level sandbox (namespace on Linux, "
-            "sandbox-exec on macOS). The two layers are mutually exclusive on "
-            "macOS (nested seatbelt causes EPERM).",
+            "Sandbox mode for ACP provider. Default 'auto' engages OS-level "
+            "isolation (namespace on Linux, sandbox-exec on macOS) and "
+            "automatically defers to kiro-cli's internal sandbox on macOS when "
+            "it is enabled (kiro-cli >= 2.13; nested seatbelt causes EPERM). "
+            "Set to 'off' to skip Kiro Crew's own OS-level sandbox — delegation "
+            "to kiro-cli's internal sandbox still fires on macOS if it is "
+            "enabled, and a SECURITY warning is logged when neither layer is "
+            "active.",
             enum=["auto", "off"],
         ),
     )
@@ -830,7 +903,12 @@ class AgentConfig:
             "RuntimeError if no sandbox backend is available and mode is not 'off', "
             "preventing unsandboxed execution entirely (fail-closed). This is "
             "distinct from sandbox_allow_no_isolation which only controls warning "
-            "severity — this field controls whether execution proceeds at all.",
+            "severity — this field controls whether execution proceeds at all. "
+            "The default is platform-independent: on a host with no backend (any "
+            "Windows host, a Linux kernel refusing user namespaces) `kirocrew "
+            "setup` OFFERS this opt-in interactively and writes it only on an "
+            "explicit yes, so unconfined execution stays operator-declared and is "
+            "never enabled implicitly by the platform.",
         ),
     )
     apps_allow_third_party: bool = field(
@@ -841,7 +919,20 @@ class AgentConfig:
             "Defaults to false. Only the JSON boolean true admits in-process Python "
             "hooks, backend processes, lifecycle/install scripts, and openCommand. "
             "App code can access the filesystem, network, and in-memory credentials; "
-            "enable this only for apps you trust (CSE SEC-012).",
+            "enable this only for apps you trust (CSE SEC-012). Prefer "
+            "apps_trusted, which grants the same admission to ONE named app.",
+        ),
+    )
+    apps_trusted: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Trusted Apps",
+            "Per-app grants for third-party execution — the narrow form of "
+            "apps_allow_third_party. An app whose manifest name appears here is "
+            "admitted to run Python hooks, its backend, lifecycle scripts, and "
+            "openCommand; every other third-party app stays blocked. Only a JSON "
+            "array of app-name strings is honoured, and no wildcard entry is "
+            "accepted (use apps_allow_third_party to trust all).",
         ),
     )
     jail: str = field(
@@ -1126,6 +1217,34 @@ class AgentConfig:
                 clamped,
             )
             self.soft_stop_budget_secs = clamped
+        # Keep only known role keys, each normalized ("auto"/non-str -> "").
+        # Defensive for directly-constructed instances; the load() path already
+        # feeds coerced input.
+        self.role_models = coerce_role_models(self.role_models)
+        self.role_efforts = coerce_role_efforts(self.role_efforts)
+
+    def resolve_model(self, role: str) -> str:
+        """Effective model id for a task ``role`` — INDEPENDENT of the chat model.
+
+        Returns the role's own pin (``role_models[role]``) or :data:`DEFAULT_MODEL`
+        (``"auto"``). It deliberately does NOT inherit ``agent.model``: background
+        workers (lite / heartbeat) run unattended, so riding the interactive chat
+        flagship on every cycle would be a silent cost regression. ``"auto"`` lets
+        the provider pick a served model, entitlement-safe on every tier. Callers
+        that write a kiro agent spec / cc_model store this verbatim.
+        """
+        return normalize_agent_model(self.role_models.get(role, "")) or DEFAULT_MODEL
+
+    def resolve_effort(self, role: str) -> str:
+        """Effective reasoning effort for a task ``role`` — INDEPENDENT of the chat
+        default.
+
+        Returns ``role_efforts[role]`` or ``""`` (the provider/model default). It
+        does not inherit ``agent.reasoning_effort``, for the same reason
+        :meth:`resolve_model` does not inherit ``agent.model``. Effort only takes
+        effect on reasoning-capable models; on others it is ignored downstream.
+        """
+        return self.role_efforts.get(role, "")
 
 
 @dataclass
@@ -1485,26 +1604,82 @@ class KnowledgeConfig:
             "0 keeps the workers warm indefinitely.",
         ),
     )
-    auto_ingest_doc_links: bool = field(
-        default=False,
+    auto_add_documents: bool = field(
+        default=True,
         metadata=_meta(
-            "Auto-Ingest Doc Links",
-            "Automatically ingest documents referenced by links pasted into chat "
-            "whose host is in the doc-ingest allowlist. Off by default. An edition "
-            "that supplies a doc-link scanner (via the dashboard on_user_message "
-            "seam) uses this + the host allowlist below; inert in the public build "
-            "unless a link scanner is wired.",
+            "Auto-Add Documents",
+            "Let the agent add documents it comes across during normal work to the "
+            "Knowledge Library, so they become searchable later. The agent reads the "
+            "document with its own tools, under your approval, and hands over the "
+            "text -- Kiro Crew fetches nothing itself, so the doc-ingest host "
+            "allowlist below does not apply. Added documents appear in a single "
+            "aggregate 'Auto-added' source you can remove in one click. On by "
+            "default. Renamed from auto_ingest_doc_links, which is still accepted.",
+        ),
+    )
+    auto_register_project_docs: bool = field(
+        default=True,
+        metadata=_meta(
+            "Auto-Register Project Documents",
+            "Register the documents of each project you work in as a Knowledge "
+            "source automatically, so a project's design docs, specs and READMEs "
+            "become searchable without adding the folder by hand. Only documents "
+            "are taken (.md/.pdf/.docx/.org above a small size floor, excluding "
+            "agent instructions, generated files and repository boilerplate) -- "
+            "never source code. No confirmation step: the document filter and the "
+            "per-sweep chunk budget below bound the cost, and deleting the source "
+            "keeps it deleted. On by default.",
+        ),
+    )
+    auto_ingest_chunk_budget: int = field(
+        default=150,
+        metadata=_meta(
+            "Auto-Ingest Chunk Budget",
+            "Chunks an automatically-registered source may ingest per watcher "
+            "sweep. Each chunk costs one LLM extraction call, so this is what "
+            "actually bounds the cost of auto-registration -- file filters bound "
+            "pollution, not spend. Newest documents land first and the rest "
+            "trickle in on later sweeps, so a new project never arrives as a "
+            "burst. 0 removes the bound.",
+        ),
+    )
+    folder_ingest_chunk_budget: int = field(
+        default=300,
+        metadata=_meta(
+            "Folder Ingest Chunk Budget",
+            "Chunks a folder you add by hand may ingest per watcher sweep. Adding "
+            "a source-code repository discovers thousands of files, and each "
+            "chunk costs an LLM extraction call on a pool of billed sessions, so "
+            "an unpaced first scan can spend a large amount unattended. Nothing "
+            "is skipped: newest files land first and the rest continue on later "
+            "sweeps. Higher than the auto-ingest budget because you asked for the "
+            "folder explicitly. 0 removes the bound; a per-source chunk_budget "
+            "property overrides it for one folder.",
+        ),
+    )
+    dedup_every_n_sweeps: int = field(
+        default=12,
+        metadata=_meta(
+            "De-duplicate Every N Sweeps",
+            "Run a full duplicate-collapsing pass every Nth watcher sweep. The "
+            "per-write gate refuses a byte-identical document, but only a full "
+            "pass catches a near-duplicate (the same document edited slightly "
+            "between two sources) or duplicates that already existed. At the "
+            "default 300s sweep interval, 12 is roughly hourly. 0 disables it.",
         ),
     )
     doc_ingest_hosts: list[str] = field(
         default_factory=list,
         metadata=_meta(
             "Doc-Ingest Host Allowlist",
-            "Exact hostnames whose links may be auto-ingested when "
-            "auto_ingest_doc_links is on. Empty = ingest nothing (SSRF-safe "
-            "deny-by-default): a link is only fetched if its host is an exact "
-            "member of this list. Prevents a pasted link to an internal metadata "
-            "endpoint or arbitrary host from being fetched.",
+            "Exact hostnames whose links may be fetched by KIROCREW ITSELF and "
+            "ingested, for an edition that wires a server-side doc-link scanner. "
+            "Empty = fetch nothing (SSRF-safe deny-by-default). This governs only "
+            "that server-fetch path -- it does NOT gate 'Auto-Add Documents' "
+            "above, where the agent has already fetched the content under its own "
+            "approval and Kiro Crew fetches nothing. Applying it there would make "
+            "the feature ingest nothing on a default config while its toggle "
+            "reads on.",
         ),
     )
     auto_discover_folder: bool = field(
@@ -1531,6 +1706,20 @@ class KnowledgeConfig:
             "it always exists, which would defeat discovery.",
         ),
     )
+
+
+def _read_auto_add_documents(knowledge_data: dict) -> bool:
+    """Read the auto-add-documents toggle, honouring the older spelling.
+
+    Accepts the older ``auto_ingest_doc_links`` spelling so an existing config's
+    value carries over instead of silently reverting to the default on upgrade.
+    Canonical spelling is ``auto_add_documents``, which is what ``save()`` writes,
+    so a save/load round-trip settles on it.
+    """
+    for key in ("auto_add_documents", "auto_ingest_doc_links"):
+        if key in knowledge_data:
+            return bool(knowledge_data.get(key))
+    return True
 
 
 @dataclass
@@ -1684,12 +1873,71 @@ class PublishConfig:
 
 
 @dataclass
+class TailscaleConfig:
+    """Tailnet access for the dashboard (RFC: rfc-tailnet-dashboard-access)."""
+
+    enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Tailnet Access",
+            "Accept this machine's own MagicDNS name as a dashboard origin, so "
+            "`tailscale serve` works without hand-writing dashboard.url. Reads "
+            "the local Tailscale daemon once at startup; contributes nothing if "
+            "Tailscale is absent, stopped, or MagicDNS is off. Does NOT widen the "
+            "network bind and does NOT change authentication — every request "
+            "still needs a dashboard session.",
+        ),
+    )
+
+
+@dataclass
+class CfAccessConfig:
+    """Cloudflare Access trust for dashboard auto-login (JWT verification)."""
+
+    team_domain: str = field(
+        default="",
+        metadata=_meta(
+            "Cloudflare Access Team Domain",
+            "Your Zero Trust team domain (e.g. `myteam.cloudflareaccess.com`). "
+            "With the AUD tag also set, a request whose `Cf-Access-Jwt-Assertion` "
+            "header verifies against this domain's signing keys is signed in "
+            "automatically as the JWT's email — no token URL needed. Empty "
+            "disables the feature.",
+        ),
+    )
+    aud: str = field(
+        default="",
+        metadata=_meta(
+            "Cloudflare Access Application AUD",
+            "The Access application's Audience (AUD) tag, from the Zero Trust "
+            "dashboard. Required alongside the team domain; it pins assertions "
+            "to this specific Access application.",
+        ),
+    )
+
+
+@dataclass
 class DashboardConfig:
     url: str = field(
         default="",
         metadata=_meta(
             "Dashboard URL",
             "Public URL for the dashboard (used in Slack links).",
+        ),
+    )
+    tailscale: TailscaleConfig = field(
+        default_factory=TailscaleConfig,
+        metadata=_meta(
+            "Tailscale",
+            "Reach the dashboard over your tailnet via `tailscale serve`.",
+        ),
+    )
+    cf_access: CfAccessConfig = field(
+        default_factory=CfAccessConfig,
+        metadata=_meta(
+            "Cloudflare Access",
+            "Auto-login for requests that passed a Cloudflare Access policy "
+            "(verified via the signed `Cf-Access-Jwt-Assertion` header).",
         ),
     )
     restore_sessions: bool = field(
@@ -1774,10 +2022,12 @@ class DashboardConfig:
             "Response Verbosity",
             "Controls how terse the agent's prose is. 'default' is normal; "
             "'concise' injects brevity guidelines (lead with the answer, cut "
-            "filler, keep code/errors verbatim) while preserving full detail for "
-            "security warnings, irreversible-action confirmations, and ordered "
-            "multi-step instructions.",
-            enum=["default", "concise"],
+            "filler, keep code/errors verbatim); 'ultra' writes for an ADHD "
+            "reader — the answer lands in a 3-sentence opening, and any detail "
+            "after it must be scannable bullets rather than prose. Both levels "
+            "preserve full detail for security warnings, irreversible-action "
+            "confirmations, and ordered multi-step instructions.",
+            enum=["default", "concise", "ultra"],
         ),
     )
     link_previews: bool = field(
@@ -1790,6 +2040,19 @@ class DashboardConfig:
             "model outputs, so each linked site sees a request from your IP "
             "address. When false the /api/link-meta endpoint fetches nothing and "
             "returns 403.",
+        ),
+    )
+    usage_text_scrape_enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Spend Credits To Read The Credit Meter",
+            "Let the credit pill fall back to a `kiro-cli /usage` chat turn when "
+            "the free usage API returns no plan. That fallback is a REAL billed "
+            "LLM turn on whichever model the lite agent resolves, and it repeats "
+            "on every refresh interval for as long as any dashboard tab is open, "
+            "so it is off by default: a meter that reports spending must not "
+            "itself spend. While it is off the pill shows whatever the free API "
+            "returned and hides when the API has nothing to show.",
         ),
     )
     tail_fork_enabled: bool = field(
@@ -1805,6 +2068,17 @@ class DashboardConfig:
         metadata=_meta(
             "Auto Open Browser",
             "Open the dashboard URL in the default browser on gateway startup.",
+        ),
+    )
+    prevent_sleep: bool = field(
+        default=False,
+        metadata=_meta(
+            "Prevent Sleep While Running",
+            "Keep this computer awake while the agent is running a task, so a long "
+            "task is not interrupted by the machine going to sleep. Off by default. "
+            "Uses caffeinate on macOS, systemd-inhibit on Linux, and "
+            "SetThreadExecutionState on Windows; on a host with no keep-awake "
+            "backend it is a no-op.",
         ),
     )
     quick_send: bool = field(
@@ -1955,6 +2229,13 @@ class DashboardConfig:
             "Show feature tip cards while the agent is thinking.",
         ),
     )
+    folder_suggestions_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Folder Suggestions Enabled",
+            "Offer to file a newly-titled, unfiled chat session into a matching folder.",
+        ),
+    )
     tips_cadence_hours: float = field(
         default=6.0,
         metadata=_meta(
@@ -1977,10 +2258,12 @@ class DashboardConfig:
         ),
     )
     tips_model: str = field(
-        default="claude-haiku-4.5",
+        default="auto",
         metadata=_meta(
             "Tips Model",
-            "Model ID for tips generation (pinned to Haiku-class for cost efficiency).",
+            "Model ID for tips generation. Defaults to \"auto\" so it inherits the "
+            "account's governed model; a hardcoded id can be rejected on accounts "
+            "or partitions that do not serve it.",
         ),
     )
     tips_explore_ratio: float = field(
@@ -2094,8 +2377,17 @@ class ExternalRegistryConfig:
 @dataclass
 class SkillsConfig:
     max_triggered: int = field(
-        default=3,
-        metadata=_meta("Max Triggered", "Maximum number of skills to load per message (≥1)."),
+        default=0,
+        metadata=_meta(
+            "Max Triggered",
+            "Maximum number of skills a single message may flag as relevant (≥0). "
+            "Each match injects that skill's full content, unless the skill sets "
+            "inject_on_trigger: false (pointer-only; requires max_triggered > 0 to "
+            "have any effect). Defaults to 0 (disabled): the agent discovers skills "
+            "from the Available Skills index and reads them on demand via cat, "
+            "$skillname, or skill_search. Set to a positive integer to re-enable "
+            "per-turn word-overlap trigger matching.",
+        ),
     )
     # ── Lazy skill injection (opt-in, like MCP prewarm) ──
     lazy_load: bool = field(
@@ -2208,11 +2500,13 @@ class SkillsConfig:
         ),
     )
     judge_model: str = field(
-        default="claude-haiku-4.5",
+        default="auto",
         metadata=_meta(
             "Skill Judge Model",
-            "Cheap model used for the dedupe judge and the advisory pending review. "
-            "Kept separate from the main chat model to bound cost.",
+            "Model used for the dedupe judge and the advisory pending review. "
+            "Defaults to \"auto\" to inherit the account's governed model; the "
+            "value only gates whether the judge runs (any truthy value enables "
+            "it) — the judge turn itself runs on the shared background session.",
         ),
     )
     extra_paths: list[str] = field(
@@ -2226,9 +2520,9 @@ class SkillsConfig:
     )
 
     def __post_init__(self) -> None:
-        if self.max_triggered < 1:
-            logger.warning("max_triggered %d < 1, using 1", self.max_triggered)
-            object.__setattr__(self, "max_triggered", 1)
+        if self.max_triggered < 0:
+            logger.warning("max_triggered %d < 0, using 0", self.max_triggered)
+            object.__setattr__(self, "max_triggered", 0)
         if self.auto_min_tool_calls < 2:
             logger.warning("auto_min_tool_calls %d < 2, using 2", self.auto_min_tool_calls)
             object.__setattr__(self, "auto_min_tool_calls", 2)
@@ -2672,7 +2966,7 @@ class ChannelConfig:
         )
 
 
-_VALID_STT_PROVIDERS = ("whisper", "mlx", "transcribe")
+_VALID_STT_PROVIDERS = ("whisper", "mlx", "apple", "transcribe")
 _VALID_CHANNEL_PREFIXES = ("C", "D", "G")
 
 
@@ -2945,7 +3239,10 @@ class SttConfig:
         default=False,
         metadata=_meta(
             "Streaming",
-            "Stream partial transcripts live to the dashboard input (transcribe provider only).",
+            "Stream partial transcripts live to the dashboard input. Supported by the "
+            "streaming providers only: `transcribe` (AWS, cloud) and `apple` "
+            "(on-device, macOS 26+). The whisper/mlx CLIs have no partial-result "
+            "channel.",
         ),
     )
     endpointing: bool = field(
@@ -2954,7 +3251,8 @@ class SttConfig:
             "Semantic endpointing",
             "While streaming dictation, run a fast background model on each stable "
             "transcript segment to detect when you have finished a complete request, "
-            "then auto-submit. Transcribe streaming only; off by default.",
+            "then auto-submit. Streaming providers only (transcribe, apple); "
+            "off by default.",
         ),
     )
     dictation_panel: bool = field(
@@ -4381,12 +4679,14 @@ class KiroCrewConfig:
                 approval_mode=agent_data.get("approval_mode", "auto"),
                 streaming=agent_data.get("streaming", True),
                 model=agent_data.get("model", DEFAULT_MODEL),
+                role_models=coerce_role_models(agent_data.get("role_models")),
+                role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
                 provider=agent_data.get("provider", PROVIDER_ACP),
                 account=agent_data.get("account", ""),
                 accounts=_parse_accounts(agent_data.get("accounts", {})),
                 default_agent=agent_data.get("default_agent", ""),
-                sandbox=agent_data.get("sandbox", "off"),
+                sandbox=agent_data.get("sandbox", "auto"),
                 sandbox_allow_no_isolation=bool(
                     agent_data.get("sandbox_allow_no_isolation", False)
                 ),
@@ -4395,6 +4695,11 @@ class KiroCrewConfig:
                 ),
                 apps_allow_third_party=_safe_bool(
                     agent_data.get("apps_allow_third_party", False), False
+                ),
+                apps_trusted=(
+                    [a for a in _trusted if isinstance(a, str) and a]
+                    if isinstance(_trusted := agent_data.get("apps_trusted"), list)
+                    else []
                 ),
                 jail=_normalize_jail(agent_data.get("jail", "auto")),
                 dangerously_skip_permissions=_read_skip_permissions(agent_data),
@@ -4577,7 +4882,15 @@ class KiroCrewConfig:
                     knowledge_data.get("pool_idle_ttl_secs", 300),
                     300,
                 ),
-                auto_ingest_doc_links=bool(knowledge_data.get("auto_ingest_doc_links", False)),
+                auto_add_documents=_read_auto_add_documents(knowledge_data),
+                auto_register_project_docs=bool(
+                    knowledge_data.get("auto_register_project_docs", True)),
+                auto_ingest_chunk_budget=_safe_nonnegative_int(
+                    knowledge_data.get("auto_ingest_chunk_budget", 150), 150),
+                folder_ingest_chunk_budget=_safe_nonnegative_int(
+                    knowledge_data.get("folder_ingest_chunk_budget", 300), 300),
+                dedup_every_n_sweeps=_safe_nonnegative_int(
+                    knowledge_data.get("dedup_every_n_sweeps", 12), 12),
                 doc_ingest_hosts=[
                     str(h)
                     for h in knowledge_data.get("doc_ingest_hosts", [])
@@ -4710,6 +5023,17 @@ class KiroCrewConfig:
             ),
             dashboard=DashboardConfig(
                 url=dashboard_data.get("url", ""),
+                tailscale=TailscaleConfig(
+                    enabled=_safe_bool(
+                        _safe_dict(dashboard_data.get("tailscale")).get("enabled"), False
+                    ),
+                ),
+                cf_access=CfAccessConfig(
+                    team_domain=str(
+                        _safe_dict(dashboard_data.get("cf_access")).get("team_domain", "")
+                    ),
+                    aud=str(_safe_dict(dashboard_data.get("cf_access")).get("aud", "")),
+                ),
                 restore_sessions=dashboard_data.get("restore_sessions", False),
                 restore_window_minutes=dashboard_data.get("restore_window_minutes", 30),
                 surface_channel_sessions=dashboard_data.get("surface_channel_sessions", True),
@@ -4726,12 +5050,16 @@ class KiroCrewConfig:
                     LOOP_STALL_EXIT_AFTER_MAX,
                 ),
                 auto_open_browser=dashboard_data.get("auto_open_browser", True),
+                prevent_sleep=_safe_bool(dashboard_data.get("prevent_sleep"), False),
                 quick_send=dashboard_data.get("quick_send", False),
                 session_grid=dashboard_data.get("session_grid", False),
                 mcp_app_panel=dashboard_data.get("mcp_app_panel", False),
                 widget_density=dashboard_data.get("widget_density", "more"),
                 verbosity=dashboard_data.get("verbosity", "default"),
                 link_previews=_safe_bool(dashboard_data.get("link_previews"), False),
+                usage_text_scrape_enabled=_safe_bool(
+                    dashboard_data.get("usage_text_scrape_enabled"), False
+                ),
                 tail_fork_enabled=dashboard_data.get("tail_fork_enabled", False),
                 terminal=dashboard_data.get("terminal", {"enabled": True}),
                 default_project=dashboard_data.get("default_project", ""),
@@ -4757,6 +5085,9 @@ class KiroCrewConfig:
                 user_role_other=str(dashboard_data.get("user_role_other", "")),
                 user_technical_level=str(dashboard_data.get("user_technical_level", "")),
                 tips_enabled=bool(dashboard_data.get("tips_enabled", True)),
+                folder_suggestions_enabled=bool(
+                    dashboard_data.get("folder_suggestions_enabled", True)
+                ),
                 tips_cadence_hours=_safe_float(
                     dashboard_data.get("tips_cadence_hours", 6.0), 6.0, lo=0.0
                 ),
@@ -4766,7 +5097,7 @@ class KiroCrewConfig:
                 tips_recency_decay=_safe_float(
                     dashboard_data.get("tips_recency_decay", 0.6), 0.6, lo=0.0, hi=1.0
                 ),
-                tips_model=str(dashboard_data.get("tips_model", "claude-haiku-4.5")),
+                tips_model=str(dashboard_data.get("tips_model", "auto")),
                 tips_explore_ratio=_safe_float(
                     dashboard_data.get("tips_explore_ratio", 0.2), 0.2, lo=0.0, hi=1.0
                 ),
@@ -4949,7 +5280,7 @@ class KiroCrewConfig:
             ),
             heartbeat=HeartbeatConfig(default_deliver=heartbeat_default_deliver),
             skills=SkillsConfig(
-                max_triggered=_safe_int(skills_data.get("max_triggered", 3), 3),
+                max_triggered=_safe_int(skills_data.get("max_triggered", 0), 0),
                 lazy_load=bool(skills_data.get("lazy_load", False)),
                 auto_create_from_sessions=bool(skills_data.get("auto_create_from_sessions", False)),
                 auto_refine_on_deviation=bool(skills_data.get("auto_refine_on_deviation", False)),
@@ -4964,7 +5295,7 @@ class KiroCrewConfig:
                 pending_ttl_days=_safe_int(skills_data.get("pending_ttl_days", 30), 30),
                 generate_scripts=bool(skills_data.get("generate_scripts", True)),
                 judge_model=str(
-                    skills_data.get("judge_model", "claude-haiku-4.5") or "claude-haiku-4.5"
+                    skills_data.get("judge_model", "auto") or "auto"
                 ),
                 extra_paths=[
                     p for p in _safe_list(skills_data.get("extra_paths")) if isinstance(p, str)
@@ -5325,7 +5656,15 @@ class KiroCrewConfig:
             # pick up effort already recovered from a pre-existing overlay,
             # never the freshly-set slot value. Mirrors the _claude_code path.
             _eff_per_model: dict[str, str] = {}
-            _eff = reasoning_effort_override or default_effort
+            # Role-aware effort default: background worker agents (lite /
+            # heartbeat) resolve the "background" role effort; everything else
+            # uses the chat default. An explicit override (the dashboard slot's
+            # effort, or a sub-agent's resolved "subagent" effort) still wins.
+            if agent in ("kirocrew-lite", "kirocrew-heartbeat"):
+                base_effort = self.agent.resolve_effort("background")
+            else:
+                base_effort = default_effort
+            _eff = reasoning_effort_override or base_effort
             if m and _eff and is_valid_effort(_eff) and model_supports_effort(m):
                 _eff_per_model[m] = _eff
             return AcpProvider(

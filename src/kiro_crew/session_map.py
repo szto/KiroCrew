@@ -202,7 +202,7 @@ class SessionMap:
         # Fallback: dashboard history round-trip (dashboard:dashboard_X → dashboard:X)
         matched_key = key
         if not entry and key.startswith("dashboard:dashboard_"):
-            canonical = "dashboard:" + key[len("dashboard:dashboard_"):]
+            canonical = "dashboard:" + key[len("dashboard:dashboard_") :]
             entry = self._data.get(canonical)
             if entry:
                 matched_key = canonical
@@ -307,6 +307,22 @@ class SessionMap:
             self._save()
             logger.info("Pruned %d stale session map entries", len(stale))
         return len(stale)
+
+    def mapped_sids_by_key(self) -> dict[str, str]:
+        """Session key to kiro-cli session ID, for every entry that has one.
+
+        A session ID present here is one Kiro Crew can still resume. Callers that
+        account for or reclaim disk space need both halves of this relation: the
+        IDs to exclude from deletion, and the key each ID belongs to so a
+        session's transcript can be paired with its replay log. Returning the
+        mapping rather than only the ID set is what lets such a caller reclaim a
+        session whole instead of leaving one half behind.
+        """
+        return {
+            key: sid
+            for key, entry in self._data.items()
+            if isinstance(sid := entry.get("sid"), str) and sid
+        }
 
     def set_slack_link(self, key: str, thread_ts: str, channel_id: str | None) -> None:
         """Link a session to a Slack thread. Creates entry if needed."""
@@ -489,6 +505,35 @@ class SessionMap:
                 matches.append(key)
         return matches
 
+    def clear_mirror_links_at(self, link: ChannelLink) -> list[str]:
+        """Clear EVERY session whose mirror targets an exact non-Slack location.
+
+        The write counterpart of :meth:`find_mirror_sessions`. An in-channel
+        unlink means "nothing mirrors into this conversation anymore", and the
+        bindings that occupy a location are matched by VALUE there — so a row
+        stranded under a key spelling the conversation no longer uses (a rotated
+        DM generation, a pre-unification ``dashboard:`` row) or a dashboard
+        session mirroring into the conversation still blocks it while being
+        unreachable by any key-addressed :meth:`clear_mirror_link`. Clearing by
+        location closes that gap and doubles as the repair path for duplicate
+        bindings, which the inbound resolver deliberately refuses to pick from.
+
+        Returns the cleared session keys (empty when the location was free).
+        Slack mirrors live in their own reverse index and are out of scope,
+        exactly as in :meth:`find_mirror_sessions`.
+        """
+        cleared: list[str] = []
+        for key in self.find_mirror_sessions(link):
+            entry = self._data.get(key)
+            if entry is None:  # pragma: no cover - keys come from _data itself
+                continue
+            entry.pop("mirror", None)
+            entry.pop("mirror_accepts_inbound", None)
+            cleared.append(key)
+        if cleared:
+            self._save()
+        return cleared
+
     def clear_mirror_link(self, key: str) -> bool:
         """Remove a session's outbound mirror binding; return True iff one existed.
 
@@ -527,7 +572,7 @@ class SessionMap:
         prefix = f"{bucket}:gen"
         for key in self._data:
             if key.startswith(prefix):
-                suffix = key[len(prefix):]
+                suffix = key[len(prefix) :]
                 if suffix.isdigit():
                     best = max(best, int(suffix))
         return best

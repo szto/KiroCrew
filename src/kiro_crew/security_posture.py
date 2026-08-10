@@ -105,6 +105,23 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "Skill context budget",
+        "dashboard/handlers/skill_budget.py",
+        "Skill display names served by `GET /api/skills/-/budget`. An auto-skill's "
+        "frontmatter `name` is written by the agent, so it is LLM-authored text that "
+        "reaches the dashboard verbatim — the same output-boundary reason as the "
+        "session-memory titles below.",
+    ),
+    (
+        "Session & task memory panel",
+        "dashboard/session_memory.py",
+        "Chat titles served by `GET /api/sessions/memory`. Titles are generated from "
+        "user content, and the resume path in `chat_handlers` assigns a "
+        'client-supplied `body["title"]` to the slot with no scan of its own, so this '
+        "serializer is the boundary that guarantees the scan — the same "
+        "output-boundary reason as the sibling subagent-task text.",
+    ),
+    (
         "Mochi notify + pin egress",
         "apps/builtins/mochi/hooks.py",
         "Agent-authored notify text (perform_pet_action summary/chatMessage) crosses to "
@@ -119,6 +136,147 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "code identifiers and shortened paths, but the artifact exists to be sent "
         "to a maintainer, and py-spy's raw output embeds absolute paths from the "
         "target process — so it is an egress boundary, redacted on the way out.",
+    ),
+    (
+        "md-notebook error middleware",
+        "apps/builtins/md_notebook/server.py",
+        "Every md-notebook API error body. Handlers drive git and filesystem work "
+        "over caller-supplied vault URLs, ids and note paths, so an unmodeled "
+        "exception carries absolute paths and git stderr; `_safe_error` scrubs "
+        "credentials, exfiltration URLs and host paths before the JSON reaches the "
+        "browser — the same output-boundary reason as the dashboard error sinks.",
+    ),
+    (
+        "Issue Radar provider CLI stderr",
+        "apps/builtins/issue_radar/backend/errors.py",
+        "`gh`/`glab` stderr quoted into provider exception messages, which the "
+        "issue-radar routes return in their error bodies and the frontend renders "
+        "verbatim. `sanitize_cli_stderr` runs only the host-path pass plus a "
+        "private-host filter, not the credential scanner: both CLIs take their "
+        "token from the environment rather than argv and neither echoes it, so host "
+        "topology is the disclosure risk here. The actionable phrasing (auth, "
+        "not-found, 403, timeout) is deliberately preserved so the user can "
+        "self-diagnose.",
+    ),
+    (
+        "Auto-Improvement fallback tool audit",
+        "apps/builtins/auto_improvement/spine/agent_runner.py",
+        "Per-tool SEL events for the unattended subprocess agent carry the tool's TARGET "
+        "HINT — a path, glob or shell command the model chose. On-disk SEL records are not "
+        "redacted by the writer and the persisted HMAC chain signs the bytes as-written, so "
+        "the hint is redacted here, before `log_tool_invocation`. Fail-closed: a redactor "
+        "that cannot run emits a fixed placeholder rather than raw agent text.",
+    ),
+    (
+        "Auto-Improvement commit messages",
+        "apps/builtins/auto_improvement/spine/driver.py",
+        "Agent-authored commit subjects/bodies redacted before they become PERMANENT git "
+        "history — both the local keep commit and the direct-push commit. A pushed commit "
+        "message cannot be edited without rewriting history, so this is a one-way egress "
+        "boundary.",
+    ),
+    (
+        "Auto-Improvement one-click commit",
+        "apps/builtins/auto_improvement/backend/commit.py",
+        "The operator-triggered commit path builds its message from the queued PR body "
+        "(agent-authored prose) and redacts before committing — same "
+        "cannot-be-unpublished reason as the driver's path.",
+    ),
+    (
+        "Auto-Improvement MCP tool results",
+        "apps/builtins/auto_improvement/backend/mcp_server.py",
+        "Every `tools/call` result is serialized run evidence handed to an LLM — a finding's "
+        "note/signature/hypothesis are the model's own prose. Redacted BEFORE truncation so "
+        "the cut cannot split a credential into a fragment the scanner misses. FAIL-CLOSED: "
+        "these six tools are conveniences, so withholding a result beats leaking. The ERROR "
+        "paths are scanned too (`_redact_error`): tool ARGUMENTS reach exception text by "
+        'design — `get_finding` raises "no finding with fingerprint <fp>" with the caller\'s '
+        "raw value — so a credential-shaped argument was echoed straight back to the model "
+        "and into the SEL record. Measured before fixing. The exception type and JSON-RPC "
+        "error code are composed in after scrubbing, so the message stays actionable.",
+    ),
+    (
+        # The watcher's residual risk, disclosed because accepting it is the OPERATOR's
+        # decision and a silent limitation is the real defect. Measured: a nested process under
+        # `mode="strict"` sees ~/.aws, ~/.config/gh and ~/.docker EMPTY on a populated host,
+        # and ~/.ssh exposes only `known_hosts` (host-key verification needs it) while
+        # id_rsa/*.key stay hidden — so CREDENTIALS are confined. NETWORK EGRESS is NOT: the
+        # sandbox never enters a network namespace (no CLONE_NEWNET; its docstring explains
+        # agentic commands need reachable networking), and while curl/wget/nc are denied,
+        # `python helper.py` is allowed and can open a socket. The shell denylist cannot close
+        # that — it gates the requested command, not what the command then does. Consequence:
+        # point the PR watcher only at repositories whose PR comments you would be willing to
+        # execute. Raised by the GPT review (twice); the credential half was already verified
+        # under D-84, the egress half is new and correct.
+        "Auto-Improvement PR-watcher egress boundary",
+        "apps/builtins/auto_improvement/backend/pr_watchers.py",
+        "The watcher reads UNTRUSTED text (pull-request comments, check logs) and runs with an "
+        "auto-approved shell, because its job is to run the repository's own build/test/lint, "
+        "rebase, and commit. Credential stores are hidden by the strict sandbox (verified), but "
+        "network EGRESS is deliberately reachable and a nested interpreter can open a socket "
+        "even though curl/wget/nc are denied. Two OPT-IN gates, both default OFF, both a "
+        "one-time consent: `watcherAcceptEgressRisk` is a HARD precondition — `_make_runner` "
+        "refuses to build any watcher runner without it, so a watcher cannot run at all until "
+        "the operator acknowledges this egress boundary — and `watcherAutoStart` separately "
+        "gates whether a polled GET may PROMOTE watchers (a promote used to happen with no "
+        "operator action, leaving no consent moment). Treat setting either flag as agreeing to "
+        "execute the pull request's comments.",
+    ),
+    (
+        "Auto-Improvement run activity feed",
+        "apps/builtins/auto_improvement/backend/runner.py",
+        "The live activity ring buffer carries RAW model output — assistant text and the "
+        "`command` of a bash tool call — and is served verbatim by GET /run into the "
+        "dashboard — so this is an egress boundary, not an internal log. FAIL-CLOSED: an "
+        "unscannable string becomes a fixed placeholder while the event structure, "
+        "timestamps and other fields survive, so the operator still sees the run "
+        "progressing without unscanned text reaching the browser. Recursive, because the "
+        "agent event is nested. The WATCHER snapshot and chat-session records are scanned on "
+        "the same grounds (`routes._redact_tree`): the watcher log ring is redacted on WRITE, "
+        "but `WatcherState.as_dict` beside it served `target`/`title`/`lastNote`/"
+        "`verdictReason`/`fixing` raw — all model- or pull-request-derived, and the watcher "
+        "ingests PR text as untrusted input by design. Measured with a credential-shaped "
+        "`target` (an access-key literal, not reproduced here — this disclosure is itself "
+        "scanned): it reached the browser verbatim. The session "
+        "records go through it too, because `save_session` merges the caller's patch and the "
+        "stored `title` is built from a finding's target. So do the route ERROR bodies: "
+        "`commit.py` builds its `error` from `(proc.stderr or '')[:160]` — raw git stderr, "
+        "which quotes refs, paths and whatever a repository's own hooks printed. That was "
+        "latent while nothing rendered it; surfacing a refused commit at the finding row made "
+        'it a live path to the browser, so all five `result.get("error")` responses plus the '
+        "PR-status and draft bodies are scanned. "
+        "Covers the TERMINAL ERROR field on the same response too "
+        '(`_fail`): `f"{type(exc).__name__}: {exc}"` was assigned raw while the feed '
+        "beside it was scanned, and an exception message routinely quotes what failed — a "
+        "git url, a subprocess argv, a path — so a run dying on an agent-influenced value "
+        "carried it to the browser. The exception TYPE is composed in after redaction so "
+        "the message stays actionable.",
+    ),
+    (
+        "Auto-Improvement PR prose",
+        "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py",
+        "The pull-request TITLE and BODY are agent-authored prose published by `gh pr "
+        "create`, and a PR description cannot be un-published. Redacted in place because "
+        "prose survives rewriting; the DIFF beside it is instead detected-and-refused by "
+        "`spine/push_policy.py:scan_content_for_secrets`, since rewriting a patch would "
+        "corrupt the fix the gate proved.",
+    ),
+    (
+        "Auto-Improvement finding evidence",
+        "apps/builtins/auto_improvement/backend/routes.py",
+        "The candidate diff and drafted PR body are agent-authored text read back off "
+        "disk and rendered in the operator's browser by GET /findings/{fp}. FAIL-CLOSED, "
+        "unlike the watcher log below: the text stays on disk and re-readable, so "
+        "withholding it beats serving it unscanned.",
+    ),
+    (
+        "Auto-Improvement watcher log",
+        "apps/builtins/auto_improvement/backend/pr_watchers.py",
+        "Per-PR watcher log lines carry agent output and third-party CI text and are "
+        "served to the dashboard via GET /watchers/{fp}/log with NO second scan, so this is "
+        "the only pass between that text and the browser. FAIL-CLOSED: an unscannable "
+        "line becomes a fixed placeholder, so the log keeps advancing without serving "
+        "unscanned text.",
     ),
     (
         "Side-chat parent snapshot",
@@ -175,6 +333,15 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "and detail responses. Document CONTENT is deliberately NOT redacted: it "
         "populates the tab's editor and is written straight back on save, so "
         "redacting it would overwrite the user's own file with markers.",
+    ),
+    (
+        "Telemetry spend ranking",
+        "dashboard/handlers/telemetry.py",
+        "Session titles attached to the conversations-by-spend rows of "
+        "/api/telemetry/startup. `display_title` is model-authored, and this is a "
+        "SECOND egress path for it alongside the slot snapshot — a title set "
+        "through `api_chat_slot_resume` reaches the slot unredacted, so nothing "
+        "upstream of this handler has scanned it.",
     ),
     (
         "OpenAI-compatible API",
@@ -278,6 +445,13 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "Install/start/stop script output and warnings surfaced from an app.",
     ),
     (
+        "App teardown output",
+        "apps/teardown.py",
+        "Output from an app's own onDisable script, scrubbed by the dual-pass "
+        "redact() helper before it becomes a warning on the disable and "
+        "trust-revocation responses.",
+    ),
+    (
         "App activity log",
         "apps/builtins/mochi/activity_log.py",
         "Agent-authored activity entries are redacted before persistence, for the "
@@ -295,17 +469,37 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "the same output-boundary reason as the app activity log.",
     ),
     (
+        "Slack render pipeline",
+        "slack/format.py",
+        "The Slack RENDERING boundary: text that is converted to mrkdwn goes "
+        "through render_for_slack / render_one_for_slack, and a build gate "
+        "(test_slack_render_pipeline.py) fails if any module calls "
+        "to_slack_mrkdwn itself. Both helpers strip ANSI and run "
+        "redact_via_context BEFORE conversion and again after, because neither "
+        "ordering is safe alone -- the ANSI strip inside to_slack_mrkdwn "
+        "reassembles a credential the escapes had broken up, while its 39k "
+        "self-truncation cuts one into an unmatchable prefix. Text is pre-split "
+        "below that ceiling so conversion never truncates, and OPTIONS choice "
+        "labels are redacted before the Block Kit slices. SCOPE, stated exactly: "
+        "the gate polices the CONVERSION primitive, not the Slack API calls -- a "
+        "path that posts raw text without ever converting it is not covered here "
+        "and relies on its own redaction.",
+    ),
+    (
         "Slack session mirror",
         "dashboard/chat_slack.py",
-        "Thread titles and mirrored message bodies posted to Slack, via "
-        "redact_and_truncate (redaction BEFORE truncation, so a truncation "
-        "boundary cannot split and hide a credential).",
+        "Thread titles and the conversation history seeded into a newly linked "
+        "thread. Titles go through redact_and_truncate (redaction BEFORE "
+        "truncation, so a truncation boundary cannot split and hide a "
+        "credential); history is delegated to the shared Slack render pipeline "
+        "above with redact_via_context injected as its redactor.",
     ),
     (
         "Configured-channel session mirror",
         "dashboard/chat_mirror.py",
         "Recent dashboard context posted while linking a configured non-Slack "
-        "destination, via redact_and_truncate before transport dispatch.",
+        "destination, via redact_via_context before transport dispatch, then "
+        "chunked to the channel's own message limit rather than truncated.",
     ),
     (
         "Slack Block Kit views",
@@ -414,6 +608,33 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "colleague, or a ticket, the investigation record — so its provider titles "
         "and model-authored diagnosis are redacted at the write, not at a read.",
     ),
+    (
+        "Diagnostics support bundle",
+        "diagnostics.py",
+        "The redacted zip built by `kirocrew doctor --bundle` and Settings › About › "
+        "Report a Problem, plus the pre-filled GitHub issue URL it returns. The most "
+        "external boundary in this list: the artifact exists to be attached to a "
+        "PUBLIC issue, and its members are raw gateway/kiro-cli logs and crash "
+        "reports. Every text member and the user-typed note run the credential and "
+        "exfiltration-URL scanners plus a sensitive-header pass before anything is "
+        "written into the archive.",
+    ),
+    (
+        "Tag definitions (HTTP + auto-tag)",
+        "dashboard/chat_tags.py",
+        "Tag names supplied by both the POST /api/chat/tags HTTP handler and the "
+        "background auto-tag task are LLM-authored or project-derived and persist "
+        "to tags.json, the dashboard sidebar, and Slack notifications. Both paths "
+        "redact credentials and exfiltration URLs before creation/persistence.",
+    ),
+    (
+        "Background auto-tag (project-derived names)",
+        "dashboard/chat_auto_tag.py",
+        "The background auto-tag task derives tag names from the slot's project "
+        "path and persists them to tags.json and the dashboard sidebar via the "
+        "shared tag-creation path. Names are passed through redact_credentials "
+        "and redact_exfiltration_urls before resolution or persistence.",
+    ),
 )
 
 # Modules that call a redactor but are NOT an output egress boundary, so they do
@@ -445,6 +666,14 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # message with and without redaction, so a raw comparison would keep both
         # copies — nothing redacted here is ever written or shown.
         "channel_transcript_migration.py",
+        # DETECTOR, not a redactor: the pre-push content scan calls both scanners only
+        # to COUNT findings and then refuses the push. It deliberately discards the
+        # cleaned text — rewriting a code diff would corrupt the very fix the gate
+        # proved — so it is not a redaction egress path. The push it guards is not an
+        # output boundary this panel measures either: nothing reaches GitHub when the
+        # scan hits, and the change degrades to the local queue instead. Lives in
+        # push_policy because all three push paths share this one implementation.
+        "apps/builtins/auto_improvement/spine/push_policy.py",
         # Internal persistence / indexing (the on-disk or in-memory copy), whose
         # user-visible surface is already covered by a registered sink.
         "dashboard/chat_folders.py",
@@ -485,6 +714,7 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/handlers/workflows.py",
         "dashboard/handlers_project.py",
         "knowledge/agent_fetch.py",
+        "knowledge/agent_source.py",
         "knowledge/artifact_ingest.py",
         "knowledge/ingestion.py",
         "mcp_core.py",
@@ -526,6 +756,7 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "kiro_prerequisite.py",
         "instances/ssh_tunnel_manager.py",
         "instances/token_mint.py",
+        "instances/ssm_token_mint.py",
         "publish_sync.py",
         "cli_commands.py",
         # Slack sub-surfaces whose posted output is covered by the two Slack rows.
@@ -588,9 +819,16 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "deploy/scan.py",
         # Bundled app backends: each app's own surface, not core egress.
         "apps/builtins/auto_research/handlers.py",
+        "apps/builtins/code_review_sage/sage_lib/learning.py",
         "apps/builtins/code_review_sage/sage_lib/pipeline.py",
         "apps/builtins/code_review_sage/sage_lib/report.py",
         "apps/builtins/code_review_sage/sage_lib/review_driver.py",
+        # `store` DEFINES this app's redactor (`redact_text`) so every reader in the
+        # app can scrub, not just the posting path; `discovery` calls it when reading
+        # the worker-writable pinned-repo file before the sidebar renders it. Both
+        # are the app's own surface, same classification as its siblings above.
+        "apps/builtins/code_review_sage/sage_lib/store.py",
+        "apps/builtins/code_review_sage/sage_lib/discovery.py",
         "apps/builtins/dev_fleet/server.py",
         "apps/builtins/issue_radar/backend/routes.py",
         "apps/builtins/meetings/backend/domain/session.py",
@@ -869,7 +1107,33 @@ def _token_auth_items() -> list[PostureItem]:
     # read at call time — the documented circular-import exception, and it keeps
     # the advertised windows derived from the enforcing module rather than
     # restated as literals that could drift.
-    from kiro_crew.dashboard.token_auth import LINK_WINDOW_SECS, MAX_SESSION_TTL_SECS
+    from kiro_crew.dashboard.token_auth import (
+        LINK_WINDOW_SECS,
+        MAX_SESSION_TTL_SECS,
+        proxied_pin_observed,
+    )
+
+    # Tri-state, deliberately, and derived from the LIVE bindings so it recovers
+    # on its own. A pin that has collapsed onto a same-host proxy's loopback
+    # address is NOT the control this row used to advertise, and "nothing is
+    # pinned right now" is not evidence that pins are effective — rendering
+    # either as the plain claim is the failure this row is being corrected for.
+    _pinned = proxied_pin_observed()
+    if _pinned is None:
+        _pin_detail = (
+            "A session is bound to the address that first used it. No session is "
+            "currently pinned, so the effective scope is not known yet"
+        )
+    elif _pinned:
+        _pin_detail = (
+            "SHARED, not per-client: sessions are binding to a proxy's address rather than a "
+            "client's — either a same-host tunnel (cloudflared / ngrok / tailscale serve) or a "
+            "reverse proxy in front of this gateway — so every client reaching the dashboard "
+            "through it satisfies the same pin. Reach the dashboard directly, or over a "
+            "transport that preserves the client address, for the pin to identify one client"
+        )
+    else:
+        _pin_detail = "A session is bound to the client address that first used it"
 
     return [
         PostureItem(
@@ -878,7 +1142,7 @@ def _token_auth_items() -> list[PostureItem]:
         ),
         PostureItem(
             label="IP pinning",
-            detail="A token is bound to the IP that first used it",
+            detail=_pin_detail,
         ),
         PostureItem(
             label="Single-use link nonce",

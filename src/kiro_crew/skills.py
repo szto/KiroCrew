@@ -61,8 +61,13 @@ def _matches_any(path: str, globs: list[str]) -> bool:
 # affords a bounded slice of the context budget, so on-demand skills are ranked
 # by usage and summarized top-down; the tail is discoverable via `skill_search`.
 # Per-skill description is truncated to this many chars in the summary line so a
-# few verbose descriptions can't dominate the block.
-_SHORT_DESC_CHARS = 160
+# few verbose descriptions can't dominate the block. Sized as a guardrail against
+# a pathological description rather than a routine trim: the description is the
+# only signal the model has for deciding whether to load a skill, so the cap sits
+# above the typical length (~290 chars across the built-in set) and bites only the
+# outliers. Descriptions also arrive from the public registry, where their length
+# is not ours to control — hence a cap rather than hand-trimming.
+_SHORT_DESC_CHARS = 300
 # A skill whose file mtime is within this window gets a recency boost in the
 # ranking so a freshly-added, never-used skill still surfaces instead of being
 # starved by the rich-get-richer usage ordering.
@@ -86,10 +91,19 @@ _DOLLAR_SKILL_PATTERN = re.compile(r"(?<![\w$])\$([a-z0-9][a-z0-9/_-]*)")
 _MAX_DOLLAR_SKILLS = 5
 # Cache the discovered skill-file list for this long. get_triggered_skills runs
 # on EVERY message; without this it os.walk()s the skills dir + every extra
-# path per message. Skills change rarely (add/remove via setup or sync), so a
-# short TTL keeps trigger matching off the per-message filesystem hot path
-# while still picking up new skills within a few seconds.
-_ITER_CACHE_TTL_SECS = 5.0
+# path per message.
+#
+# This was 5.0s, which did not achieve that: a walk of a real skills tree (645
+# files across 21 roots on a dev desktop, incl. AIM-installed package roots)
+# takes ~0.7s, and chat messages arrive MINUTES apart — so every message missed
+# the cache and paid the full walk, and the 5s only ever deduped the several
+# _iter() calls WITHIN one message. At 60s the walk is amortized ~12x with a
+# worst-case staleness of one minute.
+#
+# Staleness only affects skills added OUT OF BAND (AIM sync, a manual cp):
+# the app's own create/update/delete/refresh all call _invalidate_iter_cache(),
+# so a skill written through the app is visible immediately regardless of TTL.
+_ITER_CACHE_TTL_SECS = 60.0
 
 # ── Auto skill creation ──
 
@@ -328,6 +342,108 @@ def _within_any(candidate: str, roots: tuple[str, ...]) -> bool:
     return False
 
 
+#: Basename every skill's body lives under. Used as a cheap pre-filter before
+#: any filesystem work when deciding whether a tool call touched a skill.
+_SKILL_FILE = "SKILL.md"
+
+#: Argument names under which file-reading tools carry their target. Covers the
+#: builtin read tool's ``path`` plus the spellings other tools use; a name that
+#: is absent simply yields no candidate.
+_TOOL_READ_PATH_KEYS = ("path", "file_path", "filePath", "paths", "files")
+
+#: A whitespace/quote-delimited token ending in the skill basename — how a skill
+#: read appears inside a shell command (``cat /x/SKILL.md``). Anchored on the
+#: basename so it cannot match an arbitrary argument.
+_SHELL_SKILL_PATH_RE = re.compile(r"""[^\s"'|;&><]+SKILL\.md""")
+
+
+def _tool_read_path_candidates(
+    tool_name: str, raw_params: dict | None, command: str | None
+) -> list[str]:
+    """File targets of a tool call that DELIVERS file content to the model.
+
+    Returns nothing for a call that merely names a path — a delete, move, line
+    count, or grep. The ledger's hits mean "a body reached the model", so
+    crediting a mention would re-create the mention-as-use conflation that the
+    separate searches tally exists to avoid.
+
+    Never raises on a malformed params dict — a tool's arguments are
+    model-authored and may hold anything.
+    """
+    out: list[str] = []
+    if isinstance(raw_params, dict) and tool_name in _CONTENT_READ_TOOLS:
+        for key in _TOOL_READ_PATH_KEYS:
+            value = raw_params.get(key)
+            if isinstance(value, str):
+                out.append(value)
+            elif isinstance(value, (list, tuple)):
+                out.extend(v for v in value if isinstance(v, str))
+    if isinstance(command, str) and command:
+        for segment in _shell_segments_reading_content(command):
+            out.extend(_SHELL_SKILL_PATH_RE.findall(segment))
+    return out
+
+
+#: Shell commands that deliver a file's CONTENT to the model. Deliberately
+#: narrow: the ledger counts bodies that reached the model, so a command that
+#: merely names a path — ``rm``, ``mv``, ``wc``, ``chmod`` — earns nothing, and
+#: neither does ``grep``, which emits matching lines rather than the body.
+#: ``head``/``tail`` deliver a prefix, which is still a body the model read.
+_SHELL_READ_VERBS = frozenset(
+    {"cat", "bat", "head", "tail", "less", "more", "view", "type"}
+)
+
+#: Tools whose result hands the model a file's content. ``grep``/``glob`` are
+#: read-KIND but return matches and names, not bodies, so they are excluded for
+#: the same reason ``grep`` is above.
+_CONTENT_READ_TOOLS = frozenset({"fs_read", "read", "read_file", "readFile"})
+
+#: Splits a shell command into independently-invoked segments, so the verb that
+#: applies to a given path is the one that precedes it in ITS segment — without
+#: this, ``cat a.txt && rm x/SKILL.md`` would read as a ``cat`` of the skill.
+_SHELL_SEGMENT_RE = re.compile(r"(?:\|\||&&|[;|&\n]|\$\(|`)")
+
+
+def _shell_segments_reading_content(command: str) -> list[str]:
+    """Segments of *command* whose leading verb delivers file content.
+
+    A segment's verb is its first bare token; leading environment assignments
+    (``FOO=bar cat x``) and absolute paths (``/bin/cat``) are tolerated.
+    """
+    reading: list[str] = []
+    for segment in _SHELL_SEGMENT_RE.split(command):
+        for token in segment.split():
+            if "=" in token and not token.startswith("-"):
+                continue  # leading VAR=value assignment
+            verb = token.rsplit("/", 1)[-1]
+            if verb in _SHELL_READ_VERBS:
+                reading.append(segment)
+            break  # only the segment's first bare token is its verb
+    return reading
+
+
+def _mentions_skill_basename(raw_params: dict | None, command: str | None) -> bool:
+    """Whether a tool call's arguments name a skill body at all.
+
+    Independent of read intent: used only to tell "this call had nothing to do
+    with skills" apart from "this call named a skill but our read-intent
+    allowlists did not recognise it", which is what a provider tool rename looks
+    like from here.
+    """
+    if isinstance(command, str) and _SKILL_FILE in command:
+        return True
+    if not isinstance(raw_params, dict):
+        return False
+    for value in raw_params.values():
+        if isinstance(value, str):
+            if _SKILL_FILE in value:
+                return True
+        elif isinstance(value, (list, tuple)):
+            if any(isinstance(v, str) and _SKILL_FILE in v for v in value):
+                return True
+    return False
+
+
 def _iter_skill_files(base: Path) -> list[tuple[str, Path]]:
     """Recursively find all SKILL.md files under *base*.
 
@@ -379,6 +495,28 @@ def _iter_skill_files(base: Path) -> list[tuple[str, Path]]:
     return sorted(results, key=lambda x: x[0])
 
 
+# Skills RELOCATED into the kirocrew-dev/ folder (the Kiro Crew development
+# suite). Without this, an upgraded install keeps BOTH the old flat copy
+# and the new nested copy — two divergent copies of the same skill matched
+# nondeterministically by trigger overlap. The flat copy is NOT deleted (it
+# may carry user edits
+# the mtime-preserving sync deliberately protects): its SKILL.md is renamed
+# to SKILL.md.pre-relocation, which removes it from loader discovery while
+# preserving every byte on disk for the user to reconcile. Only done when
+# the nested replacement is verifiably present, so a failed/partial sync
+# never disables the only copy.
+#
+# Module level so the packaging guard in test/test_builtin_skill_packaging.py
+# can assert every destination actually ships: a destination the package never
+# installs makes this migration a permanent no-op and leaves the flat copy as
+# the only one the loader finds.
+_RELOCATED_SKILLS: dict[str, str] = {
+    "prepare-pr": "kirocrew-dev/prepare-pr",
+    "babysit": "kirocrew-dev/babysit",
+    "kirocrew-worktree-dev": "kirocrew-dev/kirocrew-worktree-dev",
+}
+
+
 def _ensure_builtin_skills(base: Path) -> None:
     """Sync built-in skills: copy new/updated, remove stale.
 
@@ -404,28 +542,13 @@ def _ensure_builtin_skills(base: Path) -> None:
 
     # Remove known stale builtin skills (replaced by MCP tools)
     stale_builtins = {"learn", "subagent", "cron", "kirocrew-core"}
-    # Skills RELOCATED into the kirocrew-dev/ folder (the KiroCrew development
-    # suite). Without this, an upgraded install keeps BOTH the old flat copy
-    # and the new nested copy — two divergent copies of the same skill matched
-    # nondeterministically by trigger overlap. The flat copy is NOT deleted (it
-    # may carry user edits
-    # the mtime-preserving sync deliberately protects): its SKILL.md is renamed
-    # to SKILL.md.pre-relocation, which removes it from loader discovery while
-    # preserving every byte on disk for the user to reconcile. Only done when
-    # the nested replacement is verifiably present, so a failed/partial sync
-    # never disables the only copy.
-    relocated = {
-        "prepare-pr": "kirocrew-dev/prepare-pr",
-        "babysit": "kirocrew-dev/babysit",
-        "kirocrew-worktree-dev": "kirocrew-dev/kirocrew-worktree-dev",
-    }
     if base.exists():
         for name in stale_builtins:
             stale = base / name
             if stale.is_dir():
                 shutil.rmtree(stale)
                 logger.info("Removed stale builtin skill: %s", name)
-        for old_name, new_name in relocated.items():
+        for old_name, new_name in _RELOCATED_SKILLS.items():
             old_skill_md = base / old_name / "SKILL.md"
             if old_skill_md.is_file() and (base / new_name / "SKILL.md").exists():
                 try:
@@ -593,25 +716,71 @@ class SkillsLoader:
         self._iter_cache = None
         self._fm_cache.clear()
 
-    def _cached_frontmatter(self, path: Path) -> dict[str, str]:
-        """Parse frontmatter with mtime-based caching."""
+    def _cached_frontmatter(self, path: Path, mtime: float | None = None) -> dict[str, str]:
+        """Parse frontmatter with mtime-based caching.
+
+        *mtime* lets a caller that already stat()'d the file reuse that result.
+        ``list_skills()`` needs the size from the same stat, and this path runs
+        on the event loop during context assembly — one syscall per skill, not
+        two.
+        """
         key = str(path)
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            return {}
+        if mtime is None:
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                return {}
         cached = self._fm_cache.get(key)
         if cached and cached[0] == mtime:
             return cached[1]
+        # Failures PROPAGATE deliberately. Not every caller is a reader:
+        # ``update_auto_skill`` reads this to carry ``created_at``, ``version``,
+        # ``pinned`` and ``inject_on_trigger`` across a rewrite, so degrading an
+        # unreadable file to "no metadata" here would make it silently drop those
+        # and clobber a version snapshot. A reader that would rather show a row
+        # than fail catches this at ITS call site instead.
         meta = self._parse_frontmatter(path)
         self._fm_cache[key] = (mtime, meta)
         return meta
 
     def list_skills(self) -> list[dict]:
-        """Return list of skill metadata dicts with key, name, description, path, dir, always."""
+        """Return per-skill metadata for the dashboard's Skills page.
+
+        Carries the three fields the injection-cost control needs alongside the
+        identity ones: whether the skill opted out of full-body injection, how
+        big its body is, and how many times that body was actually DELIVERED into
+        a prompt. Cost is the product of the last two, and a user deciding
+        whether to opt a skill out cannot weigh it without both.
+
+        ``deliveries`` counts body deliveries, not trigger matches: the ledger
+        records only when a body reaches the prompt, so a false-positive match, a
+        pointer-only skill, and an undelivered match all count zero. Two
+        consequences a caller must not paper over — a skill already opted out
+        stops accruing entirely, so its figure is historical and frozen; and this
+        is therefore a measure of what was SPENT, never of how often the skill
+        was relevant.
+
+        ``deliveries`` is ``None`` when the skill has no ledger entry, which is
+        different from zero: an entry can also age out of the 30-day window.
+
+        ``owned`` says whether Kiro Crew may rewrite the file. A skill reached
+        through ``skills.extra_paths`` is listed but not ours to edit, so the UI
+        must not offer a toggle the endpoint will refuse.
+
+        This runs on the event loop as part of context assembly (the skill
+        index), so it takes exactly ONE stat per skill — the same count as
+        before ``size_bytes`` existed — by feeding that stat's mtime to the
+        frontmatter cache instead of letting it stat again.
+        """
         skills: list[dict] = []
         for name, skill_file in self._iter():
-            meta = self._cached_frontmatter(skill_file)
+            try:
+                st: os.stat_result | None = skill_file.stat()
+            except OSError:
+                st = None
+            meta = self._cached_frontmatter(
+                skill_file, mtime=st.st_mtime if st is not None else None
+            )
             skills.append(
                 {
                     "key": name,
@@ -620,9 +789,240 @@ class SkillsLoader:
                     "path": str(skill_file),
                     "dir": str(skill_file.parent),
                     "always": meta.get("always", "").lower() == "true",
+                    # Mirrors split_triggered: only an explicit `false` opts out,
+                    # so a malformed value reads as injecting, as it behaves.
+                    "inject_on_trigger": (
+                        meta.get("inject_on_trigger", "").strip().lower() != "false"
+                    ),
+                    "size_bytes": st.st_size if st is not None else 0,
+                    "deliveries": self._delivery_count(name),
+                    "owned": self._owned_hint(skill_file),
                 }
             )
         return skills
+
+    def _owned_hint(self, skill_file: Path) -> bool:
+        """Whether *skill_file* sits under the directory Kiro Crew owns.
+
+        Syscall-free on purpose: this runs once per skill inside ``list_skills``,
+        which the event loop calls while assembling the skill index, and
+        ``Path.resolve()`` costs a stat each. It is an ADVISORY hint for the UI —
+        the authoritative check is the resolved one in
+        ``set_inject_on_trigger``, which is the write boundary and runs once per
+        toggle. A path that only differs by a symlink therefore reads as owned
+        here and is still refused there; the failure mode is a toggle that
+        reports an error, never an unowned file being rewritten.
+        """
+        try:
+            return skill_file.is_relative_to(self._dir)
+        except (OSError, ValueError):
+            return False
+
+    def _served_key_by_realpath(self) -> dict[str, str]:
+        """Map each served skill file's realpath to its canonical served key.
+
+        Applies the same canonical rule as ``resolve_ledger_aliases`` — the real
+        file's key beats a symlink's, then alphabetical — so a read through a
+        symlinked skill is credited to the key the budget screen displays rather
+        than splitting one file's cost across two rows. Uncached and
+        resolve()-bound for the same reason stated there, so callers must gate
+        it behind a cheap check rather than running it per tool call.
+        """
+        by_realpath: dict[str, list[tuple[str, Path]]] = {}
+        for key, skill_file in self._iter():
+            try:
+                rp = str(skill_file.resolve())
+            except (OSError, RuntimeError):
+                # A cyclic symlink raises RuntimeError, not OSError.
+                continue
+            by_realpath.setdefault(rp, []).append((key, skill_file))
+        return {
+            rp: min(pairs, key=lambda p: (p[1].is_symlink(), p[0]))[0]
+            for rp, pairs in by_realpath.items()
+        }
+
+    def resolve_tool_read_keys(
+        self,
+        tool_name: str = "",
+        raw_params: dict | None = None,
+        command: str | None = None,
+    ) -> list[str]:
+        """Served skill keys whose body a tool call is about to deliver.
+
+        Resolution only — nothing is recorded, so the caller can run this off
+        the event loop and credit later, once the read is confirmed to have
+        completed. Returns keys deduped, so one command naming a file twice
+        yields it once.
+
+        Only content-delivering reads qualify (see
+        ``_tool_read_path_candidates``): a tool call that merely names a skill
+        path earns nothing, because the ledger's hits mean a body reached the
+        model.
+
+        Filesystem-bound (``_iter`` plus a ``resolve()`` per served skill), so
+        candidates are filtered on the ``SKILL.md`` basename first and callers
+        must keep this off the event loop.
+        """
+        if self._usage is None:
+            return []
+        candidates = [
+            c
+            for c in _tool_read_path_candidates(tool_name, raw_params, command)
+            if _SKILL_FILE in c
+        ]
+        if not candidates:
+            # The read-intent allowlists (`_CONTENT_READ_TOOLS`,
+            # `_SHELL_READ_VERBS`) encode the provider's current tool spellings.
+            # A rename would silently restore the pre-existing undercount with
+            # nothing failing, so a call that clearly names a skill yet yields no
+            # candidate is logged — the one signal that distinguishes drift from
+            # a legitimately non-reading tool call.
+            if _mentions_skill_basename(raw_params, command):
+                logger.debug(
+                    "skill-read: %r names a skill but is not a content read "
+                    "(tool=%r); check the read-intent allowlists if the provider "
+                    "renamed its tools",
+                    command or raw_params,
+                    tool_name,
+                )
+            return []
+        try:
+            realpath_to_key = self._served_key_by_realpath()
+        except OSError:
+            return []
+        keys: list[str] = []
+        for cand in candidates:
+            try:
+                rp = str(Path(cand).expanduser().resolve())
+            except (OSError, RuntimeError, ValueError):
+                continue
+            key = realpath_to_key.get(rp)
+            if key is not None and key not in keys:
+                keys.append(key)
+        return keys
+
+    def credit_skill_reads(self, keys: list[str]) -> None:
+        """Record a delivery for each key in *keys*. Best-effort, never raises.
+
+        Separate from ``resolve_tool_read_keys`` so the credit lands only after
+        the read has actually completed — a tool call that was denied or failed
+        must not leave a delivery behind.
+        """
+        for key in keys:
+            self._record_use(key)
+
+    def resolve_ledger_aliases(self) -> dict[str, list[str]]:
+        """Map served skill keys to ledger keys that resolve to the same file.
+
+        Returns ``{served_key: [alias_key, ...]}`` — only entries with at least
+        one alias appear. Unresolvable ledger keys (no SKILL.md on disk) are
+        dropped silently.
+
+        The result is NOT cached. It depends on what each served path currently
+        resolves to, so any sound cache key would have to resolve every served
+        file — the same work the cache would save. `_iter()` has its own TTL, so
+        repeat calls (e.g. dashboard refreshes) do not re-walk the skills tree.
+
+        This is the public seam for *alias resolution* specifically — the budget
+        endpoint no longer builds the map itself. It still reads other loader
+        internals to assemble its rows, so this is one step out of that coupling,
+        not the end of it. It deliberately does NOT live inside ``list_skills()``
+        — that method guarantees one stat per skill and runs on the hot path
+        during context assembly; filesystem resolution here is acceptable only
+        at dashboard-refresh frequency.
+        """
+        if self._usage is None:
+            return {}
+
+        snapshot = self._usage.snapshot()
+        if not snapshot:
+            return {}
+
+        # NOT cached, deliberately. The map is a function of the ledger's keys
+        # AND of what each served path currently RESOLVES to, so a sound cache key
+        # has to resolve every served file — exactly the work a cache would be
+        # there to avoid. Keying on names alone was demonstrably unsound: deleting
+        # an alias, or retargeting a served symlink, changes no name, so a hit
+        # kept crediting deliveries to the wrong skill. A cache that is only
+        # correct when nothing moved is worse than no cache, and `_iter()` already
+        # carries its own TTL, so repeat calls do not re-walk the tree.
+        skill_pairs = self._iter()
+
+        # Group served keys by resolved path. Two served keys CAN name the same
+        # file: a file-level symlink (`old/SKILL.md` -> `new/SKILL.md`) leaves
+        # both directories real, so `_iter()` yields both. Treating each as its
+        # own skill splits one file's cost across two rows, which is the very
+        # thing this fold exists to prevent — so one key per file is canonical
+        # and the rest are aliases.
+        by_realpath: dict[str, list[tuple[str, Path]]] = {}
+        for key, skill_file in skill_pairs:
+            try:
+                rp = str(skill_file.resolve())
+            except (OSError, RuntimeError):
+                # A cyclic symlink raises RuntimeError("Symlink loop from ..."),
+                # NOT OSError, so it must be caught explicitly or one bad link
+                # takes the whole endpoint down with a 500.
+                continue
+            by_realpath.setdefault(rp, []).append((key, skill_file))
+
+        realpath_to_served: dict[str, str] = {}
+        alias_map: dict[str, list[str]] = {}
+        for rp, pairs in by_realpath.items():
+            # The real file's key beats a symlink's, then alphabetical — so the
+            # winner does not depend on directory iteration order.
+            canonical, _ = min(pairs, key=lambda p: (p[1].is_symlink(), p[0]))
+            realpath_to_served[rp] = canonical
+            for key, _ in pairs:
+                if key != canonical:
+                    alias_map.setdefault(canonical, []).append(key)
+
+        # Roots to resolve a ledger key against. `_iter()` serves the main skills
+        # dir AND every extra path (an installed app's own skills dir), and each
+        # names its skills relative to its OWN root — so an app skill's alias key
+        # only resolves under that app's root. Resolving against `_dir` alone
+        # silently drops every app-skill alias.
+        roots = [self._dir, *self._extra_paths]
+
+        # A ledger key that no longer names a served skill: resolve it on disk and
+        # fold it into whichever served key shares its file.
+        for ledger_key in snapshot:
+            if ledger_key in realpath_to_served.values():
+                continue  # Already the canonical key for its file.
+            if any(ledger_key in a for a in alias_map.values()):
+                continue  # Already folded as a served alias above.
+            for root in roots:
+                candidate = root / ledger_key / "SKILL.md"
+                try:
+                    rp = str(candidate.resolve())
+                except (OSError, RuntimeError):
+                    continue  # Unresolvable or a symlink loop — try the next root.
+                if not Path(rp).exists():
+                    continue
+                served_key = realpath_to_served.get(rp)
+                if served_key is None:
+                    continue
+                if ledger_key != served_key:
+                    alias_map.setdefault(served_key, []).append(ledger_key)
+                break  # First root that resolves wins; a key names one file.
+
+        for aliases in alias_map.values():
+            aliases.sort()
+
+        return alias_map
+
+    def _delivery_count(self, key: str) -> int | None:
+        """Body deliveries recorded for *key*, or ``None`` when untracked.
+
+        Best-effort: the ledger is telemetry, so a missing or unreadable one
+        yields ``None`` rather than failing the whole listing.
+        """
+        if self._usage is None:
+            return None
+        try:
+            hits, _ = self._usage.score(key)
+        except Exception:
+            return None
+        return int(hits) if hits else None
 
     @staticmethod
     def _safe_name(name: str) -> bool:
@@ -872,7 +1272,10 @@ class SkillsLoader:
         # Re-emit the lifecycle lines ``_build_auto_skill_content`` does not know
         # about. Dropping ``version`` would make the next update-approval read the
         # skill as v1 and overwrite an existing ``.versions/v1-SKILL.md`` snapshot;
-        # dropping ``pinned`` would silently remove the skill's archival exemption.
+        # dropping ``pinned`` would silently remove the skill's archival exemption;
+        # dropping ``inject_on_trigger`` would turn full-body injection back on for
+        # a skill the user had made pointer-only — a setting undoing itself behind
+        # an unrelated refine.
         _carry: list[str] = []
         _ver = existing_meta.get("version", "")
         try:
@@ -883,6 +1286,8 @@ class SkillsLoader:
             _carry.append(f"version: {_vn}")
         if str(existing_meta.get("pinned", "")).strip().lower() in ("true", "1", "yes"):
             _carry.append("pinned: true")
+        if str(existing_meta.get("inject_on_trigger", "")).strip().lower() == "false":
+            _carry.append("inject_on_trigger: false")
         if _carry:
             content = content.replace("\n---\n", "\n" + "\n".join(_carry) + "\n---\n", 1)
         skill_file.write_text(content, encoding="utf-8")
@@ -1002,6 +1407,66 @@ class SkillsLoader:
         atomic_write(skill_file, new_content)
         self._invalidate_iter_cache()
         logger.info("%s auto skill: %s", "Pinned" if pinned else "Unpinned", name)
+        return True
+
+    def set_inject_on_trigger(self, name: str, inject: bool) -> bool:
+        """Opt a skill in or out of full-body injection on a trigger match.
+
+        Edits the ``inject_on_trigger:`` frontmatter line in place, mirroring
+        :meth:`set_pinned`. ``inject=False`` writes the opt-out; ``inject=True``
+        removes the line rather than writing ``true``, because injecting is the
+        default and an absent key is the honest way to say "unchanged".
+
+        Refuses any skill whose file resolves outside this loader's own skills
+        dir. ``_resolve_path`` also reaches ``skills.extra_paths`` and the
+        kiro-cli user/workspace skill dirs — directories Kiro Crew does not own
+        and may not even be able to write. Rewriting a foreign ``SKILL.md``
+        because a dashboard toggle was flipped is a side effect nobody asked
+        for, so ownership is checked before the write, not left to the UI (which
+        does gate on source, but the endpoint is reachable directly).
+
+        Returns False when the skill cannot be resolved, is not ours, or has no
+        frontmatter block to edit — the caller surfaces that as a failed toggle
+        rather than silently reporting success on a no-op.
+        """
+        if not self._safe_name(name):
+            return False
+        skill_file = self._resolve_path(name)
+        if skill_file is None or not skill_file.exists():
+            return False
+        try:
+            owned_root = self._dir.resolve()
+            if not skill_file.resolve().is_relative_to(owned_root):
+                logger.warning("Refusing to edit a skill outside %s: %s", owned_root, skill_file)
+                return False
+        except OSError:
+            return False
+        try:
+            content = skill_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False
+        m = re.match(r"^---\n(.*?)\n---\n?(.*)$", content, re.DOTALL)
+        if not m:
+            return False
+        fm_lines = [
+            ln
+            for ln in m.group(1).split("\n")
+            # Only a TOP-LEVEL key, matched without stripping: an indented
+            # `inject_on_trigger:` belongs to a block scalar (a description that
+            # documents the flag, say), and deleting that line would silently
+            # rewrite the skill's prose while toggling a setting.
+            if not ln.lower().startswith("inject_on_trigger:")
+        ]
+        if not inject:
+            fm_lines.append("inject_on_trigger: false")
+        new_content = "---\n" + "\n".join(fm_lines) + "\n---\n" + m.group(2)
+        # Atomic write (temp + rename), for the same reason set_pinned uses it:
+        # a partial write must never truncate the live SKILL.md.
+        atomic_write(skill_file, new_content)
+        self._invalidate_iter_cache()
+        logger.info(
+            "Skill %s on trigger: %s", "injects fully" if inject else "sends a pointer", name
+        )
         return True
 
     def _archive_root(self) -> Path:
@@ -1651,17 +2116,22 @@ class SkillsLoader:
         created_at: str,
         version: int,
         pinned: bool = False,
+        pointer_only: bool = False,
     ) -> str:
         """Rebuild an update candidate's body as the new live SKILL.md.
 
         Keeps the candidate's description/triggers/source/body (the merged new
         content) but forces ``name`` to the live target, preserves the live
         ``created_at``, and stamps ``version``. Any ``name`` / ``created_at`` /
-        ``version`` / ``pinned`` lines from the candidate are dropped and
-        re-emitted so the live skill's identity + history are authoritative, not
-        the candidate's. ``pinned`` is carried from the LIVE skill: a candidate
-        never sets it, and losing it would drop the target's lifecycle exemption
-        and expose a user-pinned skill to archival.
+        ``version`` / ``pinned`` / ``inject_on_trigger`` lines from the candidate
+        are dropped and re-emitted so the live skill's identity + history are
+        authoritative, not the candidate's. ``pinned`` is carried from the LIVE
+        skill: a candidate never sets it, and losing it would drop the target's
+        lifecycle exemption and expose a user-pinned skill to archival.
+        ``pointer_only`` is carried the same way and for the same reason: a
+        candidate never sets ``inject_on_trigger``, so dropping it would silently
+        re-enable full-body injection on a skill the user had opted out — a
+        setting reverting itself behind an unrelated approval.
         """
         m = re.match(r"^---\n(.*?)\n---\n?(.*)$", candidate_content, re.DOTALL)
         if m:
@@ -1675,7 +2145,7 @@ class SkillsLoader:
             if not ln.strip():
                 continue
             key = ln.split(":", 1)[0].strip() if ":" in ln else ""
-            if key in ("name", "created_at", "version", "pinned"):
+            if key in ("name", "created_at", "version", "pinned", "inject_on_trigger"):
                 continue
             kept.append(ln)
         new_fm = [f"name: {target_name}"]
@@ -1685,6 +2155,8 @@ class SkillsLoader:
         new_fm.append(f"version: {version}")
         if pinned:
             new_fm.append("pinned: true")
+        if pointer_only:
+            new_fm.append("inject_on_trigger: false")
         return "---\n" + "\n".join(new_fm) + "\n---\n\n" + body.strip() + "\n"
 
     def _versions_root(self, target_slug: str) -> Path:
@@ -1759,6 +2231,7 @@ class SkillsLoader:
             version=current_version + 1,
             pinned=str(_live_fm.get("pinned", "")).strip().lower()
             in ("true", "1", "yes"),
+            pointer_only=str(_live_fm.get("inject_on_trigger", "")).strip().lower() == "false",
         )
         # Redact both sides: this feeds the dashboard API, and the candidate is
         # only redacted in place at approve time (so an un-approved draft may
@@ -1935,12 +2408,20 @@ class SkillsLoader:
         live_pinned = str(
             self._cached_frontmatter(live_skill).get("pinned", "")
         ).strip().lower() in ("true", "1", "yes")
+        # Same for the injection opt-out: the candidate never carries it, so
+        # writing it over live without this would silently turn full-body
+        # injection back on for a skill the user had made pointer-only.
+        live_pointer_only = (
+            str(self._cached_frontmatter(live_skill).get("inject_on_trigger", "")).strip().lower()
+            == "false"
+        )
         new_live_content = self._rewrite_update_frontmatter(
             candidate_body,
             target_name=target_name,
             created_at=live_created_at,
             version=new_version,
             pinned=live_pinned,
+            pointer_only=live_pointer_only,
         )
         # Snapshot the current live SKILL.md into .versions/ (point-of-no-return
         # is the live overwrite below; if the snapshot fails, live is untouched).
@@ -2281,12 +2762,6 @@ class SkillsLoader:
         scored.sort(key=lambda x: x[1], reverse=True)
         triggered = [name for name, _ in scored[: self._max_triggered]]
 
-        # Record usage — triggered skills are injected full-body this turn, so
-        # this is the authoritative "skill was used" signal that feeds the
-        # lazy-load hotness ranking in get_context.
-        for name in triggered:
-            self._record_use(name)
-
         # Emit ONE audit event for the matched + denied sets rather than one per
         # skill. Previously this wrote a SEL entry for every skill (incl. every
         # non-match) on every message — N synchronous writes per message that
@@ -2299,6 +2774,13 @@ class SkillsLoader:
             metadata = {"text_hash": hashlib.sha256(text.encode()).hexdigest()[:16]}
             if triggered:
                 metadata["skills"] = ",".join(triggered)
+                # Record HOW each match was delivered, not just that it matched.
+                # A pointer is an offer the agent may decline, so an auditor
+                # reconstructing "was this procedure actually in the prompt?"
+                # needs the split — the skill list alone no longer answers it.
+                bodies, pointers = self.split_triggered(triggered)
+                metadata["bodies"] = ",".join(bodies)
+                metadata["pointers"] = ",".join(pointers)
             if negated_skills:
                 metadata["negated"] = ",".join(negated_skills)
             sel().log_tool_invocation(
@@ -2309,6 +2791,87 @@ class SkillsLoader:
                 metadata=metadata,
             )
         return triggered
+
+    def split_triggered(self, names: list[str]) -> tuple[list[str], list[str]]:
+        """Split matched *names* into (inject-body, pointer-only), order preserved.
+
+        Full-body injection is the DEFAULT: a matched skill's procedure lands in
+        the prompt whether or not the agent chooses to read a file. A skill opts
+        out with ``inject_on_trigger: false``, which reduces its contribution to
+        a single pointer line naming it and its path.
+
+        The default is deliberately the expensive one. A pointer makes delivery
+        voluntary, so a skill authored to be *obeyed* on match — a mandatory
+        pre-flight check, say — would be silently skipped by an agent that
+        declines to read it, and a silent miss is the failure mode with no
+        signal to catch it. Defaulting the other way would make forgetting the
+        field fail open. Opting out is a per-skill statement that the skill is
+        an offer rather than a mandate, which only its author can make.
+        """
+        enforced: list[str] = []
+        pointer_only: list[str] = []
+        for name in names:
+            skill_file = self._resolve_path(name)
+            if skill_file is None:
+                continue
+            meta = self._cached_frontmatter(skill_file)
+            if meta.get("inject_on_trigger", "").strip().lower() == "false":
+                pointer_only.append(name)
+            else:
+                enforced.append(name)
+        return enforced, pointer_only
+
+    def trigger_hint(self, names: list[str]) -> str:
+        """Return a pointer block naming *names* and where to read each one.
+
+        The counterpart to :meth:`get_triggered_skills` for a skill that opted
+        out of full-body injection with ``inject_on_trigger: false``: the matcher
+        decides which skills look relevant, and this renders that verdict as one
+        line per skill instead of the skill's body. A body costs 8k-34k chars and
+        is charged again on every turn the match repeats; a line costs ~150.
+
+        The agent reaches the procedure the same way ``get_context``'s
+        ``## Available Skills`` block already directs it to — by reading the
+        path. The wording deliberately does NOT ask for a re-read of a skill
+        already present earlier in the conversation: ACP replays native
+        history, so that content is still in the window, and a needless ``cat``
+        would spend a tool round-trip only to put the body back in as tool
+        output.
+
+        Returns ``""`` for an empty *names* (no block, not an empty header).
+        """
+        lines: list[str] = []
+        for name in names:
+            skill_file = self._resolve_path(name)
+            if skill_file is None:
+                continue
+            meta = self._cached_frontmatter(skill_file)
+            desc = self._short_desc(meta.get("description", "") or name, suffix="…")
+            lines.append(
+                f"- **{meta.get('name', name)}**: {desc} → `{skill_file}`"
+            )
+        if not lines:
+            return ""
+        return (
+            "[Relevant skills for this message]\n"
+            "These skills match this message. If one applies, read its file "
+            "before acting — unless it already appears earlier in this "
+            "conversation, in which case you already have its instructions.\n"
+            + "\n".join(lines)
+            + "\n[End of relevant skills]\n\n"
+        )
+
+    def _resolve_path(self, name: str) -> Path | None:
+        """Return the ``SKILL.md`` path for an enumerated skill *name*.
+
+        Allowlist-only, like ``resolve_dollar_skills``: the path comes from the
+        enumeration rather than being constructed from *name*, so a crafted
+        name cannot escape the skill roots.
+        """
+        for candidate, skill_file in self._iter():
+            if candidate == name:
+                return skill_file
+        return None
 
     def get_context(self, budget: int | None = None, only: list[str] | None = None) -> str:
         """Build skills context for prompt injection (lazy-loaded).
@@ -2393,7 +2956,7 @@ class SkillsLoader:
             for s in ranked:
                 line = (
                     f"- **{s['name']}**: {self._short_desc(s['description'])} "
-                    f"-> `{s['path']}` (dir: `{s['dir']}`)"
+                    f"-> `{s['path']}`"
                 )
                 if (
                     budget is not None
@@ -2447,12 +3010,12 @@ class SkillsLoader:
                 "",
                 "If a user request relates to any skill below, read the full "
                 "skill file first with `cat <path>` before responding.",
-                "To run a skill's scripts, `cd` into its directory first.",
+                "To run a skill's scripts, `cd` into the directory containing its `SKILL.md`.",
                 "",
             ]
             for s in on_demand:
                 summary_lines.append(
-                    f"- **{s['name']}**: {s['description']} → `{s['path']}` (dir: `{s['dir']}`)"
+                    f"- **{s['name']}**: {self._short_desc(s['description'])} → `{s['path']}`"
                 )
             parts.append("\n".join(summary_lines))
         return "[Skills:]\n" + "\n\n---\n\n".join(parts) + "\n[End of skills]\n\n"
@@ -2485,12 +3048,21 @@ class SkillsLoader:
         return self._usage.score(s["key"], recency_boost=boost)
 
     @staticmethod
-    def _short_desc(desc: str) -> str:
-        """Collapse whitespace and truncate a description for the summary line."""
+    def _short_desc(desc: str, suffix: str = "...") -> str:
+        """Collapse whitespace and truncate a description for the summary line.
+
+        Cuts on a word boundary when one falls in the last fifth of the budget so
+        the line ends on a readable word instead of mid-token; a description with
+        no such boundary (one very long token) is cut hard.
+        """
         d = " ".join((desc or "").split())
-        if len(d) > _SHORT_DESC_CHARS:
-            return d[:_SHORT_DESC_CHARS].rstrip() + "..."
-        return d
+        if len(d) <= _SHORT_DESC_CHARS:
+            return d
+        cut = d[:_SHORT_DESC_CHARS]
+        space = cut.rfind(" ")
+        if space >= _SHORT_DESC_CHARS * 4 // 5:
+            cut = cut[:space]
+        return cut.rstrip() + suffix
 
     def search_skills(self, query: str, limit: int = 20) -> list[dict]:
         """Grep skills by keyword for on-demand discovery (the skill_search tool).
@@ -2600,7 +3172,17 @@ class SkillsLoader:
 
     @staticmethod
     def _parse_frontmatter(path: Path) -> dict[str, str]:
-        """Parse YAML frontmatter from a markdown file (simple key: value)."""
+        """Parse YAML frontmatter from a markdown file (simple key: value).
+
+        Only a key at column 0 is a field. An indented ``key: value`` belongs to
+        the enclosing block scalar — a description that documents a setting, for
+        instance — and reading it as the setting made the writer and the reader
+        disagree: ``set_inject_on_trigger`` deliberately leaves an indented
+        occurrence alone (deleting it would rewrite the author's prose), so
+        honoring it here meant the opt-in could never take effect. Ignoring
+        indented lines also drops the junk keys a prose line like
+        ``  Steps: do x`` used to invent.
+        """
         content = path.read_text(encoding="utf-8")
         if not content.startswith("---"):
             return {}
@@ -2609,7 +3191,7 @@ class SkillsLoader:
             return {}
         meta: dict[str, str] = {}
         for line in match.group(1).split("\n"):
-            if ":" in line:
+            if ":" in line and not line[:1].isspace():
                 key, value = line.split(":", 1)
                 meta[key.strip()] = value.strip().strip("\"'")
         return meta

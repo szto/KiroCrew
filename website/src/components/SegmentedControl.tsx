@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
+import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
 import { ChevronDown } from 'lucide-react'
 
 export interface Segment<T extends string = string> {
@@ -8,6 +8,15 @@ export interface Segment<T extends string = string> {
   icon?: React.ReactNode
   count?: number
   tooltip?: string
+  /**
+   * Render the segment but refuse selection — for an option the surface knows
+   * about and cannot serve yet. Showing it greyed says "planned"; omitting it
+   * says "does not exist", and silently accepting the click says "broken".
+   * A disabled segment carries `aria-disabled` rather than the `disabled`
+   * attribute so it stays reachable by keyboard and its tooltip stays readable,
+   * which is where the reason for the greying lives.
+   */
+  disabled?: boolean
 }
 
 interface SegmentedControlProps<T extends string = string> {
@@ -31,6 +40,13 @@ type Mode = 'full' | 'compact' | 'dropdown'
 
 export default function SegmentedControl<T extends string = string>({ segments, value, onChange, layoutId = 'segment', collapse = true }: SegmentedControlProps<T>) {
   const containerRef = useRef<HTMLDivElement>(null)
+  // The label below animates its WIDTH while clipping overflow, so until it
+  // settles the text is genuinely cut off. Anything measuring layout in that
+  // window — a reader with reduced motion, or the render gate, which launches
+  // with the preference set for exactly this reason — sees truncated labels that
+  // are not truncated once the spring lands. framer-motion does not consult the
+  // preference on its own, which is why the honouring is explicit here.
+  const reduceMotion = useReducedMotion()
   const [mode, setMode] = useState<Mode>('full')
   const [dropdownOpen, setDropdownOpen] = useState(false)
 
@@ -89,9 +105,16 @@ export default function SegmentedControl<T extends string = string>({ segments, 
               {segments.map(s => (
                 <button
                   key={s.key}
-                  onClick={() => { onChange(s.key); setDropdownOpen(false) }}
-                  className={`flex items-center gap-2 w-full px-3 py-1.5 text-[12px] font-medium cursor-pointer border-none bg-transparent text-left hover:bg-bg-hover ${
-                    s.key === value ? 'text-accent' : 'text-muted'
+                  aria-disabled={s.disabled === true || undefined}
+                  onClick={() => {
+                    if (s.disabled === true) return
+                    onChange(s.key)
+                    setDropdownOpen(false)
+                  }}
+                  className={`flex items-center gap-2 w-full px-3 py-1.5 text-[12px] font-medium border-none bg-transparent text-left ${
+                    s.disabled === true
+                      ? 'text-muted/40 cursor-not-allowed'
+                      : `cursor-pointer hover:bg-bg-hover ${s.key === value ? 'text-accent' : 'text-muted'}`
                   }`}
                 >
                   {s.icon}
@@ -111,23 +134,34 @@ export default function SegmentedControl<T extends string = string>({ segments, 
       <div ref={containerRef} className="inline-flex rounded-lg bg-bg-elevated border border-border p-0.5 gap-0.5">
         {segments.map(s => {
           const isActive = s.key === value
+          const isDisabled = s.disabled === true
           return (
             <motion.button
               key={s.key}
               layout
-              onClick={() => onChange(s.key)}
+              aria-disabled={isDisabled || undefined}
+              onClick={() => {
+                if (isDisabled) return
+                onChange(s.key)
+              }}
               title={s.tooltip || s.label}
-              whileTap={isActive ? { scale: 0.95 } : undefined}
+              whileTap={isActive && !isDisabled ? { scale: 0.95 } : undefined}
               transition={{ duration: 0.15 }}
-              className={`relative flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-[12px] font-medium cursor-pointer border-none transition-colors z-[1] ${
-                isActive ? 'text-accent' : 'text-muted hover:text-text hover:bg-bg-hover'
+              className={`relative flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-[12px] font-medium border-none transition-colors z-[1] ${
+                isDisabled
+                  ? 'text-muted/40 cursor-not-allowed'
+                  : isActive
+                    ? 'text-accent cursor-pointer'
+                    : 'text-muted hover:text-text hover:bg-bg-hover cursor-pointer'
               }`}
             >
-              {isActive && (
+              {isActive && !isDisabled && (
                 <motion.div
                   layoutId={`${layoutId}-indicator`}
                   className="absolute inset-0 bg-card rounded-md shadow-sm border border-border"
-                  transition={{ type: 'spring', stiffness: 500, damping: 35 }}
+                  transition={reduceMotion
+                    ? { duration: 0 }
+                    : { type: 'spring', stiffness: 500, damping: 35 }}
                 />
               )}
               {s.icon && <span className="relative z-[1]">{s.icon}</span>}
@@ -135,10 +169,12 @@ export default function SegmentedControl<T extends string = string>({ segments, 
                 {(mode === 'full' || isActive) && (
                   <motion.span
                     key={`label-${s.key}`}
-                    initial={{ width: 0 }}
+                    initial={reduceMotion ? false : { width: 0 }}
                     animate={{ width: 'auto' }}
-                    exit={{ width: 0 }}
-                    transition={{ type: 'spring', bounce: 0, duration: 0.2 }}
+                    exit={reduceMotion ? { width: 'auto' } : { width: 0 }}
+                    transition={reduceMotion
+                      ? { duration: 0 }
+                      : { type: 'spring', bounce: 0, duration: 0.2 }}
                     className="relative z-[1] overflow-hidden whitespace-nowrap"
                   >
                     {s.label}

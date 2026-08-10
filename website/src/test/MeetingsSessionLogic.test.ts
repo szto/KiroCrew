@@ -13,6 +13,10 @@ import {
   newSegmentText,
   resolveEnabledAgents,
 } from '../apps/meetings/hooks/useMeetingSession'
+import {
+  CAPTION_WINDOW_CHARS,
+  captionWindow,
+} from '../apps/meetings/hooks/useMeetingTranscription'
 import type { AgentDef, MeetingsConfig } from '../apps/meetings/api'
 import { readFileSync } from 'node:fs'
 import EN_CATALOG from '../i18n/locales/en.json'
@@ -23,6 +27,7 @@ const TranscriptionSource = readFileSync(
   'src/apps/meetings/hooks/useMeetingTranscription.ts', 'utf-8',
 )
 const SessionSource = readFileSync('src/apps/meetings/hooks/useMeetingSession.ts', 'utf-8')
+const SettingsSource = readFileSync('src/apps/meetings/SettingsView.tsx', 'utf-8')
 
 const AGENTS: AgentDef[] = [
   { id: 'note-taker', name: 'Note Taker', widget_type: 'markdown', enabled_by_default: true },
@@ -446,6 +451,22 @@ describe('settings saves cannot revert each other', () => {
   })
 })
 
+describe('settings layout remains scrollable', () => {
+  it('keeps cards out of a shrinking flex column', () => {
+    // Cards hide overflow for their glow treatment. Making them flex items lets
+    // the browser shrink each card to the viewport, clipping its contents while
+    // leaving the scroll container with no overflow to scroll.
+    const scrollContainer = SettingsSource.match(
+      /<div className="([^"]*overflow-y-auto[^"]*)">/,
+    )
+
+    expect(scrollContainer).not.toBeNull()
+    expect(scrollContainer![1]).toContain('flex-1 min-h-0')
+    expect(scrollContainer![1]).not.toMatch(/(?:^|\s)flex(?:\s|$)/)
+    expect(scrollContainer![1]).not.toContain('flex-col')
+  })
+})
+
 describe('a nested settings patch is derived from the latest config', () => {
   // Chaining the saves and reading the cache fixed the SCALAR case. A field derived
   // from the config — `meeting_agents` mapped from the existing array, `calendar`
@@ -508,5 +529,62 @@ describe('starting before the config loads does not persist an empty roster', ()
     const startCall = SessionSource.match(/const startMutation[\s\S]*?\n  \}\)/)
     expect(startCall, 'no startMutation found').not.toBeNull()
     expect(startCall![0]).not.toMatch(/enabledIds\.length/)
+  })
+})
+
+describe('the live caption shows the newest speech, not the meeting opening', () => {
+  // `finalsRef` accumulates every final segment and is cleared only by `start()`,
+  // so by mid-meeting it holds the entire transcript. It used to be handed to the
+  // caption verbatim, into an element that clipped its overflow — and
+  // `text-overflow: ellipsis` shows a string's HEAD. The visible caption was
+  // therefore the meeting's first sentence, frozen for its whole duration.
+
+  const SEGMENTS = Array.from(
+    { length: 40 },
+    (_, i) => `segment ${i} with several spoken words in it`,
+  )
+
+  it('drops the oldest segments once the window is full', () => {
+    const out = captionWindow(SEGMENTS)
+    expect(out).toContain('segment 39')
+    // The defect, stated as an assertion: the opening of the meeting must be gone.
+    expect(out).not.toContain('segment 0 ')
+  })
+
+  it('bounds what the caption element is asked to render', () => {
+    expect(captionWindow(SEGMENTS).length).toBeLessThanOrEqual(CAPTION_WINDOW_CHARS)
+  })
+
+  it('leaves a transcript that already fits completely alone', () => {
+    // The common case must not be trimmed at all.
+    expect(captionWindow(['hello there', 'how are you'])).toBe('hello there how are you')
+  })
+
+  it('keeps the in-flight partial at the end', () => {
+    expect(captionWindow(['committed words'], 'and the partial')).toBe(
+      'committed words and the partial',
+    )
+    expect(captionWindow([], 'partial only')).toBe('partial only')
+    expect(captionWindow([])).toBe('')
+  })
+
+  it('keeps the tail, not the head, when one segment alone overflows', () => {
+    const long = Array.from({ length: 60 }, (_, i) => `word${i}`).join(' ')
+    expect(long.length).toBeGreaterThan(CAPTION_WINDOW_CHARS)
+    const out = captionWindow([long])
+    expect(out.length).toBeLessThanOrEqual(CAPTION_WINDOW_CHARS)
+    // A suffix of the segment: the newest words survive, the oldest are cut.
+    expect(long.endsWith(out)).toBe(true)
+    // And cut at a word boundary, so the caption never opens mid-token.
+    expect(out.startsWith('word')).toBe(true)
+  })
+
+  it('routes both caption call sites through the bounded window', () => {
+    // Exporting the helper is not enough. A call site left on the raw
+    // accumulation would restore the bug while every assertion above still
+    // passed, so the guard is on the source itself.
+    expect(TranscriptionSource).not.toContain("finalsRef.current.join(' ')")
+    expect(TranscriptionSource).toContain('captionWindow(finalsRef.current, lastPartial)')
+    expect(TranscriptionSource).toContain('captionWindow(finalsRef.current)')
   })
 })

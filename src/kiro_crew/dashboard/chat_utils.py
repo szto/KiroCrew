@@ -13,16 +13,20 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMEvent
 
 from kiro_crew.dashboard.state import (
+    BUSY_RECOVERY_PREFIX,
+    CONN_RECOVERY_PREFIX,
     CRON_NOTIFY_PREFIX,
     EMPTY_RESPONSE_RECOVERY_PREFIX,
+    MANUAL_RESUME_RECOVERY_PREFIX,
     POSTTOKEN_RECOVERY_PREFIX,
-    SUBAGENT_COMPLETION_PREFIX,
+    SUBAGENT_COMPLETION_PREFIXES,
     DashboardState,
     _ChatSlot,
     _normalize_slot_key,
@@ -405,9 +409,50 @@ def dashboard_slot_key(session_key: str) -> str:
     receive it: routing a notice, addressing a card, honouring a dashboard-only
     directive.
     """
+    if session_key.startswith("cron:"):
+        # A cron-born tab is named ``cron-<job_id>`` (see cron_inject.py), which
+        # is NOT the session key folded: ``_normalize_slot_key`` turns
+        # ``cron:<id>`` into ``cron_<id>`` (underscore), a slot that has never
+        # existed. Consumers that trusted the fold — sub-agent completion
+        # injection, compaction/recycle notices — silently missed the open cron
+        # tab ("parent slot cron_<id> gone, notification only"), so agent
+        # results reached the bell icon but never the conversation.
+        #
+        # Per-run execution keys carry extra segments — ``cron:<job_id>:<run_id>``
+        # for stateless jobs, ``cron:<job_id>:<agent>`` for agent sequences —
+        # while the surface registry only ever holds the slot's linked key
+        # (``cron:<job_id>``), so the surface gate is checked against both
+        # spellings. Whichever matched, the displaying tab is the job's own.
+        job_id = session_key.removeprefix("cron:").split(":", 1)[0]
+        if not (
+            has_dashboard_surface(session_key) or has_dashboard_surface(f"cron:{job_id}")
+        ):
+            return ""
+        return _normalize_slot_key(f"cron-{job_id}")
     if not has_dashboard_surface(session_key):
         return ""
     return _normalize_slot_key(session_key)
+
+
+def subagent_event_slot(parent_session_key: str) -> str:
+    """The ``slot`` value a per-slot WS event must carry for *parent_session_key*.
+
+    The frontend routes ``subagent_*`` / ``batch_finished`` frames by EXACT
+    match between the frame's ``slot`` and the tab's slot key, so a bare
+    ``removeprefix("dashboard:")`` breaks every non-dashboard parent: a
+    cron-born tab is named ``cron-<id>`` while its session key is
+    ``cron:<id>``, and a channel-born tab is named by its transcript stem
+    (``slack_<ts>``) while its session key stays ``slack:<ts>``. Frames tagged
+    with those raw keys route to a slot no tab reads — the Subagents panel
+    showed "No subagents running" for the entire life of every agent spawned
+    from such a session.
+
+    :func:`dashboard_slot_key` owns the real mapping; fall back to the old
+    prefix-strip when it answers ``""`` (no open tab — nothing routes anywhere
+    either way, but keeping the raw key preserves the historical payload for
+    external WS consumers and log lines).
+    """
+    return dashboard_slot_key(parent_session_key) or parent_session_key.removeprefix("dashboard:")
 
 
 def slot_transcript_key(slot_key: str) -> str:
@@ -429,8 +474,48 @@ def slot_transcript_key(slot_key: str) -> str:
     return _history_key_for(slot_key)
 
 
+def slot_history_key(slot: _ChatSlot) -> str:
+    """The TRANSCRIPT key for *slot* — the file its conversation is stored in.
+
+    Differs from :func:`effective_session_key` in exactly one case, and that
+    case is a real one: a channel-born slot the dashboard could not bind.
+    ``surface_channel_session`` deliberately surfaces such a slot **unbound**
+    when ``channel_key_for_stem`` cannot resolve its key (the session map was
+    pruned, or the thread predates it), because guessing would route replies to
+    a session the channel never reads. For that slot ``linked_session_key`` is
+    empty, so ``effective_session_key`` falls back to ``_history_key_for``,
+    which prefixes ``dashboard:`` and names a file NO restore path reads —
+    while every read path resolves the same slot through
+    :func:`slot_transcript_key` and gets the channel transcript. Reads and
+    writes then address different files: a close flag, a fork, or a backfill
+    lands on (or is looked for in) a phantom transcript.
+
+    Resolving the fallback through :func:`slot_transcript_key` puts both back on
+    one file. Deliberately does NOT change the slot's SESSION identity — an
+    unbound channel slot keeps running under ``dashboard:<name>``, so approval
+    policy and restricted-key bookkeeping keyed on that prefix stay intact.
+
+    Gated on the slot's ``channel_origin`` provenance, NOT on its name's shape.
+    A name is not provenance: ``POST /api/chat/slots`` accepts a client-supplied
+    slot name, so keying off the ``slack_<ts>`` shape alone would let a fresh
+    dashboard conversation write itself into an existing thread's transcript and
+    merge two unrelated histories. Only the paths that adopt an EXISTING channel
+    conversation (``surface_channel_session``, the restore, a History resume)
+    set the flag.
+
+    Use this wherever a slot is turned into a transcript path; use
+    :func:`effective_session_key` where a slot is turned into a session.
+    """
+    linked = getattr(slot, "linked_session_key", "")
+    if linked:
+        return linked
+    if getattr(slot, "channel_origin", False):
+        return slot_transcript_key(slot.key)
+    return _history_key_for(slot.key)
+
+
 def effective_session_key(slot: _ChatSlot) -> str:
-    """The session key AND transcript key for *slot* — one identity, one file.
+    """The session key for *slot* — the session its turns run on.
 
     A channel-born slot carries the real channel key (``slack:<ts>``) in
     ``linked_session_key``, so its turns run on the channel's own session and
@@ -439,10 +524,11 @@ def effective_session_key(slot: _ChatSlot) -> str:
     ``.jsonl``, so one key addresses both the live session and the file the
     channel side appends to. Everything else derives from the slot key.
 
-    Use this anywhere a slot's conversation is addressed — reading or writing
-    its transcript, resolving its session, mirroring its links. Reserve
-    :func:`_history_key_for` for the cases that genuinely start from a slot key
-    with no slot in hand.
+    Use this anywhere a slot's SESSION is addressed — resolving the session its
+    turns run on, mirroring its links. For the slot's TRANSCRIPT use
+    :func:`slot_history_key`, which resolves the unbound-channel-slot case onto
+    the file the read paths actually use. Reserve :func:`_history_key_for` for
+    the cases that genuinely start from a slot key with no slot in hand.
     """
     return getattr(slot, "linked_session_key", "") or _history_key_for(slot.key)
 
@@ -680,15 +766,34 @@ def _edit_queued_by_id(messages: list[dict], queue_id: str, content: str) -> boo
 # Runner-injected synthetic recovery instructions (defined here — the shared
 # utils layer — so BOTH the runner's turn logic and the queue/merge predicates
 # below classify them from one source of truth; chat_runner re-exports them).
-# The post-transient CONTINUE resumes an interrupted turn; the empty-response
-# nudge breaks the repeated-empty-generation pattern. Both are orchestration,
-# not user speech.
+# The connection-loss and post-transient continuations resume interrupted turns;
+# the empty-response nudge breaks the repeated-empty-generation pattern. All are
+# orchestration, not user speech.
 #
-# Each carries a bracketed marker line, matching the three recovery prefixes in
+# Each carries a bracketed marker line, matching the recovery prefixes in
 # state.py. The marker is what the dashboard matches to fold the row into a
 # one-line RecoveryCard instead of printing the machine-facing prose as a
 # full-width bubble; it also labels the injection for the model, which reads
 # these the same way it reads the refusal/stall continuations.
+_CONN_RECOVER_MSG = (
+    f"{CONN_RECOVERY_PREFIX}\n"
+    "Your previous turn was interrupted by a lost backend connection and has "
+    "been automatically recovered. This was NOT a user action — do not treat "
+    "it as a cancellation or interruption by the user. The work already done "
+    "above is preserved in the conversation. Continue from where it stopped "
+    "and finish the request — do not restart it or repeat steps or tools that "
+    "already completed successfully."
+)
+_BUSY_RECOVER_MSG = (
+    f"{BUSY_RECOVERY_PREFIX}\n"
+    "Your previous turn was interrupted because the backend session was still "
+    "busy, so the session was reset and the turn automatically recovered. This "
+    "was NOT a user action — do not treat it as a cancellation or interruption "
+    "by the user. The work already done above is preserved in the "
+    "conversation. Continue from where it stopped and finish the request — do "
+    "not restart it or repeat steps or tools that already completed "
+    "successfully."
+)
 _POSTTOKEN_RECOVER_MSG = (
     f"{POSTTOKEN_RECOVERY_PREFIX}\n"
     "The previous response was interrupted partway through by a transient "
@@ -704,7 +809,99 @@ _EMPTY_AUTO_CONTINUE_MSG = (
     "conversation above and respond now — do NOT restart from scratch and do "
     "NOT re-run steps or tools that already completed successfully."
 )
-_SYNTHETIC_RECOVERY_MSGS = (_POSTTOKEN_RECOVER_MSG, _EMPTY_AUTO_CONTINUE_MSG)
+_SYNTHETIC_RECOVERY_MSGS = (
+    _CONN_RECOVER_MSG,
+    _BUSY_RECOVER_MSG,
+    _POSTTOKEN_RECOVER_MSG,
+    _EMPTY_AUTO_CONTINUE_MSG,
+)
+# Injected when the USER presses Continue on an interrupted turn. Worded to be
+# TRUE in both interruption shapes, which is why the endpoint needs no branch:
+# a turn that streamed partway and one that produced nothing at all read this
+# same text correctly. It must not assert that completed work exists above —
+# _POSTTOKEN_RECOVER_MSG does ("The work already done above ... is preserved"),
+# and after a gateway restart mid-first-turn that is simply false, which would
+# point the model at progress it cannot find.
+_MANUAL_RESUME_MSG = (
+    f"{MANUAL_RESUME_RECOVERY_PREFIX}\n"
+    "The previous turn was interrupted before it finished (a dropped "
+    "connection, a restart, or a backend error) and the user has asked you to "
+    "carry on. Look at the conversation above, work out what was already "
+    "completed, and finish the user's most recent request from there. Do NOT "
+    "re-run steps or tools that already completed successfully, and do NOT "
+    "assume any particular progress was made — if nothing was done yet, simply "
+    "start the request now."
+)
+# Injected when the user presses Continue on a slot whose last turn ended
+# NORMALLY. Continue is offered on any idle slot with a transcript (a killed
+# gateway writes no error row, so an interrupted turn can be shape-identical to
+# a clean one — see ``_is_interrupted``), which means the button must also have
+# something true to say when nothing was actually cut short. Sharing
+# ``MANUAL_RESUME_RECOVERY_PREFIX`` is deliberate: to the user the two are one
+# button, so they must fold into the same RecoveryCard.
+#
+# The closing sentence is load-bearing. Without an explicit licence to say "this
+# is done", a model handed a bare "keep going" on a finished thread invents
+# follow-up work to justify the turn.
+_MANUAL_CONTINUE_MSG = (
+    f"{MANUAL_RESUME_RECOVERY_PREFIX}\n"
+    "The user pressed Continue without typing a new instruction. Look at the "
+    "conversation above and carry on with their most recent request: take the "
+    "next step that was still outstanding, or finish anything left half-done. "
+    "Do NOT re-run steps or tools that already completed successfully. If the "
+    "request is genuinely complete, say so in one line instead of inventing "
+    "further work."
+)
+
+
+class ResetCause(str, Enum):
+    """Why a turn's session had to be reset, which selects the continuation the
+    requeue carries — and so the row the transcript renders.
+
+    A closed set rather than a boolean or a caller-supplied string: every reset
+    site must state its cause, and a site added later cannot silently inherit
+    another cause's user-facing label.
+
+    ``str`` mixin (not ``StrEnum``) for Py3.10 compat, matching ``KindSupport``.
+    """
+
+    CONNECTION_LOST = "connection_lost"
+    SESSION_BUSY = "session_busy"
+
+
+#: The continuation each cause resumes with once the turn has emitted output.
+_CONTINUATION_BY_CAUSE = {
+    ResetCause.CONNECTION_LOST: _CONN_RECOVER_MSG,
+    ResetCause.SESSION_BUSY: _BUSY_RECOVER_MSG,
+}
+
+
+def build_recovery_requeue(
+    message: str, turn_emitted: bool, cause: ResetCause, *, message_is_synthetic: bool
+) -> tuple[str, RecoveryPayload]:
+    """Choose the prompt for a reset-and-requeue recovery, and label its provenance.
+
+    Once output or a tool call has been emitted, replaying the original request
+    can repeat side effects. A continuation instead resumes from restored
+    conversation state. Before any output, the original request is safe and is
+    still required for the model to begin the work.
+
+    That decision is the same for every cause, but the continuation is not:
+    ``cause`` is required because the marker it carries is what the transcript
+    renders, and a session that was merely busy must not be reported as a lost
+    connection.
+
+    The text and its label are returned together because choosing them apart is how
+    they drifted. Replaying ``message`` unchanged only means "the user's own words"
+    when this turn was not itself a recovery: a second consecutive failure before any
+    output re-queues the runner's previous continuation, so ``turn_emitted`` alone
+    cannot say whose words these are. ``message_is_synthetic`` carries that from the
+    queue entry that produced the turn, and is required for the same reason ``cause``
+    is — a requeue site added later must not silently inherit "the user said this".
+    """
+    if turn_emitted:
+        return _CONTINUATION_BY_CAUSE[cause], RecoveryPayload.CONTINUATION
+    return message, payload_for_replay(message_is_synthetic)
 
 
 def is_system_injection(content: str) -> bool:
@@ -715,8 +912,11 @@ def is_system_injection(content: str) -> bool:
     messages keep draining during a sub-agent run (`_dequeue_next_system_message`),
     which break a user-message merge (`_dequeue_next_message`), and which must
     not consume the session-reset notice (chat_runner drain loop).
+
+    Both sub-agent shapes count: the per-agent event and the wave digest, whose
+    prefix is a sibling of the per-agent one rather than an extension of it.
     """
-    return content.startswith(SUBAGENT_COMPLETION_PREFIX) or content.startswith(
+    return content.startswith(SUBAGENT_COMPLETION_PREFIXES) or content.startswith(
         CRON_NOTIFY_PREFIX
     )
 
@@ -735,6 +935,48 @@ def is_synthetic_recovery_item(item: dict) -> bool:
     transcript-visible recovery text verbatim (which must classify as a plain
     user message)."""
     return item.get("kind") == SYNTHETIC_RECOVERY_KIND
+
+
+class RecoveryPayload(str, Enum):
+    """Whether a recovery entry's TEXT is runner-authored or the user's own words.
+
+    ``build_recovery_requeue`` already draws this line — a continuation once the
+    turn emitted output, the original request before that — but both re-queue
+    under ``SYNTHETIC_RECOVERY_KIND``, because both must render as an inject row
+    rather than a second user bubble. The kind therefore cannot also answer
+    whether the text may be mirrored to a linked thread as user speech.
+
+    ``str`` mixin (not ``StrEnum``) for Py3.10 compat, matching ``ResetCause``.
+    """
+
+    CONTINUATION = "continuation"
+    ORIGINAL = "original"
+
+
+def payload_for_replay(message_is_synthetic: bool) -> RecoveryPayload:
+    """The payload tag for a requeue that replays the incoming ``message`` verbatim.
+
+    Asks the only question such a site has: were these the user's words, or the
+    runner's? Branching on ``turn_emitted`` instead was wrong — a recovery turn that
+    dies before emitting replays the runner's own continuation, and labelling that
+    ORIGINAL mirrors internal orchestration to a linked thread as user speech.
+    """
+    return RecoveryPayload.CONTINUATION if message_is_synthetic else RecoveryPayload.ORIGINAL
+
+
+def is_synthetic_payload_item(item: dict) -> bool:
+    """True when a queue ENTRY's text was written by the runner, not the user.
+
+    Separate question from :func:`is_synthetic_recovery_item`, which answers where
+    the entry came from. An untagged entry falls back to the kind because the two
+    errors are not symmetric: mirroring runner text as if the user typed it
+    misattributes machine orchestration, while suppressing a mirror only loses an
+    echo of something the user can already see.
+    """
+    payload = item.get("payload")
+    if payload:
+        return payload == RecoveryPayload.CONTINUATION
+    return is_synthetic_recovery_item(item)
 
 
 def is_system_injection_item(item: dict) -> bool:

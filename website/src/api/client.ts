@@ -8,12 +8,15 @@ import type {
   PullRequestStatusBatch,
   PublishProviderDescriptor,
   SessionDoc,
+  SessionStorageCleanup,
+  SessionStorageReport,
 } from '../types'
 import { refreshOnce, __resetRefreshOnceForTests } from './refreshOnce'
 import { beginArtifactWrite, endArtifactWrite } from '../lib/artifactWrites'
 import { installApiTransport } from './apiTransport'
 import { queryClient } from './queryClient'
 import { getStoredConsent } from '../utils/themeConsent'
+import { recordError, parseErrorCode, requestPath } from '../utils/errorReport'
 import { i18nT } from '../i18n/t'
 
 /**
@@ -68,6 +71,14 @@ export interface PlanStepInput {
 export interface InstallStreamResult {
   ok?: boolean
   error?: string
+  /**
+   * Machine-readable failure code. The registry install path checks the
+   * execution gate BEFORE cloning, so a third-party install can be refused with
+   * `app_execution_denied` — and because the stream RESOLVES that refusal (SSE
+   * `done`) instead of rejecting, the code has to travel on the result for the
+   * consent modal to open at all.
+   */
+  code?: string
   needsClientInstall?: boolean
   clientInstall?: { shell?: string; postInstall?: string }
 }
@@ -437,6 +448,67 @@ export interface SecurityPostureData {
   counts: Record<string, number | null>
 }
 
+/**
+ * GET /api/tailnet/status — whether this machine's Tailscale MagicDNS name is in
+ * the dashboard's Origin allow-list.
+ *
+ * `state` is derived SERVER-SIDE and the UI must render off it directly rather
+ * than recomputing it from the other fields: one owner for the state machine
+ * means the two layers cannot disagree about what "active" means. Precedence is
+ * `pinned` > `off` > `unresolved` > `active`.
+ *
+ * `host` / `origin` / `resolved_at` describe the STARTUP resolution — the value
+ * that actually went into `build_allowed_origins` — not a fresh probe. A live
+ * probe could report a name the running origin set does not contain (daemon came
+ * up after the gateway), and rendering that as trusted is the same
+ * checked-but-never-ran defect the posture registry guards against.
+ */
+export interface TailnetStatusData {
+  /** `dashboard.tailscale.enabled` as actually loaded, post-hydration. */
+  enabled: boolean
+  /** `capabilities.tailnet_origin` pinned off at the POLICY layer. */
+  governance_pinned: boolean
+  /** MagicDNS name resolved at startup; `''` when none was. */
+  host: string
+  /** `https://<host>`; `''` when `host` is `''`. */
+  origin: string
+  /** Epoch seconds of that startup resolution; `0` when it never resolved. */
+  resolved_at: number
+  state: 'pinned' | 'off' | 'unresolved' | 'active'
+}
+
+/**
+ * GET /api/security/trusted-apps — per-app grants that let a third-party app
+ * run its own code (Python in-process, its own backend, manifest shell
+ * commands).  Third-party app code is refused by default; a grant is made for
+ * ONE app at a time from the trust-consent modal, so `apps` is the explicit
+ * allow list and `allowAll` is the separate blanket escape hatch.
+ */
+export interface TrustedAppsData {
+  /** Grants the execution gate ACTUALLY enforces (valid app names, sorted). */
+  apps: string[]
+  /**
+   * Entries stored in `config.json` that the gate IGNORES because they fail the
+   * app-name charset — a hand-edited config can hold `LD-App`, `ld-app ` with a
+   * trailing space, a fullwidth homoglyph, `..` or `*`. They must render
+   * separately from `apps`: folded in, the panel claims trust that does not
+   * exist and the user cannot tell why their app is still blocked.
+   */
+  ineffective: string[]
+  /** Blanket grant — trusts every third-party app, present or future. */
+  allowAll: boolean
+}
+
+/**
+ * DELETE /api/security/trusted-apps/{name} — the refreshed snapshot PLUS whether
+ * the revoke also had to DISABLE the app. Revoking trust has to stop the app's
+ * code from running, so the backend disables a currently-enabled app in the same
+ * transaction; the UI must say so, otherwise an app silently stops working.
+ */
+export interface TrustedAppsRevokeResult extends TrustedAppsData {
+  disabled: boolean
+}
+
 let _sessionExpiredShown = false
 
 /**
@@ -636,12 +708,34 @@ export const friendlyErrText = (status: number, body: string): string => {
   return body
 }
 
+/**
+ * Build the ApiError AND journal it.
+ *
+ * `j`/`jNullable` are the single chokepoint every dashboard API failure passes
+ * through, which makes this the one place that can capture the full context
+ * (status, path, backend `code`, raw body) before call sites collapse it to
+ * `e.message`. `utils/errorReport` then lets a shared error banner recover that
+ * context from the message alone — see AskAgentButton / ErrorNotice.
+ */
+const apiFailure = (r: Response, errText: string): ApiError => {
+  const message = friendlyErrText(r.status, errText) || `HTTP ${r.status}`
+  recordError({
+    source: 'api',
+    message,
+    status: r.status,
+    code: parseErrorCode(errText),
+    endpoint: requestPath(r.url),
+    detail: errText,
+  })
+  return new ApiError(r.status, message, errText)
+}
+
 const j = async (r: Response) => {
   checkSessionExpired(r)
   if (r.ok) removeAuthBanner()
   if (!r.ok) {
     const errText = await r.text()
-    throw new ApiError(r.status, friendlyErrText(r.status, errText) || `HTTP ${r.status}`, errText)
+    throw apiFailure(r, errText)
   }
   return r.json()
 }
@@ -656,7 +750,7 @@ const jNullable = async (r: Response) => {
   if (r.status === 204) return null
   if (!r.ok) {
     const errText = await r.text()
-    throw new ApiError(r.status, friendlyErrText(r.status, errText) || `HTTP ${r.status}`, errText)
+    throw apiFailure(r, errText)
   }
   return r.json()
 }
@@ -733,7 +827,14 @@ export interface InstanceTunnelStatus {
   connected_at?: number
   token_ttl_remaining?: number
   diagnosis?: {
-    code: 'ok' | 'not_connected' | 'ssh_unreachable' | 'remote_down' | 'tunnel_down' | 'unknown'
+    code:
+      | 'ok'
+      | 'not_connected'
+      | 'ssh_unreachable'
+      | 'ssm_unreachable'
+      | 'remote_down'
+      | 'tunnel_down'
+      | 'unknown'
     ok: boolean
     reason: string
     probes: { name: string; ok: boolean }[]
@@ -755,16 +856,33 @@ export interface InstanceView {
   local_port: number
   ttl: string
   remote_bin: string
+  /** Transport used to reach the instance. Older records default to 'ssh'. */
+  connection_method: 'ssh' | 'ssm'
+  /** SSM-only: EC2 instance id (i-...) or SSM managed-instance id (mi-...). */
+  ssm_target: string
+  /** SSM-only: named AWS profile ('' = default credential chain). */
+  aws_profile: string
+  /** SSM-only: AWS region ('' = profile/environment default). */
+  aws_region: string
+  ssm_run_as: string
   was_connected: boolean
   status: InstanceTunnelStatus
 }
 
 export interface AddInstanceBody {
   name: string
-  ssh_host: string
+  /** Required when connection_method is 'ssh' (the default). */
+  ssh_host?: string
   remote_port?: number
   ttl?: string
   remote_bin?: string
+  /** Transport to reach the instance. Defaults to 'ssh' when omitted. */
+  connection_method?: 'ssh' | 'ssm'
+  /** Required when connection_method is 'ssm': i-... / mi-... instance id. */
+  ssm_target?: string
+  aws_profile?: string
+  aws_region?: string
+  ssm_run_as?: string
   id?: string
 }
 
@@ -778,25 +896,21 @@ export interface TunnelStatus {
   reconnect_attempt: number
 }
 
-export interface KiroPrerequisiteOperation {
-  kind: '' | 'install' | 'login'
-  status: 'idle' | 'running' | 'succeeded' | 'failed'
-  message: string
-  detail: string
-  url: string
-  error: string
-}
-
 export interface KiroPrerequisiteStatus {
   platform: string
   installed: boolean
   authenticated: boolean
   ready: boolean
   initial_setup_complete: boolean
-  can_auto_install: boolean
-  can_login: boolean
   repair_required: boolean
   docs_url: string
+  /**
+   * The command the USER runs to sign in (`kiro-cli login`). Supplied by the
+   * gateway and rendered verbatim in a `<code>` — never a catalog value, because
+   * a translated command cannot be typed.
+   */
+  login_command: string
+  sso_login_command: string
   setup_allowed: boolean
   /**
    * True when the CLI binary is present and executable but could not be
@@ -810,7 +924,26 @@ export interface KiroPrerequisiteStatus {
   sandbox_failure_kind: string
   /** Technical probe reason, e.g. 'unshare(CLONE_NEWNS) failed with errno 1 (EPERM)'. */
   sandbox_detail: string
-  operation: KiroPrerequisiteOperation
+  /**
+   * Machine-readable host mechanism behind a Linux user-namespace denial:
+   * 'apparmor_userns' | 'max_user_namespaces' | 'no_user_ns' | 'userns_denied' | ''.
+   * Selects which concrete remedy the gate renders — the errno alone leaves the
+   * user with nothing to act on.
+   */
+  sandbox_remedy: string
+  /**
+   * Kiro Crew's own agent spec files missing from the kiro-cli agents directory.
+   * Non-empty means kiro-cli will answer every session/set_mode with
+   * "Mode '<name>' not found", so `ready` is forced false and `repair_required`
+   * true — a viable binary and a good `whoami` are NOT sufficient on their own.
+   */
+  missing_agent_specs: string[]
+  /**
+   * Failure text from the repair the Check again button attempts when specs are
+   * missing. Empty when none was attempted or it succeeded. Shown verbatim and
+   * untranslated: it names the failing install step.
+   */
+  agent_spec_repair_error: string
 }
 
 export interface AgentImportCategory {
@@ -870,10 +1003,118 @@ export interface AgentImportApplyResponse {
   summary: AgentImportSummary
 }
 
+/* ── Inbound webhooks (GET /api/webhooks) ──
+ * Shapes mirror the pinned backend contract. Both one-time secrets — the bearer
+ * token and the HMAC signing secret — only ever appear in
+ * `WebhookTokenCreated`, from the create call; `GET /api/webhooks` never echoes
+ * either one. */
+
+export type WebhookFreshness = 'fresh' | 'stale' | 'expired'
+
+export type WebhookOutcome =
+  | 'completed' | 'timeout' | 'error' | 'rejected_capacity' | 'unauthorized' | 'disabled'
+
+export interface WebhookTokenEntry {
+  id: string
+  label: string
+  /** Leading, non-secret slice of the raw token, e.g. `kc_whk_4f2b`. */
+  display_prefix: string
+  last4: string
+  created_at: number
+  /** null / 0 until the token authorizes its first call. */
+  last_used_at: number | null
+  /** True when a caller using this token must also send a timestamp + HMAC
+   *  signature of the raw body. The signing secret itself is never in this
+   *  payload — it is returned once, from the create call. Legacy config tokens
+   *  have no signing secret, so they report false. */
+  require_signature: boolean
+  /** True for the legacy `hooks.webhook_token` config scalar, which cannot be
+   *  deleted from the dashboard. */
+  legacy: boolean
+}
+
+export interface WebhookContextEntry {
+  hook_id: string
+  session_key: string
+  registered_at: number
+  age_seconds: number
+  freshness: WebhookFreshness
+  context_summary: string
+  context_chars: number
+}
+
+export interface WebhookRunRecord {
+  id: string
+  /** null for a 401 — the caller is unknown at that point. */
+  hook_id: string | null
+  session_key: string
+  name?: string
+  outcome: WebhookOutcome
+  started_at: number
+  duration_ms: number
+  result_chars: number
+  token_id: string | null
+  delivered: boolean
+  detail?: string
+}
+
+export interface WebhooksView {
+  /** Effective state: `has_tokens && switch_on`. */
+  enabled: boolean
+  /** The kill switch on its own. False ⇒ every inbound call is answered
+   *  with 503 before any auth work, while tokens and history are kept. */
+  switch_on: boolean
+  /** True when at least one token exists (stored or legacy). */
+  has_tokens: boolean
+  url: string
+  slots: { in_use: number; max: number }
+  limits: {
+    session_key_prefix: string
+    message_max: number
+    timeout_default: number
+    timeout_max: number
+    max_concurrent: number
+    /** Raw request-body cap in bytes. Optional: a server predating the cap
+     *  omits it, and the page falls back rather than rendering `undefined`. */
+    body_max_bytes?: number
+    /** Accepted clock skew, in seconds, for a signed request's timestamp. */
+    signature_window_seconds: number
+  }
+  tokens: WebhookTokenEntry[]
+  contexts: WebhookContextEntry[]
+  runs: WebhookRunRecord[]
+}
+
+export interface WebhookTokenCreated {
+  ok: boolean
+  /** The raw secret — returned exactly once and unrecoverable afterwards. */
+  token: string
+  /** The HMAC signing secret — also returned exactly once. Absent when the
+   *  token was minted bearer-only (`require_signature: false`). */
+  signing_secret?: string
+  entry: WebhookTokenEntry
+}
+
+export interface WebhookTestResult {
+  ok: boolean
+  status: number
+  session_key?: string
+  error?: string
+}
+
 export const api = {
   status: () => fetch('/api/status').then(j),
   tunnelStatus: () => fetch('/api/tunnel/status').then(j) as Promise<TunnelStatus>,
   system: () => fetch('/api/system').then(j),
+  sessionStorage: () => get('/api/system/session-storage').then(j) as Promise<SessionStorageReport>,
+  sessionStorageCleanup: (olderThanDays: number, dryRun = false) =>
+    post('/api/system/session-storage/cleanup', { older_than_days: olderThanDays, dry_run: dryRun })
+      .then(j) as Promise<SessionStorageCleanup>,
+  sessionStorageRestore: (batchId: string, uids?: string[]) =>
+    post('/api/system/session-storage/restore', uids ? { batch_id: batchId, uids } : { batch_id: batchId })
+      .then(j) as Promise<{ restored: number }>,
+  sessionStorageEmpty: (batchIds: string[]) =>
+    post('/api/system/session-storage/empty', { batch_ids: batchIds }).then(j) as Promise<{ freed_bytes: number }>,
   telemetryStartup: () => fetch('/api/telemetry/startup').then(j),
   // Per-turn context injection breakdown for one session. Independent of the
   // telemetry main switch: the usage rows it reads are always written.
@@ -883,14 +1124,29 @@ export const api = {
   // Background polls read the gateway's latched state (no kiro-cli subprocess).
   // `refresh` is the explicit user action (Refresh / Check again) that forces a
   // real host probe.
-  kiroPrerequisite: (refresh = false) =>
-    get(`/api/kiro-prerequisite${refresh ? '?refresh=1' : ''}`).then(
+  /**
+   * `refresh` picks the probe mode, and the two are deliberately different:
+   * `'explicit'` is the human Check again and always probes the host, `'auto'` is
+   * the blocking gate's poll and is coalesced server-side behind a short floor so
+   * several open tabs cannot multiply the `kiro-cli` spawns. `false` reads the
+   * gateway's latched state and spawns nothing.
+   */
+  kiroPrerequisite: (refresh: false | 'auto' | 'explicit' = false) => {
+    // Built with URLSearchParams like every other query here (see artifacts
+    // below): the mode is its own wire value, so there is no query-string
+    // literal for the i18n gate to mistake for user-visible copy.
+    const params = new URLSearchParams()
+    if (refresh) params.set('refresh', refresh)
+    const s = params.toString()
+    return get(`/api/kiro-prerequisite${s ? `?${s}` : ''}`).then(
       j,
-    ) as Promise<KiroPrerequisiteStatus>,
-  installKiroPrerequisite: () =>
-    post('/api/kiro-prerequisite/install').then(j) as Promise<KiroPrerequisiteStatus>,
-  loginKiroPrerequisite: () =>
-    post('/api/kiro-prerequisite/login').then(j) as Promise<KiroPrerequisiteStatus>,
+    ) as Promise<KiroPrerequisiteStatus>
+  },
+  // A POST, not a flag on the status GET: the gateway's CSRF check and its SEL
+  // audit are both method-scoped, so a spec rewrite reached from a GET would be
+  // cross-site triggerable and would leave no audit record.
+  repairKiroPrerequisiteSpecs: () =>
+    post('/api/kiro-prerequisite/repair-specs').then(j) as Promise<KiroPrerequisiteStatus>,
   onboardingImportScan: () =>
     get('/api/onboarding/import/scan').then(j) as Promise<AgentImportScanResponse>,
   onboardingImportApply: (body: AgentImportApplyRequest) =>
@@ -901,6 +1157,11 @@ export const api = {
   // means "temporarily unresolvable", never "zero".
   securityStats: () => get('/api/security/stats').then(j) as Promise<{ denied_commands: number | null; suspicious_patterns: number | null; tool_schemas: number | null; redaction_paths: number | null }>,
   securityPosture: () => get('/api/security/posture').then(j) as Promise<SecurityPostureData>,
+  // Tailnet origin (Settings → Security). READ ONLY here: the toggle writes
+  // `dashboard.tailscale.enabled` through the generic config PATCH, because the
+  // setting IS a config value and the status endpoint only reports what the
+  // running server resolved from it at startup.
+  tailnetStatus: () => get('/api/tailnet/status').then(j) as Promise<TailnetStatusData>,
   // Denied commands (Settings → Security). Every endpoint returns the full
   // refreshed snapshot so callers can seed their query cache from the response.
   deniedCommands: () => get('/api/security/denied-commands').then(j) as Promise<DeniedCommandsData>,
@@ -914,6 +1175,18 @@ export const api = {
     patch('/api/security/denied-commands/user/' + encodeURIComponent(id), { enabled }).then(j) as Promise<DeniedCommandsData>,
   deleteUserDeniedCommand: (id: string) =>
     del('/api/security/denied-commands/user/' + encodeURIComponent(id)).then(j) as Promise<DeniedCommandsData>,
+  // Third-party app trust (Settings → Security). Like denied-commands, every
+  // endpoint returns the full refreshed snapshot so callers can seed the query
+  // cache from the mutation response instead of re-fetching.
+  listTrustedApps: () => get('/api/security/trusted-apps').then(j) as Promise<TrustedAppsData>,
+  trustApp: (name: string) =>
+    post('/api/security/trusted-apps/' + encodeURIComponent(name)).then(j) as Promise<TrustedAppsData>,
+  // Returns the snapshot PLUS `disabled` — revoking trust also disables an app
+  // that is currently enabled, so its code stops running immediately.
+  untrustApp: (name: string) =>
+    del('/api/security/trusted-apps/' + encodeURIComponent(name)).then(j) as Promise<TrustedAppsRevokeResult>,
+  setTrustAllApps: (value: boolean) =>
+    put('/api/security/trusted-apps/allow-all', { value }).then(j) as Promise<TrustedAppsData>,
   // Read-only governance policy viewer (Settings → Security). No write path —
   // the enterprise ceiling is file-authored and un-editable via the UI.
   governancePolicy: () => get('/api/governance/policy').then(j) as Promise<GovernancePolicyData>,
@@ -980,6 +1253,29 @@ export const api = {
   consolidateMemory: (key: string, includeHistory: boolean) => post('/api/memory/consolidate', { key, include_history: includeHistory }).then(j),
   restartSessions: () => post('/api/sessions/restart').then(j),
   sessionsContext: () => fetch('/api/sessions/context').then(j),
+  sessionsMemory: () => fetch('/api/sessions/memory').then(j) as Promise<{
+    sessions: {
+      key: string; title: string; slot_key: string; untitled: boolean
+      agent: string; pid: number | null; owns_runtime: boolean; prompts: number
+      channel: string
+      rss_mb: number | null; procs: number | null; mcp: number | null
+      cpu_cores: number | null; uptime_s: number | null
+      credits: number | null; turns: number | null
+    }[]
+    tasks: {
+      id: string; task: string; agent: string; parent: string
+      rss_mb: number; peak_rss_mb: number; cpu_cores: number
+      started_at: number; shared: boolean; pid: number | null; sampled: boolean
+    }[]
+    totals: {
+      rss_mb: number; runtimes: number; host_mb: number | null
+      host_pct: number | null; rss_is_upper_bound: boolean
+    }
+    unattributed: {
+      procs: number; rss_mb: number | null; oldest_uptime_s: number | null
+    } | null
+    history: { t: number; mb: number }[]
+  }>,
   sessionsUsage: () => fetch('/api/sessions/usage').then(j),
   providerUsage: () => fetch('/api/usage').then(j),
   mcpProbeCache: () => fetch('/api/mcp/probe').then(j),
@@ -1076,6 +1372,13 @@ export const api = {
     return fetch('/api/crons/history' + (p.toString() ? '?' + p : ''), { headers: { ..._sk } }).then(j)
   },
 
+  // Cron Folders
+  cronFolders: () => fetch('/api/cron-folders').then(j),
+  createCronFolder: (name: string) => post('/api/cron-folders', { name }).then(j),
+  updateCronFolder: (id: string, body: { name?: string }) =>
+    fetch('/api/cron-folders/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j),
+  deleteCronFolder: (id: string) => del('/api/cron-folders/' + id).then(j),
+
   // Lessons
   lessons: () => fetch('/api/lessons').then(j),
   createLesson: (rule: string, category: string) => post('/api/lessons', { rule, category }).then(j),
@@ -1088,6 +1391,18 @@ export const api = {
   deleteHook: (id: string) => del('/api/hooks/' + id).then(j),
   toggleHook: (id: string) => post('/api/hooks/' + id + '/toggle', {}).then(j),
   testHook: (id: string, context?: string) => post('/api/hooks/' + id + '/test', { context: context || 'test' }).then(j),
+  // Inbound webhooks (POST /api/hooks/agent) — token store, registered
+  // contexts, run history. All dashboard-authed; the webhook bearer token is
+  // never used from the browser.
+  webhooks: () => fetch('/api/webhooks').then(j),
+  // `require_signature` defaults to true server-side; pass false only for a
+  // caller that cannot compute an HMAC.
+  createWebhookToken: (label: string, requireSignature = true) =>
+    post('/api/webhooks/tokens', { label, require_signature: requireSignature }).then(j),
+  deleteWebhookToken: (id: string) => del('/api/webhooks/tokens/' + encodeURIComponent(id)).then(j),
+  deleteWebhookContext: (hookId: string) => del('/api/webhooks/contexts/' + encodeURIComponent(hookId)).then(j),
+  testWebhook: (message?: string) => post('/api/webhooks/test', { message }).then(j),
+  setWebhooksEnabled: (enabled: boolean) => post('/api/webhooks/switch', { enabled }).then(j),
   // Prompts (Agent SOPs)
   prompts: () => fetch('/api/prompts').then(j),
   promptDetail: (name: string) => fetch('/api/prompts/' + name.split('/').map(encodeURIComponent).join('/')).then(j),
@@ -1120,6 +1435,12 @@ export const api = {
   approvePendingSkill: (slug: string) => post('/api/skills/-/pending/' + encodeURIComponent(slug) + '/approve', {}).then(j),
   dismissPendingSkill: (slug: string) => post('/api/skills/-/pending/' + encodeURIComponent(slug) + '/dismiss', {}).then(j),
   pinSkill: (name: string, pinned: boolean) => post('/api/skills/-/pin', { name, pinned }).then(j),
+  /** Opt a skill in/out of full-body injection when its triggers match.
+   *  `inject: false` reduces the skill to a one-line pointer on a match. */
+  setSkillInjectOnTrigger: (name: string, inject: boolean) =>
+    post('/api/skills/-/inject-on-trigger', { name, inject }).then(j),
+  /** Context budget: cost data for the skill control plane. */
+  skillsBudget: () => get('/api/skills/-/budget').then(j) as Promise<import('../types').SkillBudgetResponse>,
   /** Multi-provider skill discovery (skills.sh, etc.) */
   discoverSkills: (query: string, opts?: { provider?: string; limit?: number }) =>
     get(`/api/skills/-/discover?q=${encodeURIComponent(query)}${opts?.provider ? `&provider=${opts.provider}` : ''}${opts?.limit ? `&limit=${opts.limit}` : ''}`).then(j) as Promise<import('../types').DiscoverSkillsResponse>,
@@ -1176,7 +1497,7 @@ export const api = {
   defaultAgent: () => fetch('/api/config/default-agent').then(j),
   setDefaultAgent: (agent: string) => put('/api/config/default-agent', { agent }).then(j),
   kirocrewConfig: () => fetch('/api/config/kirocrew').then(j),
-  saveKirocrewConfig: (agent: object) => put('/api/config/kirocrew', { agent }).then(j),
+  saveKirocrewConfig: (agent: object) => put('/api/config/kirocrew', { agent }).then(j) as Promise<{ ok?: boolean; restart_required?: boolean; error?: string }>,
   patchConfig: (path: string, value: unknown) => fetch('/api/config/kirocrew', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, value }) }).then(j),
   // Optional integrations — backend endpoints are graceful no-ops on a public
   // install (AIM / kiro usage are stubbed). Kept so the UI compiles and
@@ -1220,8 +1541,16 @@ export const api = {
   pullRequestChecks: (url: string) => post('/api/source/pull-request/checks', { url }).then(j) as Promise<{ checks: PullRequestCheck[] }>,
   pullRequestStatuses: (urls: string[]) => post('/api/source/pull-request/status', { urls }).then(j) as Promise<PullRequestStatusBatch>,
   resolvePullRequestThread: (url: string, threadId: string) => post('/api/source/pull-request/resolve', { url, threadId }).then(j) as Promise<{ resolved: boolean }>,
+  unresolvePullRequestThread: (url: string, threadId: string) => post('/api/source/pull-request/unresolve', { url, threadId }).then(j) as Promise<{ resolved: boolean }>,
+  /** Reply into an existing review thread. Owner-only on the gateway. */
+  replyToPullRequestThread: (url: string, threadId: string, body: string) => post('/api/source/pull-request/reply', { url, threadId, body }).then(j) as Promise<{ posted: boolean }>,
+  /** Top-level comment on the pull request conversation. */
+  commentOnPullRequest: (url: string, body: string) => post('/api/source/pull-request/comment', { url, body }).then(j) as Promise<{ posted: boolean }>,
   enablePullRequestAutoMerge: (url: string, confirmImmediateMerge = false) => post('/api/source/pull-request/auto-merge', { url, confirmImmediateMerge }).then(j) as Promise<{ autoMerge: boolean; mergeMethod: string }>,
   markPullRequestReady: (url: string) => post('/api/source/pull-request/ready', { url }).then(j) as Promise<{ ready: boolean }>,
+  pullRequestPendingReview: (url: string) => post('/api/source/pull-request/pending-review', { url }).then(j) as Promise<{ reviewId: string; body: string; comments?: { path: string; line: number | null; body: string }[]; commitId: string; headSha: string; stale: boolean; contentRedacted: boolean; autoMergeArmed: boolean; contentDigest: string; staleDismissalEnabled: boolean }>,
+  submitPullRequestReview: (url: string, reviewId: string, event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT', contentDigest: string) =>
+    post('/api/source/pull-request/submit-review', { url, reviewId, event, contentDigest }).then(j) as Promise<{ submitted: boolean; event: string }>,
   // Issue sources. `refresh` bypasses the server's cached payload; the panel
   // never polls, so a refresh is always an explicit user action.
   fetchIssueSource: (url: string, refresh = false) => post('/api/source/issue', { url, refresh }).then(j) as Promise<IssueSource>,
@@ -1260,6 +1589,8 @@ export const api = {
   resolveNavLinks: (links: { url: string; context: string }[]) => post('/api/chat/nav/resolve-links', { links }).then(j) as Promise<{ summaries: string[] }>,
   renameSlot: (slot: string, title: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/title', { title }).then(j),
   regenerateSlot: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/regenerate').then(j),
+  /** Pick an interrupted turn back up. NOT `/resume` — that path opens a history session into a tab. */
+  continueSlot: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/continue').then(j),
   switchVariant: (slot: string, index: number) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/switch-variant', { index }).then(j),
   editResend: (slot: string, ts: string, content: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/edit-resend', { ts, content }).then(j),
   rewind: (slot: string, ts: string, content: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/rewind', { ts, content }).then(j),
@@ -1276,9 +1607,8 @@ export const api = {
   // Folders
   chatFolders: () => fetch('/api/chat/folders', { headers: { ..._sk } }).then(j),
   /** `config` carries the folder settings the create modal collects. Each is
-   *  omitted when empty so the backend applies its own default — notably an
-   *  absent `icon` leaves the LLM emoji auto-generation in place. */
-  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; icon?: string }) =>
+   *  omitted when empty so the backend applies its own default. */
+  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string }) =>
     post('/api/chat/folders', { name, parent_id: parentId || '', ...(config ?? {}) }).then(j),
   updateChatFolder: (id: string, body: object) => patch('/api/chat/folders/' + encodeURIComponent(id), body).then(j),
   deleteChatFolder: (id: string) => del('/api/chat/folders/' + encodeURIComponent(id)).then(j),
@@ -1298,15 +1628,19 @@ export const api = {
   updateTagColumn: (id: string, body: { name?: string; tag_ids?: string[]; mode?: 'any' | 'all' | 'none'; order?: number; include_untagged?: boolean }) => patch('/api/chat/tag-columns/' + encodeURIComponent(id), body).then(j),
   deleteTagColumn: (id: string) => del('/api/chat/tag-columns/' + encodeURIComponent(id)).then(j),
   reorderTagColumns: (ids: string[]) => fetch('/api/chat/tag-columns/order', { method: 'PUT', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ ids }) }).then(j),
-  sendChat: (message: string, slot?: string, colorTheme?: string, signal?: AbortSignal, meta?: Record<string, unknown>, browse?: boolean) => {
+  sendChat: (message: string, slot?: string, colorTheme?: string, signal?: AbortSignal, meta?: Record<string, unknown>) => {
     // theme_consent_sha is the WIRE TOKEN (two-tier consent). The client just
     // TRANSMITS the raw stored grant (see themeConsentSha) — the server verifies
     // content-binding, injecting the persona only when this token equals sha256
     // of the persona.md it reads. Omitted for a built-in theme, no grant, or a
     // legacy '1'/'' token (must re-prompt). The legacy `theme_consent` boolean
     // is intentionally NOT sent: gating is content-bound server-side.
+    //
+    // Browse mode is no longer sent per message: it is default-on server-side
+    // whenever Browser Mode is enabled in Settings (a durable capability),
+    // gated there rather than per turn.
     const themeConsent = themeConsentSha(colorTheme)
-    return fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ message, slot, ...(colorTheme ? { color_theme: colorTheme } : {}), ...(themeConsent ? { theme_consent_sha: themeConsent } : {}), ...(meta ? { meta } : {}), ...(browse ? { browse: true } : {}) }), signal })
+    return fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ message, slot, ...(colorTheme ? { color_theme: colorTheme } : {}), ...(themeConsent ? { theme_consent_sha: themeConsent } : {}), ...(meta ? { meta } : {}) }), signal })
   },
   // Mid-turn steer: inject into the RUNNING turn instead of queueing. Fire-and-forget
   // JSON response ({ok, steered}); the backend falls back to queue if steer is
@@ -1368,10 +1702,26 @@ export const api = {
   renameTaskRun: (taskId: string, name: string) => fetch('/api/taskrunner/' + encodeURIComponent(taskId) + '/name', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) }).then(j),
   updateTask: (taskId: string, index: number, updates: { title?: string; description?: string; depends_on?: number[]; requires_approval?: boolean; force_approval?: boolean }) => fetch('/api/taskrunner/' + encodeURIComponent(taskId) + '/tasks/' + index, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates) }).then(j),
   taskRunToChat: (taskId: string) => post('/api/taskrunner/' + encodeURIComponent(taskId) + '/to-chat').then(j),
-  revealPath: (path: string) => post('/api/reveal', { path }).then(j).then((r: { copy?: string }) => {
+  // `action` mirrors the backend's own two modes: 'reveal' selects the path in
+  // the OS file manager (the default every existing caller relies on), 'open'
+  // hands a regular file to its default application. Headless hosts have
+  // neither, so the backend answers with `copy` and the path goes to the
+  // clipboard instead of the call silently doing nothing.
+  revealPath: (path: string, action: 'open' | 'reveal' = 'reveal') => post('/api/reveal', { path, action }).then(j).then((r: { copy?: string }) => {
     if (r.copy) copyToClipboard(r.copy)
     return r
   }),
+  collectDiagnostics: (body: { note: string; include_logs: boolean }) =>
+    post('/api/diagnostics/collect', body).then(j) as Promise<{
+      zip_path: string
+      filename: string
+      included: string[]
+      skipped: string[]
+      redaction_summary: Record<string, number>
+      total_redactions: number
+      github_issue_url: string
+      download_url: string
+    }>,
   refineTaskInput: (input: string) => post('/api/taskrunner/refine', { input }).then(j),
   refineStatus: () => fetch('/api/taskrunner/refine').then(j),
   refineCancel: () => post('/api/taskrunner/refine/cancel').then(j),
@@ -1411,17 +1761,18 @@ export const api = {
   // Update
   checkUpdate: () => fetch('/api/update/check').then(j),
   changelog: () => fetch('/api/changelog').then(j),
+  releases: () => fetch('/api/releases').then(j),
   applyUpdate: () => post('/api/update').then(j),
   setAutoUpdate: (enabled: boolean) => post('/api/update/auto', { enabled }).then(j),
   cancelUpdate: () => post('/api/update/cancel').then(j),
   simulateUpdate: (opts?: { delay?: number; fail_at?: string }) => post('/api/update/simulate', opts || {}).then(j),
   pickFiles: () => post('/api/upload').then(j) as Promise<{ paths: string[] }>,
   fileDiff: (path: string) => fetch('/api/file-diff?path=' + encodeURIComponent(path)).then(j) as Promise<{ diff: string; original: string; status?: 'clean' | 'modified' | 'untracked' | 'not_git' }>,
-  /** Fuzzy file search for @-mention picker */
+  /** Fuzzy file search for @-mention picker. `kind` distinguishes folder hits from files. */
   fileSearch: (q: string, project?: string, signal?: AbortSignal) => {
     const p = new URLSearchParams({ q })
     if (project) p.set('project', project)
-    return fetch(`/api/file-search?${p}`, signal ? { signal } : undefined).then(j) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number }>; root: string }>
+    return fetch(`/api/file-search?${p}`, signal ? { signal } : undefined).then(j) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string }>
   },
   /** Upload files via browser File API (cross-platform) */
   uploadFiles: async (files: File[]) => {
@@ -1755,8 +2106,8 @@ export const api = {
   editArtifactComment: (slug: string, commentId: string, body: { text: string }) =>
     patch(`/api/artifacts/${encodeURIComponent(slug)}/comments/${encodeURIComponent(commentId)}`, body).then(j),
   browserAuthRetry: () => post('/api/browser-auth-retry', {}).then(j),
-  getBrowserConfig: () => get('/api/browser/config').then(j) as Promise<{extension_mode: boolean; token: boolean}>,
-  saveBrowserConfig: (body: {extension_mode: boolean; token: string}) => put('/api/browser/config', body).then(j),
+  getBrowserConfig: () => get('/api/browser/config').then(j) as Promise<{enabled: boolean; engine: string; engines: string[]; extension_mode: boolean; token: boolean; installed: boolean}>,
+  saveBrowserConfig: (body: {enabled: boolean; engine: string; extension_mode: boolean; token: string}) => put('/api/browser/config', body).then(j) as Promise<{ok: boolean; mcp_status?: string; enabled?: boolean; engine?: string; install?: {ok: boolean; step: string; detail: string; engine: string}}>,
   // Computer use (desktop automation). The PUT returns the refreshed snapshot so
   // the panel re-renders from server truth rather than its optimistic guess.
   getComputerUseConfig: () => get('/api/computer-use/config').then(j) as Promise<ComputerUseConfigData>,

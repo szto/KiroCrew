@@ -34,15 +34,50 @@ function open(props: Partial<React.ComponentProps<typeof FolderConfigModal>> = {
   return { onSubmit, onClose, ...utils }
 }
 
+/* The agent picker is a Radix Select (SimpleSelect), not a native <select>, so
+ * it is addressed by its accessible name — the `aria-label` that carries the
+ * "Default agent" heading's key, since a <button> cannot be reached by an
+ * external <label htmlFor>. Its options live in a portal that only exists while
+ * the popup is open, so any assertion about them has to open it first.
+ *
+ * NOTE ON THE HARNESS: a Radix Select nested in a Radix Dialog cannot be driven
+ * in jsdom (Radix's flushSync inside Testing Library's act() throws "Should not
+ * already be working"), which is why CrewEditorSelect.test.tsx and
+ * WorkspaceModal.test.tsx stub SimpleSelect out. That does NOT apply here:
+ * `Modal` is hand-rolled (createPortal + framer-motion), so there is no Radix
+ * layer above the select and the real component is driven directly. Keep it
+ * that way — a stub here would stop testing the shipped dropdown. */
+function agentTrigger() {
+  return screen.getByRole('combobox', { name: 'Default agent' })
+}
+
+/** Open the agent popup and return its option labels in render order. */
+async function openAgents(): Promise<string[]> {
+  fireEvent.click(agentTrigger())
+  // findAllByRole, not findByRole: the latter throws on more than one match, and
+  // every case here has at least the inherit/None row plus an agent.
+  const opts = await screen.findAllByRole('option')
+  return opts.map(o => o.textContent ?? '')
+}
+
+/** Pick an agent by its visible label, then wait for the popup to unmount —
+ *  Radix marks the rest of the page inert while it is up, so a later click on
+ *  Submit would be swallowed. */
+async function pickAgent(label: string | RegExp) {
+  fireEvent.click(agentTrigger())
+  fireEvent.click(await screen.findByRole('option', { name: label }))
+  await waitFor(() => expect(screen.queryByRole('option')).toBeNull())
+}
+
 describe('FolderConfigModal', () => {
   beforeEach(() => vi.clearAllMocks())
 
   it('offers no parent-folder input — the destination is fixed by the entry point', () => {
     open({ parentId: '' })
-    // A <select> for the parent would let the user contradict where they clicked.
-    // The only select in the modal is the agent picker.
+    // A picker for the parent would let the user contradict where they clicked.
+    // The only dropdown in the modal is the agent picker.
     expect(screen.getAllByRole('combobox')).toHaveLength(1)
-    expect(screen.getByTestId('folder-config-agent')).toBeTruthy()
+    expect(agentTrigger()).toBeTruthy()
   })
 
   it('restates the destination as a read-only breadcrumb', () => {
@@ -78,71 +113,82 @@ describe('FolderConfigModal', () => {
     expect((screen.getByTestId('folder-config-submit') as HTMLButtonElement).disabled).toBe(true)
   })
 
-  it('submits an empty icon so the backend auto-generates one', () => {
+  it('submits with no color by default', () => {
     const { onSubmit } = open()
-    fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Auto' } })
+    fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Plain' } })
     fireEvent.click(screen.getByTestId('folder-config-submit'))
-    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ icon: '', regenerateIcon: false }))
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ color: '' }))
   })
 
-  it('picks an emoji from the grid', () => {
+  it('picks a color from the palette', () => {
     const { onSubmit } = open()
-    fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Rocket' } })
-    fireEvent.click(screen.getByTestId('folder-config-icon'))     // reveal the grid
-    fireEvent.click(screen.getByLabelText('Icon 🚀'))
+    fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Redteam' } })
+    // The palette is always visible — no trigger to click first.
+    fireEvent.click(screen.getByLabelText('Set color to Red'))
     fireEvent.click(screen.getByTestId('folder-config-submit'))
-    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ icon: '🚀' }))
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ color: '#ef4444' }))
   })
 
-  it('rejects a multi-emoji custom icon and does not adopt it', () => {
+  it('has no icon preview — a folder carries no icon, only a palette color', () => {
     open()
-    fireEvent.click(screen.getByTestId('folder-config-icon'))
-    const custom = screen.getByTestId('folder-config-icon-custom')
-    fireEvent.change(custom, { target: { value: '🚀🔥' } })
-    fireEvent.keyDown(custom, { key: 'Enter' })
-    expect(screen.getByText(/single emoji/i)).toBeTruthy()
+    // The emoji/icon system was removed; the palette swatch row is the only
+    // identity affordance, so a glyph preview would advertise a control that
+    // does not exist.
+    expect(screen.queryByTestId('folder-config-preview')).toBeNull()
+    expect(screen.getByTestId('folder-config-color-reset')).toBeTruthy()
   })
 
-  it('accepts a single custom emoji', () => {
-    const { onSubmit } = open()
-    fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Custom' } })
-    fireEvent.click(screen.getByTestId('folder-config-icon'))
-    const custom = screen.getByTestId('folder-config-icon-custom')
-    fireEvent.change(custom, { target: { value: '🦊' } })
-    fireEvent.keyDown(custom, { key: 'Enter' })
-    fireEvent.click(screen.getByTestId('folder-config-submit'))
-    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ icon: '🦊' }))
-  })
 
-  it('Enter in the custom-emoji field does not submit the whole form', () => {
-    const { onSubmit } = open()
-    fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Named' } })
-    fireEvent.click(screen.getByTestId('folder-config-icon'))
-    const custom = screen.getByTestId('folder-config-icon-custom')
-    fireEvent.change(custom, { target: { value: '🦊' } })
-    fireEvent.keyDown(custom, { key: 'Enter' })
-    expect(onSubmit).not.toHaveBeenCalled()
-  })
 
-  it('keeps an uninstalled agent selectable so Save cannot wipe it', () => {
+
+  it('keeps an uninstalled agent selectable so Save cannot wipe it', async () => {
     // Found by looking at the built UI: a folder set to an agent that is not in
-    // installedAgents had no matching <option>, so the select displayed "None"
+    // installedAgents had no matching option, so the picker displayed "None"
     // and Save wrote default_agent:'' — silently destroying the folder's config.
     // Happens in production whenever an agent is uninstalled or renamed.
     const f = folder('f1', { name: 'Payments', default_agent: 'retired-agent' })
     const { onSubmit } = open({ mode: 'edit', folder: f, folders: [f] })
-    const sel = screen.getByTestId('folder-config-agent') as HTMLSelectElement
-    expect(sel.value).toBe('retired-agent')
-    expect(screen.getByRole('option', { name: /retired-agent.*not installed/i })).toBeTruthy()
+    expect(agentTrigger()).toHaveTextContent(/retired-agent.*not installed/i)
+    // ...and it is a real row in the popup, flagged, so the user can see why it
+    // is not running. Ordered right after the inherit/None row, where its
+    // <option> used to sit.
+    expect(await openAgents()).toEqual(['None', 'retired-agent (not installed)', 'kirocrew', 'kirocrew-dev'])
+    // Escape dismisses the popup alone; the modal beneath must survive it.
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('option')).toBeNull())
     fireEvent.click(screen.getByTestId('folder-config-submit'))
     expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ defaultAgent: 'retired-agent' }))
   })
 
-  it('does not flag an installed agent as uninstalled', () => {
+  it('does not flag an installed agent as uninstalled', async () => {
     const f = folder('f1', { name: 'Payments', default_agent: 'kirocrew-dev' })
     open({ mode: 'edit', folder: f, folders: [f] })
-    expect((screen.getByTestId('folder-config-agent') as HTMLSelectElement).value).toBe('kirocrew-dev')
+    expect(agentTrigger()).toHaveTextContent('kirocrew-dev')
+    // Open the popup before the negative assertion: the rows only exist while
+    // it is up, so asserting the absence of the flag on a closed picker would
+    // pass vacuously.
+    expect(await openAgents()).toEqual(['None', 'kirocrew', 'kirocrew-dev'])
     expect(screen.queryByText(/not installed/i)).toBeNull()
+  })
+
+  it('clearing the agent back to inherit submits an empty string', async () => {
+    // SimpleSelect routes '' through an internal sentinel because Radix reserves
+    // '' for "no selection". '' is a real instruction here — it restores the
+    // fall-back to the global default — so it has to survive the round trip
+    // rather than arriving as the sentinel or as undefined.
+    const f = folder('f1', { name: 'Payments', default_agent: 'kirocrew-dev' })
+    const { onSubmit } = open({ mode: 'edit', folder: f, folders: [f], globalDefaultAgent: 'kirocrew' })
+    // With a global default the top row names it, so the user can see what
+    // "inherit" actually resolves to.
+    expect(await openAgents()).toEqual(['Inherit (kirocrew)', 'kirocrew', 'kirocrew-dev'])
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('option')).toBeNull())
+    await pickAgent('Inherit (kirocrew)')
+    expect(agentTrigger()).toHaveTextContent('Inherit (kirocrew)')
+    fireEvent.click(screen.getByTestId('folder-config-submit'))
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      defaultAgent: '', touched: ['defaultAgent'],
+    }))
   })
 
   it('labels the inherited directory as inherited, not as a value', () => {
@@ -160,8 +206,8 @@ describe('FolderConfigModal', () => {
     // GPT (blocking), Design and UX all converged on this: submit was
     // fire-and-forget, so a 400 from the backend closed the modal and threw the
     // whole draft away with no feedback. The backend rejects a free-typed
-    // project_dir (not absolute / not an existing directory / sensitive) and a
-    // multi-emoji icon, both of which this modal can now produce.
+    // project_dir (not absolute / not an existing directory / sensitive),
+    // which this modal can produce.
     const reject = () => vi.fn().mockRejectedValue(new Error('project_dir must be an existing directory'))
 
     it('stays open and keeps every field when the save is rejected', async () => {
@@ -230,7 +276,7 @@ describe('FolderConfigModal', () => {
 
     it('clears a previous error when the retry succeeds', async () => {
       const onSubmit = vi.fn()
-        .mockRejectedValueOnce(new Error('icon must be a single emoji'))
+        .mockRejectedValueOnce(new Error('project_dir must be an existing directory'))
         .mockResolvedValueOnce(undefined)
       render(
         <FolderConfigModal open={true} mode="create" parentId="" folders={[]}
@@ -284,27 +330,7 @@ describe('FolderConfigModal', () => {
         expect((screen.getByTestId('folder-config-name') as HTMLInputElement).value).toBe('Beta'))
     })
 
-    it('adopts a typed custom emoji on submit without needing Enter', async () => {
-      // UX: the field applied customEmoji only from its own Enter handler, so
-      // typing 🦄 then clicking Create shipped the auto icon with no feedback.
-      const { onSubmit } = open()
-      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Unicorn' } })
-      fireEvent.click(screen.getByTestId('folder-config-icon'))
-      fireEvent.change(screen.getByTestId('folder-config-icon-custom'), { target: { value: '🦄' } })
-      fireEvent.click(screen.getByTestId('folder-config-submit'))
-      await waitFor(() =>
-        expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ icon: '🦄' })))
-    })
 
-    it('blocks submit on an invalid typed emoji instead of dropping it', () => {
-      const { onSubmit } = open()
-      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Bad' } })
-      fireEvent.click(screen.getByTestId('folder-config-icon'))
-      fireEvent.change(screen.getByTestId('folder-config-icon-custom'), { target: { value: 'abc' } })
-      fireEvent.click(screen.getByTestId('folder-config-submit'))
-      expect(onSubmit).not.toHaveBeenCalled()
-      expect(screen.getByText(/single emoji/i)).toBeTruthy()
-    })
 
     it('ignores backdrop and Escape once the draft is dirty', () => {
       // UX: four fields of work behind a click-anywhere backdrop.
@@ -314,6 +340,15 @@ describe('FolderConfigModal', () => {
 
       onClose.mockClear()
       fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'Typed' } })
+      fireEvent.keyDown(window, { key: 'Escape' })
+      expect(onClose).not.toHaveBeenCalled()
+    })
+
+    it('a color-only pick also arms the dismiss guard', () => {
+      // Regression: the dirty check once omitted `color`, so a draft whose
+      // ONLY change was a swatch pick was silently discarded by Escape.
+      const { onClose } = open()
+      fireEvent.click(screen.getByLabelText('Set color to Red'))
       fireEvent.keyDown(window, { key: 'Escape' })
       expect(onClose).not.toHaveBeenCalled()
     })
@@ -332,61 +367,15 @@ describe('FolderConfigModal', () => {
     })
   })
 
-  describe('custom-emoji field never outranks a later choice', () => {
-    // GPT round-3 blocking, and a direct consequence of the round-2 fix: once
-    // submit() folds a non-empty customEmoji in, leaving it set makes a stale
-    // typed value beat whatever the user chose afterwards.
-    const openEmoji = () => {
-      const r = open()
-      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'N' } })
-      fireEvent.click(screen.getByTestId('folder-config-icon'))
-      fireEvent.change(screen.getByTestId('folder-config-icon-custom'), { target: { value: '🦄' } })
-      return r
-    }
-
-    it('a curated grid pick wins over an earlier typed emoji', async () => {
-      const { onSubmit } = openEmoji()
-      fireEvent.click(screen.getByLabelText('Icon 🚀'))
-      fireEvent.click(screen.getByTestId('folder-config-submit'))
-      await waitFor(() =>
-        expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ icon: '🚀' })))
-    })
-
-    it('Reset to auto is not undone by an earlier typed emoji', async () => {
-      const f = folder('f1', { name: 'P', icon: '🎯' })
-      const onSubmit = vi.fn().mockResolvedValue(undefined)
-      render(
-        <FolderConfigModal open={true} mode="edit" folder={f} folders={[f]}
-          installedAgents={AGENTS} onClose={vi.fn()} onSubmit={onSubmit} />
-      )
-      fireEvent.click(screen.getByTestId('folder-config-icon'))
-      fireEvent.change(screen.getByTestId('folder-config-icon-custom'), { target: { value: '🦄' } })
-      fireEvent.click(screen.getByTestId('folder-config-icon-reset'))
-      fireEvent.click(screen.getByTestId('folder-config-submit'))
-      await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(
-        expect.objectContaining({ icon: '', regenerateIcon: true })))
-    })
-
-    it('the typed emoji still wins when it is the last thing chosen', async () => {
-      const { onSubmit } = open()
-      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'N' } })
-      fireEvent.click(screen.getByTestId('folder-config-icon'))
-      fireEvent.click(screen.getByLabelText('Icon 🚀'))
-      fireEvent.change(screen.getByTestId('folder-config-icon-custom'), { target: { value: '🦄' } })
-      fireEvent.click(screen.getByTestId('folder-config-submit'))
-      await waitFor(() =>
-        expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ icon: '🦄' })))
-    })
-  })
 
   describe('reports only user-edited fields (touched)', () => {
-    // GPT round-4 blocking. Folder icons are generated asynchronously AFTER
-    // creation, so a settings modal opened before the icon lands holds icon:''
-    // while the cache gains the generated one. The caller used to diff the draft
-    // against LIVE CACHE, so a name-only save saw '' !== '🚀' and PATCHed
-    // icon:'' — deleting the generated icon. Only the modal knows the open-time
-    // seed, so it is the only place that can say what the *user* changed.
-    const seedFolder = folder('f1', { name: 'Payments', icon: '', project_dir: '/repo/pay' })
+    // The caller builds its PATCH from `touched` (measured against what the
+    // modal opened with), never from a diff against live cache — a field
+    // another client changed while the modal was open differs from the draft
+    // without the user having touched it, and re-sending the stale value
+    // would silently revert it. Only the modal knows the open-time seed, so
+    // it is the only place that can say what the *user* changed.
+    const seedFolder = folder('f1', { name: 'Payments', project_dir: '/repo/pay' })
 
     it('a name-only edit reports name alone', async () => {
       const onSubmit = vi.fn().mockResolvedValue(undefined)
@@ -399,9 +388,6 @@ describe('FolderConfigModal', () => {
       await waitFor(() => expect(onSubmit).toHaveBeenCalled())
       const draft = onSubmit.mock.calls[0][0]
       expect(draft.touched).toEqual(['name'])
-      // Critically: `icon` is absent, so the caller cannot clobber a
-      // background-generated one it never saw.
-      expect(draft.touched).not.toContain('icon')
     })
 
     it('reports nothing when the user opens and saves without editing', async () => {
@@ -422,7 +408,7 @@ describe('FolderConfigModal', () => {
           installedAgents={AGENTS} onClose={vi.fn()} onSubmit={onSubmit} />
       )
       fireEvent.change(screen.getByTestId('folder-config-project-dir'), { target: { value: '/repo/new' } })
-      fireEvent.change(screen.getByTestId('folder-config-agent'), { target: { value: 'kirocrew-dev' } })
+      await pickAgent('kirocrew-dev')
       fireEvent.click(screen.getByTestId('folder-config-submit'))
       await waitFor(() => expect(onSubmit).toHaveBeenCalled())
       const t = onSubmit.mock.calls[0][0].touched
@@ -431,15 +417,6 @@ describe('FolderConfigModal', () => {
       expect(t).not.toContain('name')
     })
 
-    it('counts a typed custom emoji as an icon edit', async () => {
-      const { onSubmit } = open()
-      fireEvent.change(screen.getByTestId('folder-config-name'), { target: { value: 'N' } })
-      fireEvent.click(screen.getByTestId('folder-config-icon'))
-      fireEvent.change(screen.getByTestId('folder-config-icon-custom'), { target: { value: '🦄' } })
-      fireEvent.click(screen.getByTestId('folder-config-submit'))
-      await waitFor(() => expect(onSubmit).toHaveBeenCalled())
-      expect(onSubmit.mock.calls[0][0].touched).toContain('icon')
-    })
   })
 
   it('associates every label with its control', () => {
@@ -448,7 +425,10 @@ describe('FolderConfigModal', () => {
     // the runtime truth instead of silencing the rule.
     open()
     expect(screen.getByLabelText(/^Name$/)).toBe(screen.getByTestId('folder-config-name'))
-    expect(screen.getByLabelText(/Default agent/)).toBe(screen.getByTestId('folder-config-agent'))
+    // The agent picker renders a <button>, so its name comes from an aria-label
+    // carrying the same "Default agent" key its visible heading uses — an
+    // external <label htmlFor> would dangle.
+    expect(screen.getByLabelText(/Default agent/)).toBe(agentTrigger())
   })
 
   it('does not submit while an IME composition is in flight', () => {
@@ -499,23 +479,24 @@ describe('FolderConfigModal', () => {
 
   describe('edit mode', () => {
     const existing = folder('f1', {
-      name: 'Payments', icon: '🚀', project_dir: '/repo/pay', default_agent: 'kirocrew-dev',
+      name: 'Payments', project_dir: '/repo/pay', default_agent: 'kirocrew-dev',
     })
 
     it('prefills every field from the folder', () => {
       open({ mode: 'edit', folder: existing, folders: [existing], parentId: undefined })
       expect((screen.getByTestId('folder-config-name') as HTMLInputElement).value).toBe('Payments')
       expect((screen.getByTestId('folder-config-project-dir') as HTMLInputElement).value).toBe('/repo/pay')
-      expect((screen.getByTestId('folder-config-agent') as HTMLSelectElement).value).toBe('kirocrew-dev')
+      expect(agentTrigger()).toHaveTextContent('kirocrew-dev')
     })
 
-    it('sends regenerateIcon instead of an icon when reset to auto', () => {
-      const { onSubmit } = open({ mode: 'edit', folder: existing, folders: [existing] })
-      fireEvent.click(screen.getByTestId('folder-config-icon'))
-      fireEvent.click(screen.getByTestId('folder-config-icon-reset'))
+    it('reset clears the color back to default', () => {
+      const withColor = { ...existing, color: '#3b82f6' }
+      const { onSubmit } = open({ mode: 'edit', folder: withColor, folders: [withColor] })
+      // "No color" is the leading swatch in the always-visible palette row.
+      fireEvent.click(screen.getByTestId('folder-config-color-reset'))
       fireEvent.click(screen.getByTestId('folder-config-submit'))
-      // Mutually exclusive server-side: sending both is a 400.
-      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ icon: '', regenerateIcon: true }))
+      // '' is a real instruction on the color pipe: PATCH color:'' clears it.
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ color: '', touched: expect.arrayContaining(['color']) }))
     })
 
     it('clearing the project dir submits an empty string, restoring inheritance', () => {

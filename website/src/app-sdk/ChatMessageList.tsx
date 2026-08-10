@@ -8,7 +8,7 @@
  * ChatEmbed wraps this in a simple scrollable div.
  */
 import React, { useMemo, useCallback, memo } from 'react'
-import { Clock, LoaderCircle, CircleSlash, CircleDot, Lock, PanelRight } from 'lucide-react'
+import { Clock, LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight } from 'lucide-react'
 import { i18nT } from '../i18n/t'
 import { extractToolFilePath } from '../utils/toolFilePath'
 import { isSafePath } from '../utils/safePath'
@@ -17,13 +17,15 @@ import UserMessage from '../pages/chat/UserMessage'
 import CollapsibleToolGroup from '../pages/chat/CollapsibleToolGroup'
 import TurnBlock from '../pages/chat/TurnBlock'
 import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
+import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
+import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
 import PastedChip from '../components/PastedChip'
 import { type PasteBlock, findTokenRanges, recollapsePastes } from '../utils/pasteTokens'
 import type { ChatMessage } from '../types'
 import type { TurnItem, DisplayItem } from '../pages/chat/types'
-import { fmtDateFields } from '../i18n/format'
+import { fmtMessageTime, fmtMessageTimeFull } from '../pages/chat/messageTime'
 
 // ── Types ──
 
@@ -32,7 +34,7 @@ export interface ChatMessageListProps {
   running: boolean
   contentWidth?: string
   onApprove?: (approvalId: string, decision: string) => void
-  onFileOpen?: (path: string) => void
+  onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
   /** Optional host-injected renderer for tool messages (role 'tool'/'tool_call'/
    *  'tool_result'). Lets a Redux-connected host (e.g. the dashboard's split-view
    *  ChatPane) render the full slot-aware ToolCallLine while this component stays
@@ -82,9 +84,15 @@ function renderUserContent(content: string, meta: Record<string, unknown> | unde
 
 const GROUPABLE = new Set(['thinking', 'permission'])
 
+/**
+ * Delegates to the shared footer formatter so an embedded app's transcript reads
+ * IDENTICALLY to the main chat's. This was a second, hardcoded copy that never
+ * printed a year at all — so an app showing a message from a previous year dated
+ * it to the current one. `fmtMessageTime` elides the year only when it is safe.
+ */
 function formatTs(ts?: string): string | undefined {
   if (!ts) return undefined
-  return fmtDateFields(ts, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  return fmtMessageTime(ts) || undefined
 }
 
 function msgKey(m: ChatMessage, i: number): string {
@@ -93,7 +101,7 @@ function msgKey(m: ChatMessage, i: number): string {
 
 // ── ToolCallPill (prop-driven, no Redux) ──
 
-const ToolCallPill = memo(function ToolCallPill({ message, running, onFileOpen }: { message: ChatMessage; running: boolean; onFileOpen?: (path: string) => void }) {
+const ToolCallPill = memo(function ToolCallPill({ message, running, onFileOpen, autoDenied }: { message: ChatMessage; running: boolean; onFileOpen?: (path: string) => void; autoDenied?: boolean }) {
   const [expanded, setExpanded] = React.useState(false)
   const isDone = message.role === 'tool_result'
   const isRejected = message.meta?.resolved === 'rejected'
@@ -109,22 +117,31 @@ const ToolCallPill = memo(function ToolCallPill({ message, running, onFileOpen }
 
   // Status icon + colour mirror ToolCallLine so an embedded transcript reads
   // with the same visual grammar as a main session: spinner while running,
-  // green dot when done, red slash when rejected, amber lock when awaiting
-  // approval. Previously EVERY state showed one accent-purple spinning wrench,
-  // so a finished call was indistinguishable from an in-flight one.
-  const Icon = isDone ? (isRejected ? CircleSlash : CircleDot) : hasPendingPerm ? Lock : LoaderCircle
+  // green dot when done, amber alert for auto-denied (policy/hook block —
+  // detected by the HOST from the hidden 🚫 sibling message and passed in,
+  // since this pill only ever renders the visible 🔧 message), red slash when
+  // user-rejected, amber lock when awaiting approval. Previously EVERY state
+  // showed one accent-purple spinning wrench, so a finished call was
+  // indistinguishable from an in-flight one.
+  const isAutoDenied = !isRejected && !!autoDenied
+  // Auto-denied is TERMINAL even though the 🔧 message never becomes a
+  // tool_result (isDone) — the gate blocked the call, nothing further runs —
+  // so it must escape both the loader icon and the spin animation.
+  const Icon = isRejected ? CircleSlash : isAutoDenied ? CircleAlert : isDone ? CircleDot : hasPendingPerm ? Lock : LoaderCircle
   const tone = isRejected
     ? 'text-danger bg-danger-subtle'
-    : isDone
-      ? 'text-ok bg-ok/5'
-      : hasPendingPerm
-        ? 'text-warn bg-warn-subtle'
-        : 'text-accent bg-accent/5'
+    : isAutoDenied
+      ? 'text-warn bg-warn-subtle'
+      : isDone
+        ? 'text-ok bg-ok/5'
+        : hasPendingPerm
+          ? 'text-warn bg-warn-subtle'
+          : 'text-accent bg-accent/5'
   // Animate ONLY while the session is actually running. A tool call left
   // un-terminated by a dropped turn used to spin forever, so an idle transcript
   // still looked busy — the loading state has to reflect the session, not just
   // the message role.
-  const iconClass = !isDone && !hasPendingPerm && !isRejected && running ? 'animate-spin' : ''
+  const iconClass = !isDone && !hasPendingPerm && !isRejected && !isAutoDenied && running ? 'animate-spin' : ''
 
   // File affordance: same pure helpers the main chat uses (no store needed).
   const filePath = React.useMemo(() => {
@@ -181,6 +198,9 @@ const ChatMessageList = memo(function ChatMessageList({
     let groupStart = 0
 
     for (let i = 0; i < messages.length; i++) {
+      // A sub-agent completion the card cannot parse stays internal — the model
+      // sees it, the reader does not.
+      if (messages[i].role === 'subagent' && !isSubagentCompletionMessage(messages[i])) continue
       if (GROUPABLE.has(messages[i].role)) {
         if (!group.length) groupStart = i
         group.push(messages[i])
@@ -212,7 +232,9 @@ const ChatMessageList = memo(function ChatMessageList({
     }
 
     for (const item of raw) {
-      if (item.kind === 'single' && item.msg.role === 'user') {
+      // A sub-agent completion is the next turn's input, so it opens a turn the
+      // same way a user message does — the agent's reply belongs below the card.
+      if (item.kind === 'single' && (item.msg.role === 'user' || item.msg.role === 'subagent')) {
         flushTurn(true)
         turns.push(item)
       } else {
@@ -223,6 +245,21 @@ const ChatMessageList = memo(function ChatMessageList({
 
     return turns
   }, [messages, running])
+
+  // tool_call_ids whose call was blocked by a security-policy deny rule or
+  // hook. The gateway appends a hidden "🚫 …" tool message sharing the visible
+  // 🔧 pill's tool_call_id; the pill itself never sees it (only 🔧 messages
+  // render), so the host computes the set once and passes a flag down. A
+  // user-rejected call also has a 🚫 sibling but carries meta.resolved =
+  // 'rejected' on its permission/pill state, which the pill checks first.
+  const autoDeniedIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const m of messages) {
+      const tcid = m.meta?.tool_call_id as string | undefined
+      if (m.role === 'tool' && tcid && m.content?.startsWith('🚫')) ids.add(tcid)
+    }
+    return ids
+  }, [messages])
 
   // Render a single message by role
   const renderMessage = useCallback((m: ChatMessage, i: number) => {
@@ -247,9 +284,20 @@ const ChatMessageList = memo(function ChatMessageList({
       )
     }
 
+    if (isSubagentCompletionMessage(m)) {
+      return (
+        <SubagentCompletionCard
+          key={key}
+          message={m}
+          onFileOpen={onFileOpen}
+          disclosureKey={key}
+        />
+      )
+    }
+
     if (m.role === 'user') {
       return wrapper(
-        <UserMessage content={m.content} meta={m.meta} timestamp={formatTs(m.ts)} renderContent={renderUserContent} />,
+        <UserMessage content={m.content} meta={m.meta} timestamp={formatTs(m.ts)} timestampTitle={fmtMessageTimeFull(m.ts)} renderContent={renderUserContent} />,
         true
       )
     }
@@ -271,6 +319,7 @@ const ChatMessageList = memo(function ChatMessageList({
             content={m.content}
             isStreaming={isStreaming}
             timestamp={formatTs(m.ts)}
+            timestampTitle={fmtMessageTimeFull(m.ts)}
             showFooter={showFooter}
             slotRunning={running}
             onFileOpen={onFileOpen}
@@ -283,9 +332,10 @@ const ChatMessageList = memo(function ChatMessageList({
     }
 
     if (m.role === 'tool' && m.content?.startsWith('🔧')) {
+      const tcid = m.meta?.tool_call_id as string | undefined
       return (
         <div key={key} className="px-5 mx-auto w-full py-0.5" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
-          {renderTool ? renderTool(m) : <ToolCallPill message={m} running={running} onFileOpen={onFileOpen} />}
+          {renderTool ? renderTool(m) : <ToolCallPill message={m} running={running} onFileOpen={onFileOpen} autoDenied={!!tcid && autoDeniedIds.has(tcid)} />}
         </div>
       )
     }
@@ -347,7 +397,7 @@ const ChatMessageList = memo(function ChatMessageList({
     }
 
     return null
-  }, [messages, running, contentWidth, onFileOpen, renderTool])
+  }, [messages, running, contentWidth, onFileOpen, renderTool, autoDeniedIds])
 
   // Render a TurnItem (single or group)
   const renderItem = useCallback((item: TurnItem, _i: number) => {

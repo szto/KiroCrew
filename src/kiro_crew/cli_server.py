@@ -19,6 +19,7 @@ import urllib.request
 from pathlib import Path
 
 from kiro_crew import __version__, platform_compat
+from kiro_crew.beacon import is_default_home
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     _DEFAULT_PORT,
@@ -47,6 +48,7 @@ from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import HookManager, hooks_config_from_config_dict
 from kiro_crew.instances import run_marker
 from kiro_crew.learn import LessonStore
+from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.memory import MemoryStore
 from kiro_crew.preflight import run_preflight_checks
 from kiro_crew.sel import sel
@@ -55,6 +57,7 @@ from kiro_crew.service import linux as svc_linux
 from kiro_crew.service import macos as svc_macos
 from kiro_crew.service.common import SERVICE_NAME, Platform, current_platform
 from kiro_crew.session import SessionManager
+from kiro_crew.skill_usage import register_skill_read_observer
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.slack.gateway import run_gateway
 from kiro_crew.taskrunner import TaskRunner
@@ -270,7 +273,7 @@ def _probe_dashboard_health(port: int) -> None:
     """
     try:
         req = urllib.request.Request(f"http://{_CLI_LOOPBACK}:{port}/", method="GET")
-        with urllib.request.urlopen(req, timeout=2) as resp:  # nosemgrep
+        with loopback_urlopen(req, timeout=2) as resp:  # nosemgrep
             body = resp.read(8192).decode("utf-8", errors="replace")
             if DASHBOARD_HTML_NOT_FOUND_MARKER.lower() in body.lower():
                 print(
@@ -318,7 +321,7 @@ def _token(args: argparse.Namespace) -> None:
         url += f"&embed_parent_port={int(epp)}"
     req = urllib.request.Request(url, headers={"X-Local-Secret": secret})
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with loopback_urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
             token = data.get("token", "")
     except Exception as exc:
@@ -362,7 +365,7 @@ def _logout(port: int) -> None:
         data=b"{}",
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with loopback_urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
             if data.get("ok"):
                 print("✅ All dashboard sessions revoked.")
@@ -413,17 +416,32 @@ def _stop(cli_port: int | None = None) -> None:
         # would then double-spawn).
         if not platform_compat.listening_pid_tool_available():
             _tool = platform_compat.listening_pid_tool()
+            # A host that keeps its binaries outside the system directories
+            # (NixOS, a Homebrew or conda prefix) has the tool and still lands
+            # here, because the lookup is pinned to those directories. Telling
+            # that operator to install what they already have sends them in
+            # circles, so name where it actually is instead.
+            _unpinned = platform_compat.tool_outside_trusted_dirs(_tool)
+            _reason = f"{_tool}_outside_trusted_dirs" if _unpinned else f"{_tool}_not_found"
             sel().log_api_access(
                 caller="cli",
                 operation="gateway_stop",
                 outcome="no_target",
                 source="cli",
-                resources=f"port={port} reason={_tool}_not_found",
+                resources=f"port={port} reason={_reason}",
             )
-            print(
-                f"`{_tool}` not found — cannot look up the gateway process on "
-                f"port {port}. Install {_tool} and retry."
-            )
+            if _unpinned:
+                print(
+                    f"`{_tool}` is installed at {_unpinned}, outside the system directories "
+                    f"Kiro Crew resolves it from, so it cannot look up the gateway process "
+                    f"on port {port}. Falling back to PATH is deliberately refused: a "
+                    f"gateway's PATH can lead with writable directories."
+                )
+            else:
+                print(
+                    f"`{_tool}` not found — cannot look up the gateway process on "
+                    f"port {port}. Install {_tool} and retry."
+                )
             sys.exit(1)
         sel().log_api_access(
             caller="cli",
@@ -866,7 +884,7 @@ def _probe_gateway_ready(port: int, timeout: int = 3) -> int:
         # Loopback-only probe to our own gateway on 127.0.0.1; the URL is
         # internally derived (never attacker-supplied), so the dynamic-URL SSRF
         # audit rule is a false positive here.
-        with urllib.request.urlopen(url, timeout=timeout) as resp:  # nosemgrep
+        with loopback_urlopen(url, timeout=timeout) as resp:  # nosemgrep
             return int(resp.status)
     except urllib.error.HTTPError as e:
         return int(e.code)
@@ -973,7 +991,7 @@ def _print_token_url(port: int) -> None:
             secret = secret_path.read_text().strip()
             url = f"http://{_CLI_LOOPBACK}:{port}/api/token/local?ttl={_RESTART_TOKEN_TTL}"
             req = urllib.request.Request(url, headers={"X-Local-Secret": secret})
-            with urllib.request.urlopen(req, timeout=3) as resp:
+            with loopback_urlopen(req, timeout=3) as resp:
                 data = json.loads(resp.read())
                 token = data.get("token", "")
             if token:
@@ -1141,19 +1159,53 @@ def _restart(cli_port: int | None = None) -> None:
 
 
 def _update() -> None:
-    """Update KiroCrew via git fetch + reset --hard + rebuild."""
+    """Update Kiro Crew — dispatches based on install layout.
+
+    Three install layouts, three update paths:
+
+    * **git checkout** — fetch + reset --hard + rebuild (existing path).
+    * **wheel / cli.sh** — fetch the release feed, compare versions, and
+      re-run the installer if newer. This is the path that was missing and
+      caused the ``KIROCREW_PROJECT_DIR not set`` error for cli.sh installs.
+    * **externally managed** (desktop app, Docker) — print guidance on how
+      to update via the correct surface instead of failing with an opaque error.
+    """
+    from kiro_crew.platform.update_layout import (
+        EXTERNALLY_MANAGED,
+        InstallLayout,
+    )
+
     print("👻 Updating Kiro Crew…\n")
 
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-    if not proj:
-        print("❌ KIROCREW_PROJECT_DIR not set — cannot locate source tree")
-        print("   Run from the project directory or run `kirocrew setup` first.")
-        sys.exit(1)
+    proj_path = Path(proj) if proj else None
+    is_git = proj_path is not None and (proj_path / ".git").exists()
 
-    proj_path = Path(proj)
+    if not is_git:
+        # Not a git checkout — check if externally managed or wheel install.
+        from kiro_crew.beacon import distribution
+
+        dist = distribution()
+        if dist in EXTERNALLY_MANAGED:
+            print(f"  ℹ️  This install ({dist}) is managed externally.")
+            print(f"  {EXTERNALLY_MANAGED[dist]}")
+            return
+
+        # Wheel / cli.sh install path.
+        layout = InstallLayout(
+            kind=dist or "wheel",
+            proj=proj,
+            is_git=False,
+            is_externally_managed=False,
+            guidance="",
+        )
+        _update_wheel(layout)
+        return
+
     # A git worktree or submodule stores ``.git`` as a FILE (a ``gitdir:``
     # pointer), not a directory, so accept both — otherwise `kirocrew update`
     # run from a worktree wrongly refuses with "No git repo".
+    assert proj_path is not None  # narrowing: is_git=True implies proj_path was set
     if not (proj_path / ".git").exists():
         print(f"❌ No git repo at {proj}")
         sys.exit(1)
@@ -1285,12 +1337,145 @@ def _update() -> None:
         print("  ⚠️  Agent config refresh failed — run: kirocrew setup --agent-only")
 
 
+def _update_wheel(layout) -> None:
+    """Update a wheel/cli.sh install by checking the release feed and re-running the installer.
+
+    This is the path taken when KIROCREW_PROJECT_DIR is unset or has no .git —
+    the standard state for ``curl | sh`` installs where the venv at
+    ``~/.kiro/crew-venv`` has no source tree.
+    """
+    import json
+    import re
+    import urllib.request
+
+    from kiro_crew import __version__ as local_version
+    from kiro_crew.platform.update_governance import update_blocked_reason
+    from kiro_crew.platform.update_layout import cdn_bases, release_channel, wheel_update_command
+
+    channel = release_channel()
+    feed_base, artifact_base = cdn_bases()
+    feed_url = f"{feed_base}/feed/{channel}/latest-cli.json"
+
+    # Source-pin governance check: same seam the git path uses, applied to the
+    # feed URL so a pinned fleet's wheel installs cannot bypass the ceiling.
+    blocked = update_blocked_reason(feed_base)
+    if not blocked:
+        blocked = update_blocked_reason(artifact_base)
+    if blocked:
+        print(f"  🛡️  Update blocked by security policy: {blocked}")
+        sys.exit(1)
+
+    # Shell safety: cdn_bases() reads KIROCREW_CDN_BASE which is operator-set.
+    # Reject metacharacters that could enable command injection when the URL
+    # flows through wheel_update_command() into ``sh -c``.
+    _SAFE_URL_RE = re.compile(r"^https://[A-Za-z0-9._/:%@~+\-]+$")
+    if not _SAFE_URL_RE.match(feed_base) or not _SAFE_URL_RE.match(artifact_base):
+        print("  ❌ CDN base URL contains disallowed characters")
+        sys.exit(1)
+
+    print(f"  📦 Install type: {layout.kind} (channel: {channel})")
+    print(f"  📡 Checking {feed_url}…")
+
+    # Fetch the release feed (scheme-validated to satisfy SAST — cdn_bases()
+    # already enforces https but Semgrep cannot see through the indirection).
+    if not feed_url.startswith("https://"):
+        print(f"  ❌ Refusing non-HTTPS feed URL: {feed_url}")
+        sys.exit(1)
+    try:
+        req = urllib.request.Request(feed_url, headers={"User-Agent": "kirocrew-update/1"})
+        with urllib.request.urlopen(req, timeout=15) as resp:  # nosemgrep: dynamic-urllib-use-detected
+            raw = resp.read(65536 + 1)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"  ❌ Could not reach release feed: {e}")
+        print("\n  To update manually, run:")
+        print(f"    {wheel_update_command(channel)}")
+        sys.exit(1)
+
+    if len(raw) > 65536:
+        print("  ❌ Release feed response too large — may be corrupted")
+        sys.exit(1)
+
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        print("  ❌ Release feed is not valid JSON")
+        sys.exit(1)
+
+    if not isinstance(manifest, dict):
+        print("  ❌ Release feed has unexpected format")
+        sys.exit(1)
+
+    if manifest.get("schema") != "kirocrew-cli-artifact-manifest-v1":
+        print("  ❌ Release feed schema mismatch — update the installer first")
+        print(f"    {wheel_update_command(channel)}")
+        sys.exit(1)
+
+    if manifest.get("channel") != channel:
+        print(f"  ❌ Feed channel mismatch (expected {channel}, got {manifest.get('channel')})")
+        sys.exit(1)
+
+    remote_version = manifest.get("version", "")
+    if not remote_version:
+        print("  ❌ No version in release feed")
+        sys.exit(1)
+
+    print(f"  📋 Current: {local_version}")
+    print(f"  📋 Latest:  {remote_version}")
+
+    # Compare versions using the same logic as the dashboard
+    from kiro_crew.dashboard.handlers.updates import _is_newer
+
+    newer = _is_newer(remote_version, local_version)
+    if newer is None:
+        print("  ⚠️  Could not compare versions — updating anyway to be safe")
+    elif not newer:
+        print("\n✅ Already on the latest version!")
+        return
+
+    # Run the installer
+    cmd = wheel_update_command(channel)
+    print("\n  🔄 Running installer…")
+    print(f"     {cmd}\n")
+
+    # Platform guard: cli.sh is a POSIX shell script; on Windows there is no sh.
+    if sys.platform == "win32":
+        print("  ❌ Wheel self-update is not supported on Windows.")
+        print("  To update manually, run in PowerShell:")
+        print(f"    {cmd}")
+        sys.exit(1)
+
+    try:
+        result = subprocess.run(
+            ["sh", "-c", cmd],
+            timeout=300,
+        )
+    except FileNotFoundError:
+        print("  ❌ 'sh' not found — cannot run the installer.")
+        print("  To update manually, run:")
+        print(f"    {cmd}")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("\n  ❌ Installer timed out (5 min)")
+        print("  Try running manually:")
+        print(f"    {cmd}")
+        sys.exit(1)
+    if result.returncode != 0:
+        print(f"\n  ❌ Installer exited with code {result.returncode}")
+        print("  Try running manually:")
+        print(f"    {cmd}")
+        sys.exit(1)
+
+    print(f"\n✅ Kiro Crew updated to {remote_version}!")
+    print("\n  Restart the gateway to use the new version:")
+    print("    kirocrew restart")
+
+
 def _status(args: argparse.Namespace) -> None:
     """Query the running gateway for stats, or print offline message."""
     port = resolve_client_port(getattr(args, "port", None))
     url = f"http://127.0.0.1:{port}/api/status"
     try:
-        with urllib.request.urlopen(url, timeout=3) as resp:
+        with loopback_urlopen(url, timeout=3) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
@@ -1315,6 +1500,31 @@ def _status(args: argparse.Namespace) -> None:
     print(f"  Subagents:   {data.get('subagents', 0)}")
     print(f"  Cron jobs:   {data.get('crons', 0)}")
     print(f"  Lessons:     {data.get('lessons', 0)}")
+
+
+def _should_reconcile_launchd_launcher() -> bool:
+    """Whether this gateway may repair the shared launchd launcher.
+
+    Only a non-frozen production instance may.
+
+    ``LIVE_PROGRAM`` is a per-user path under Application Support that
+    ``KIROCREW_HOME`` does not scope, so a dev, pod, or worktree gateway
+    repairing it would repoint the user's REAL agent at its own venv —
+    recreating the serving-vs-managed mismatch the reconcile exists to prevent,
+    and doing it without the operator ever acting on the production instance.
+    ``is_default_home`` is reused rather than re-derived so the two cannot drift
+    on what counts as the real home.
+
+    A frozen build is excluded for a different reason: the launchd agent is a
+    ``service install`` artifact belonging to a source or pip install, while a
+    packaged app manages its own backend lifecycle and supplies environment its
+    interpreter needs — notably ``PYTHONPYCACHEPREFIX``, which keeps bytecode out
+    of the signed bundle. A launcher naming the bundled executable would be run by
+    launchd WITHOUT that environment, so the interpreter would write
+    ``__pycache__`` inside the app and invalidate its signature. The packaged app
+    has no business owning this artifact at all.
+    """
+    return sys.platform == "darwin" and not getattr(sys, "frozen", False) and is_default_home()
 
 
 async def _gateway(
@@ -1356,6 +1566,19 @@ async def _gateway(
             "Run `npm ci && npm run build` in the website/ directory to build "
             "the full dashboard."
         )
+
+    # Reconcile the other derived artifact that lives outside the install: the
+    # launchd agent's launcher script. It sits under Application Support, so a
+    # "reset the app" gesture that clears that directory leaves the agent loaded
+    # with nothing to execute and no in-product way back. Self-healing here
+    # rather than in the service installer keeps a hand-customized plist intact.
+    if _should_reconcile_launchd_launcher():
+        try:
+            svc_macos.ensure_live_program()
+        except OSError as exc:
+            logging.getLogger(__name__).warning(
+                "Could not restore the launchd live-gateway launcher: %s", exc
+            )
 
     if not config_path().exists():
         cfg = KiroCrewConfig()
@@ -1467,7 +1690,7 @@ async def _run_task(args: argparse.Namespace) -> None:
     ctx = ContextBuilder(
         memory=memory, skills=skills, hooks=hooks, lessons=lessons, bot_name=cfg.agent.bot_name
     )
-
+    register_skill_read_observer(ctx)
     runner = TaskRunner(
         sessions=sessions,
         context_builder=ctx,
@@ -1545,6 +1768,49 @@ def _service_cmd(args: argparse.Namespace) -> int:
         )
         return rc
     print("Usage: kirocrew service {install|uninstall|status}", file=sys.stderr)
+    return 2
+
+
+def _sandbox_cmd(args: argparse.Namespace) -> int:
+    """Dispatch ``kirocrew sandbox {install-profile,remove-profile,status}``.
+
+    Mirrors :func:`_service_cmd`: platform detection and the privileged calls
+    live in :mod:`kiro_crew.service.controller`, and this layer only parses
+    arguments, writes the audit record, and returns an exit code.
+
+    Installing an AppArmor profile is a privileged, security-relevant change to
+    the host, so it is audited exactly like a service install.
+    """
+    action = getattr(args, "sandbox_action", None)
+    path = getattr(args, "path", None)
+    if action == "install-profile":
+        rc = service_controller.install_launcher_profile(path)
+        sel().log_api_access(
+            caller="cli",
+            operation="sandbox_profile_install",
+            outcome="allowed" if rc == 0 else "error",
+            source="cli",
+            resources=f"rc={rc} path={path or '$APPIMAGE'}",
+        )
+        return rc
+    if action == "remove-profile":
+        rc = service_controller.remove_launcher_profile()
+        sel().log_api_access(
+            caller="cli",
+            operation="sandbox_profile_remove",
+            outcome="allowed" if rc == 0 else "error",
+            source="cli",
+            resources=f"rc={rc}",
+        )
+        return rc
+    if action == "status":
+        # Read-only, so no audit record — it changes nothing and is expected to
+        # be polled by the desktop app on every launch.
+        return service_controller.sandbox_profile_status(path)
+    print(
+        "Usage: kirocrew sandbox {install-profile|remove-profile|status}",
+        file=sys.stderr,
+    )
     return 2
 
 

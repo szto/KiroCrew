@@ -6,19 +6,27 @@ import type { SettingEntry } from './settingsTypes'
 export const SETTINGS_REGISTRY: SettingEntry[] = 
 [
   {
-    "id": "browser.chrome-extension-mode",
-    "label": "Chrome Extension Mode",
-    "description": "Attach to your running Chrome with all existing logins and sessions. Recommended for macOS.",
+    "id": "browser.attach-to-my-running-browser",
+    "label": "Attach to my running browser",
+    "description": "Use my running Chromium browser (Chrome, Edge, Brave, Arc, Opera) with its existing logins and sessions. Recommended for macOS.",
     "tab": "browser",
     "type": "toggle",
     "occurrence": 1
   },
   {
-    "id": "browser.connection-token",
-    "label": "Connection Token",
+    "id": "browser.connection-token-optional",
+    "label": "Connection Token (optional)",
     "description": "Paste PLAYWRIGHT_MCP_EXTENSION_TOKEN value from the extension popup",
     "tab": "browser",
     "type": "input",
+    "occurrence": 1
+  },
+  {
+    "id": "browser.enable-browser-mode",
+    "label": "Enable Browser Mode",
+    "description": "Let the agent read and operate web pages: click, type, and navigate, not just read. Enabling this downloads the browser tools.",
+    "tab": "browser",
+    "type": "toggle",
     "occurrence": 1
   },
   {
@@ -66,9 +74,54 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "chat.auto-add-documents",
+    "label": "Auto-Add Documents",
+    "description": "Let the agent add documents it reads while working to your knowledge library, so they stay searchable later. It reads them with its own tools under your approval — Kiro Crew fetches nothing itself. Added documents appear in one “Auto-added” source you can remove in a click.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.auto-add-saved-artifacts",
+    "label": "Auto-Add Saved Artifacts",
+    "description": "Mirror documents you save as artifacts into the library, keep them in sync as you edit, and remove them when you delete the artifact.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.auto-compact-threshold",
     "label": "Auto-Compact Threshold",
     "description": "Context usage % at which auto-compaction triggers. Lower = more frequent compaction, longer sessions",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.auto-ingest-limit-per-scan",
+    "label": "Auto-Ingest Limit Per Scan",
+    "tab": "chat",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.auto-register-project-documents",
+    "label": "Auto-Register Project Documents",
+    "description": "Register the documents of each project you work in, so its design docs, specs and READMEs become searchable without adding the folder by hand. Documents only — never source code, agent instructions or generated files.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.background-effort",
+    "label": "Background Effort",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.background-model",
+    "label": "Background Model",
     "tab": "chat",
     "type": "select",
     "occurrence": 1
@@ -86,14 +139,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Which part of a subagent's stream to keep when injecting its completion event into the parent session. Head preserves the start (default, matches legacy behavior). Tail preserves the final summary. Both keeps a slice from each end with a marker between them.",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
-  },
-  {
-    "id": "chat.concise-responses",
-    "label": "Concise Responses",
-    "description": "Trim filler and over-narration: lead with the answer, keep progress notes high-level. Code, commands, and error strings stay verbatim; security warnings and multi-step instructions keep full detail.",
-    "tab": "chat",
-    "type": "toggle",
     "occurrence": 1
   },
   {
@@ -160,6 +205,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.folder-suggestions",
+    "label": "Folder suggestions",
+    "description": "Offer to file a new session into a matching folder once it has a title.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.follow-up-bar-layout",
     "label": "Follow-Up Bar Layout",
     "description": "Multiline wraps suggestions onto multiple rows. Single line keeps them on one horizontally-scrollable row.",
@@ -208,10 +261,34 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.prevent-sleep-while-running",
+    "label": "Prevent sleep while running",
+    "description": "Keep your computer awake while a task is running",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.provider",
+    "label": "Provider",
+    "description": "Which backend new sessions run on.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
     "id": "chat.quick-send",
     "label": "Quick Send",
     "tab": "chat",
     "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.response-verbosity",
+    "label": "Response Verbosity",
+    "description": "How terse the agent's prose is. Ultra-concise writes for an ADHD reader: the answer lands in an opening of at most three sentences, and any detail after it must be scannable bullets rather than prose. Code, commands, and error strings stay verbatim; security warnings and multi-step instructions keep full detail at every level.",
+    "tab": "chat",
+    "type": "select",
     "occurrence": 1
   },
   {
@@ -281,6 +358,20 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Split View (Session Grid)",
     "tab": "chat",
     "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.subagent-effort",
+    "label": "Subagent Effort",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.subagent-model",
+    "label": "Subagent Model",
+    "tab": "chat",
+    "type": "select",
     "occurrence": 1
   },
   {
@@ -380,11 +471,27 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "display.font",
+    "label": "Font",
+    "description": "Font for the built-in terminal. Enter a monospace font installed on your computer — use a Nerd Font to render Powerline and prompt-theme glyphs.",
+    "tab": "display",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
     "id": "display.font-family",
     "label": "Font Family",
     "description": "UI font family for the dashboard",
     "tab": "display",
     "type": "buttonGroup",
+    "occurrence": 1
+  },
+  {
+    "id": "display.font-size",
+    "label": "Font size",
+    "description": "Text size in the built-in terminal, measured in pixels.",
+    "tab": "display",
+    "type": "stepper",
     "occurrence": 1
   },
   {
@@ -458,6 +565,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "security.trust-every-third-party-app",
+    "label": "Trust every third-party app",
+    "description": "Off by default. When on, every third-party app you install can run its own code straight away, without asking you first.",
+    "tab": "security",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "skills.auto-generate-skills-from-sessions",
     "label": "Auto-generate skills from sessions",
     "description": "Analyze each completed session and draft a reusable SKILL.md when a non-trivial multi-step procedure is detected. Off by default. Drafts are staged to the pending queue on the Skills tab for review — nothing goes live without your approval (see below).",
@@ -484,7 +599,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   {
     "id": "voice.auto-submit-when-i-finish-speaking",
     "label": "Auto-submit when I finish speaking",
-    "description": "Use a fast model to detect when you've finished a complete request and send it automatically. Streaming (Transcribe) only.",
+    "description": "Use a fast model to detect when you've finished a complete request and send it automatically. Streaming providers only.",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1
@@ -594,7 +709,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   {
     "id": "voice.provider",
     "label": "Provider",
-    "description": "Whisper and MLX run locally; Transcribe calls AWS",
+    "description": "Whisper, MLX and Apple Speech run locally; Transcribe calls AWS",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
@@ -626,7 +741,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   {
     "id": "voice.streaming",
     "label": "Streaming",
-    "description": "Stream live partial transcripts into the input box as you speak (Transcribe only)",
+    "description": "Stream live partial transcripts into the input box as you speak. Supported by Transcribe (AWS) and Apple Speech (on-device).",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1

@@ -7,8 +7,31 @@ export interface StatusData {
   subagents: number
   lessons: number
   update_available?: boolean
+  /**
+   * Can this install replace its own code? Only a git checkout can — a wheel
+   * install (the `cli.sh` managed venv) upgrades by re-running the installer, so
+   * `POST /api/update` would 409. Shipped with the availability flag so the UI
+   * can pick the right affordance without first running a check.
+   */
+  update_self_updatable?: boolean
+  /** Did a check ever reach a verdict? Distinguishes "current" from "never checked". */
+  update_checked?: boolean
+  /** Upgrade command for an install that cannot replace itself ("" when it can). */
+  update_command?: string
   update_progress?: { step: string; detail: string } | null
   version?: string
+  /**
+   * Which release lane these bytes came from. The gateway resolves it (see
+   * `src/kiro_crew/release_channel.py`) rather than leaving the dashboard to
+   * parse `version`: the same release is stamped as SemVer for the desktop app
+   * and PEP 440 for wheels, and neither PEP 440 prerelease spelling
+   * (`1.2.3rc4`, `1.2.3.dev<stamp>`) contains a `-`, so a mirror of the rule
+   * here would drift and quietly call a prerelease build stable.
+   *
+   * Optional because an older gateway does not send it — treat a missing value
+   * as "unknown", never as "stable".
+   */
+  release_channel?: 'nightly' | 'insider' | 'stable'
   branch?: string
   commit?: string
   platform?: string
@@ -45,6 +68,48 @@ export interface SystemData {
   ollama_running?: boolean; ollama_pid?: number; ollama_mem_mb?: number; ollama_remote?: boolean
 }
 
+/** One age band of the storage report. The labels come from the server so the
+ *  buckets the UI offers can never disagree with the ones it measures. */
+export interface SessionStorageBucket {
+  label: string; sessions: number; bytes: number
+}
+
+export interface SessionStorageBatch {
+  batch_id: string; created_at: number; reason: string
+  sessions: number; bytes: number
+}
+
+/**
+ * What sessions cost on disk, and what may be reclaimed.
+ *
+ * Deliberately carries NO per-store breakdown: a session is one unit to the
+ * person reading this, and the fact that it is written in two places is an
+ * implementation detail the product does not surface.
+ */
+export interface SessionStorageReport {
+  total_bytes: number; total_sessions: number
+  active_sessions: number; active_bytes: number
+  reclaimable_sessions: number; reclaimable_bytes: number
+  /** Non-empty when this instance must not reclaim — show it instead of the action. */
+  reclaim_blocked_reason: string
+  buckets: SessionStorageBucket[]
+  trash: {
+    bytes: number
+    /** Staged bytes are still occupying the disk until the trash is emptied. */
+    still_on_disk: boolean
+    /** True when the trash shares a filesystem with the stores, so moves are renames. */
+    instant: boolean
+    batches: SessionStorageBatch[]
+  }
+}
+
+export interface SessionStorageCleanup {
+  sessions: number; bytes: number; remaining: number
+  /** Empty on a dry run — nothing was staged, so there is no batch to undo. */
+  batch_id?: string
+  dry_run?: boolean
+}
+
 export interface CronJob {
   id: string; name: string; message: string
   enabled: boolean; schedule: string; last_status: string
@@ -62,6 +127,7 @@ export interface CronJob {
   skip_dates?: string[] | null
   script?: string | null; command?: string | null; last_result?: string | null; last_error?: string | null
   is_running?: boolean; running_since?: number | null
+  folder_id?: string
 }
 
 export interface Lesson {
@@ -70,6 +136,22 @@ export interface Lesson {
 
 export interface Skill {
   key: string; name: string; description: string; always?: boolean; source?: string; package?: string
+  /** False when the skill set `inject_on_trigger: false` — a trigger match then
+   *  contributes a one-line pointer instead of the whole SKILL.md. */
+  inject_on_trigger?: boolean
+  /** Byte length of SKILL.md — half of the injection cost (the other half is
+   *  how many times that body was delivered). */
+  size_bytes?: number
+  /** Times this skill's body was DELIVERED into a prompt. Not trigger matches:
+   *  the ledger records only on delivery, so a false positive and a pointer-only
+   *  skill both count zero. An opted-out skill therefore stops accruing, making
+   *  its figure historical. `null`/absent means no ledger entry, which is NOT
+   *  the same as zero (an entry can also age out of the window). */
+  deliveries?: number | null
+  /** False when the SKILL.md lives outside the directory Kiro Crew owns (e.g. a
+   *  `skills.extra_paths` entry). Such a skill is listed but not ours to rewrite,
+   *  so the injection toggle must not be offered — the endpoint refuses it. */
+  owned?: boolean
   /** Absolute path to SKILL.md on disk, when known. */
   path?: string
   /** Absolute path to the skill folder. */
@@ -78,6 +160,28 @@ export interface Skill {
    *  SKILL.md path.  Empty list means no agent loads it via kiro-cli's
    *  native ``skill://`` loader (it may still load via KiroCrew text-injection). */
   loaded_by_agents?: string[]
+}
+
+/** Response shape for GET /api/skills/budget — the control-plane cost data. */
+export interface SkillBudgetRow {
+  key: string
+  name: string
+  size_bytes: number
+  deliveries: number | null
+  /** null when the cost is not measurable: an `always: true` skill is injected
+   *  every turn but that injection is never recorded in the usage ledger. */
+  chars: number | null
+  inject_on_trigger: boolean
+  always: boolean
+  owned: boolean
+  source: string
+  folded_from?: string[]
+  idle_days: number | null
+}
+export interface SkillBudgetResponse {
+  window_days: number
+  total_chars: number
+  rows: SkillBudgetRow[]
 }
 
 /** A single entry in a skill folder's tree listing. */
@@ -460,7 +564,7 @@ export interface PullRequestSource {
 }
 
 export interface ChatFolder {
-  id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; icon?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
+  id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
 }
 
 export interface ChatTag {
@@ -518,6 +622,8 @@ export interface ToolActivity {
   approval_type?: string // 'chat' or 'spawn'
   tool_call_id?: string  // for matching tool results
   rejected?: boolean     // true when approval was rejected
+  kind?: string          // ACP tool kind; execute is the legacy shell signal
+  is_shell?: boolean     // shell tools can expose an indeterminate live status
 }
 
 /** Parsed content block produced by the block assembler. */

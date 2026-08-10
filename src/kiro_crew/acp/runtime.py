@@ -17,8 +17,10 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -27,6 +29,7 @@ from typing import Any
 from kiro_crew import platform_compat
 from kiro_crew.acp._dispatch import (
     build_session_new_params,
+    parse_session_modes,
     set_mode_params,
 )
 from kiro_crew.acp.client import (
@@ -34,6 +37,8 @@ from kiro_crew.acp.client import (
     CLAUDE_ACP_BIN,
     CLAUDE_ACP_NPM_PKG,
     PROTOCOL_VERSION_CLAUDE,
+    OversizeLineUnrecoverable,
+    _drain_oversize_line,
     _get_start_time,
     _KiroExecutableTrustError,
     _resolve_claude_acp_bin,
@@ -57,6 +62,8 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
     JsonRpcRequest,
 )
+from kiro_crew.agent import ensure_agent_materialized
+from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.env import augmented_path, resolve_krb5_ccname
 from kiro_crew.executors import subprocess_executor
@@ -92,6 +99,11 @@ __all__ = [
 # ── AcpRuntime ──
 
 _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
+# How many in-flight request ids to name in the oversize-frame warning. A dropped
+# frame can carry a response, and the caller then fails as an opaque
+# _send_and_await timeout — naming what was in flight at the drop makes that
+# timeout attributable instead of a mystery. Capped so the line stays bounded.
+_DROP_IDS_IN_LOG = 8
 _INIT_TIMEOUT = 30.0
 _REQUEST_TIMEOUT = 30.0
 _INIT_NOTIFICATION_BUFFER_LIMIT = 100
@@ -116,6 +128,47 @@ _DEFAULT_MAX_RSS_MB = 500.0  # 500 MiB
 # CPU-only for young runtimes and only pays the offloaded RSS probe once a
 # runtime has lived long enough to plausibly have ballooned.
 _RSS_PROBE_MIN_AGE_SECS = 300.0  # 5 minutes
+
+# ── Awaited-request error formatting ──
+#
+# kiro-cli returns this when session/set_mode names an agent it cannot resolve,
+# i.e. no ``<name>.json`` in its agents directory. The wire shape is a bare
+# -32603 "Internal error", so nothing about the frame itself says "missing file".
+# The name charset is bounded to what a real spec filename can hold (see
+# validation of agent names elsewhere) rather than a greedy match, so a hostile
+# or malformed backend string is not echoed back into a user-facing message.
+_MODE_NOT_FOUND_RE = re.compile(r"""Mode ['"](?P<name>[A-Za-z0-9._-]{1,64})['"] not found""")
+
+
+def _format_runtime_rpc_error(error: object) -> str:
+    """Format an awaited-request JSON-RPC error into user-facing text.
+
+    Awaited requests are the handshake ones — ``initialize``, ``session/new``,
+    ``session/set_mode`` — so this is NOT the same population as
+    ``client._format_acp_error``, which rewrites PROMPT-time provider failures
+    (throttling, auth, 5xx) and has no branch that matches a missing agent spec.
+    The two are deliberately separate rather than merged: their inputs come from
+    different protocol phases and share no shape.
+
+    Exactly one shape is rewritten today: a missing agent spec. Left raw it
+    surfaces to the user as ``RPC error: {'code': -32603, 'message': 'Internal
+    error', 'data': "Mode 'kirocrew' not found"}`` — which names an internal ACP
+    concept, reads as a backend bug, and hides that the cause is a local file and
+    the fix is one command. Every other shape falls through to the raw dict, so a
+    shape nobody has classified is surfaced rather than swallowed.
+    """
+    if isinstance(error, dict):
+        match = _MODE_NOT_FOUND_RE.search(str(error.get("data", "") or ""))
+        if match:
+            name = match.group("name")
+            return (
+                f"Agent spec '{name}' is not installed: kiro-cli found no "
+                f"'{name}.json' in {kiro_agents_dir()}. Every turn fails until it "
+                f"is restored — repair with `kirocrew setup --agent-only --clean`, "
+                f"then restart the gateway."
+            )
+    return f"RPC error: {error}"
+
 
 # ── Unroutable-frame drop accounting ──
 #
@@ -205,9 +258,12 @@ def _get_rss_mb(pid: int) -> float | None:
 
     # macOS / other: no /proc, fall back to ps (mirrors the sysctl/ps pattern
     # used elsewhere in this codebase for darwin system info).
+    ps_bin = platform_compat.trusted_system_bin("ps")
+    if ps_bin is None:
+        return None
     try:
         out = (
-            subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)], timeout=2)
+            subprocess.check_output([ps_bin, "-o", "rss=", "-p", str(pid)], timeout=2)
             .decode()
             .strip()
         )
@@ -252,6 +308,90 @@ def _iter_descendant_pids(pid: int) -> list[int]:
     return order
 
 
+#: A whole-machine process table: ``(children_by_ppid, rss_kib_by_pid)``.
+_ProcessTable = tuple[dict[int, list[int]], dict[int, int]]
+
+#: How long one ``ps -A`` snapshot may be reused.
+#:
+#: This exists because the snapshot is WHOLE-MACHINE while its consumer asks
+#: per-pid. ``session_memory._blocking_sample`` samples every live runtime pid in
+#: one pass, so an uncached snapshot enumerated every process on the host once
+#: PER SESSION — 8 sessions on a host with ~150 MCP processes meant 8 full
+#: process-table walks every 5s, serialized in one worker. Measured cost on a
+#: typical Mac (875 procs): ~33ms per ``ps -Ao``, so 8 walks ≈ 272ms duty cycle
+#: per 5s poll — linear amplification that wastes a thread worker and grows with
+#: session count (macOS only: the Linux branch above uses ``/proc`` directly and
+#: never spawns anything).
+#:
+#: One second is chosen against the two consumers, not arbitrarily: the Sessions
+#: panel polls at 5s and the watchdog's RSS ceiling is a multi-GB threshold
+#: checked on a timer, so neither can tell a 1s-old measurement from a fresh
+#: one — while a sampling pass over N pids completes well inside the window and
+#: therefore pays for exactly one snapshot.
+_PS_TABLE_TTL_S = 1.0
+
+_ps_table_lock = threading.Lock()
+#: ``(monotonic_taken_at, table)``, or None before the first snapshot. A cached
+#: FAILURE is not stored — a transient ``ps`` error must not pin every caller to
+#: the single-pid fallback for a whole second.
+_ps_table_cache: tuple[float, _ProcessTable] | None = None
+
+
+def _reset_ps_table_cache() -> None:
+    """Drop the memoized process table. Test seam: the cache is keyed on wall
+    time only, so a test that fakes ``ps`` output would otherwise inherit the
+    previous test's snapshot."""
+    global _ps_table_cache
+    with _ps_table_lock:
+        _ps_table_cache = None
+
+
+def _ps_process_table() -> _ProcessTable | None:
+    """One ``ps -Ao pid=,ppid=,rss=`` snapshot as a parent map + RSS map.
+
+    Memoized for :data:`_PS_TABLE_TTL_S` so a caller that needs the tree for many
+    pids pays for ONE process-table walk rather than one per pid. Returns None
+    when ``ps`` is unavailable or fails, so callers fall back to a single-pid
+    read instead of reporting a phantom-empty tree.
+
+    The snapshot is taken under the lock rather than merely published under it:
+    concurrent first-callers would otherwise each spawn ``ps`` before any of them
+    stored a result, which is the exact amplification this cache exists to
+    remove.
+    """
+    global _ps_table_cache
+    with _ps_table_lock:
+        cached = _ps_table_cache
+        if cached is not None and (time.monotonic() - cached[0]) < _PS_TABLE_TTL_S:
+            return cached[1]
+        ps_bin = platform_compat.trusted_system_bin("ps")
+        if ps_bin is None:
+            return None
+        try:
+            out = (
+                subprocess.check_output([ps_bin, "-Ao", "pid=,ppid=,rss="], timeout=2)
+                .decode()
+                .strip()
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        children: dict[int, list[int]] = {}
+        rss_kib: dict[int, int] = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                cpid, ppid, rss = int(parts[0]), int(parts[1]), int(parts[2])
+            except ValueError:
+                continue
+            children.setdefault(ppid, []).append(cpid)
+            rss_kib[cpid] = rss
+        table: _ProcessTable = (children, rss_kib)
+        _ps_table_cache = (time.monotonic(), table)
+        return table
+
+
 def _get_rss_tree_mb(pid: int) -> float | None:
     """Sum RSS (MiB) of *pid* and all its descendants, or None if unavailable.
 
@@ -260,8 +400,15 @@ def _get_rss_tree_mb(pid: int) -> float | None:
     launcher parent (small, stable, blocked in ``waitpid``) while the real
     kiro-cli that accumulates multi-GB RSS is a child. Measuring only
     ``self._pid`` therefore misses the growth entirely, so we sum the whole
-    descendant tree. On macOS (sandbox-exec / no launcher fork) the tree is
-    just the process itself, so the sum equals the single-process RSS.
+    descendant tree.
+
+    On macOS the tree is walked too, and it is NOT redundant: kiro-cli spawns
+    MCP-server / tool children there exactly as it does on Windows (see that
+    branch's note), so measuring only ``pid`` under-reports a session's real
+    footprint and blinds the watchdog's leak ceiling. An earlier version of this
+    docstring claimed the macOS tree "is just the process itself"; it is kept
+    corrected here because that claim is what made the per-pid whole-machine
+    snapshot look free.
     """
     if sys.platform == "linux":
         total = 0.0
@@ -274,51 +421,26 @@ def _get_rss_tree_mb(pid: int) -> float | None:
         return total if found else None
 
     if platform_compat.IS_WINDOWS:
-        # Walk the Toolhelp parent map (the same snapshot descendant tracking
-        # uses) to find the subtree rooted at pid, then sum each process's RSS
-        # via the shim. Windows spawns kiro-cli without a launcher fork, but the
-        # tree still covers any MCP-server / tool children it spawns.
-        try:
-            parent_map = platform_compat._windows_process_parent_map()
-        except Exception:
-            return _get_rss_mb(pid)
-        win_children: dict[int, list[int]] = {}
-        for cpid, ppid in parent_map.items():
-            win_children.setdefault(ppid, []).append(cpid)
-        total_mb = 0.0
-        found = False
-        win_visited: set[int] = set()
-        stack = [pid]
-        while stack:
-            p = stack.pop()
-            if p in win_visited:
-                continue
-            win_visited.add(p)
-            r = _get_rss_mb(p)
-            if r is not None:
-                total_mb += r
-                found = True
-            stack.extend(win_children.get(p, ()))
-        return total_mb if found else None
+        # Windows spawns kiro-cli WITHOUT a launcher fork, but it still spawns
+        # MCP-server / tool children that can leak. Sum the tree via
+        # proc_rss_tree_mb_for_pid, which enumerates descendants through
+        # descendant_termination_handles — the lineage-VALIDATED walk (exact
+        # creation/exit-time edge checks across two snapshots). A raw Toolhelp
+        # parent-map walk is unsafe here: th32ParentProcessID is never cleared
+        # when a parent dies and Windows recycles PIDs, so it would sum unrelated
+        # subtrees rooted at a recycled PID into a kill/health decision. The
+        # validated walk always counts the root, so an unreadable descendant
+        # (another session / higher integrity) narrows the total rather than
+        # producing a phantom-low tree attached to a recycled root.
+        return platform_compat.proc_rss_tree_mb_for_pid(pid)
 
-    # macOS / other: build a ppid map from a single ps snapshot, then sum the
-    # descendant subtree rooted at pid (ps reports RSS in KiB).
-    try:
-        out = subprocess.check_output(["ps", "-Ao", "pid=,ppid=,rss="], timeout=2).decode().strip()
-    except (OSError, subprocess.SubprocessError):
+    # macOS / other: sum the descendant subtree rooted at pid off a SHARED
+    # whole-machine snapshot (ps reports RSS in KiB). The snapshot is memoized in
+    # _ps_process_table, so sampling N pids costs one process-table walk, not N.
+    table = _ps_process_table()
+    if table is None:
         return _get_rss_mb(pid)
-    children: dict[int, list[int]] = {}
-    rss_kib: dict[int, int] = {}
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        try:
-            cpid, ppid, rss = int(parts[0]), int(parts[1]), int(parts[2])
-        except ValueError:
-            continue
-        children.setdefault(ppid, []).append(cpid)
-        rss_kib[cpid] = rss
+    children, rss_kib = table
     if pid not in rss_kib:
         return None
     total_kib = 0
@@ -571,6 +693,17 @@ class AcpRuntime:
                 raise AcpRuntimeError(str(exc)) from exc
             if not kiro_bin:
                 raise AcpRuntimeError(f"{KIRO_CLI_BIN} not found in PATH")
+
+            # Self-heal (B): kiro-cli discovers its selectable modes at startup from
+            # ~/.kiro/agents/*.json, so the managed default agent file must exist
+            # BEFORE this --agent spawn or set_mode later fails with
+            # "Mode '<agent>' not found". Regenerate it if missing (best-effort, off
+            # the loop). Non-managed agents can't be materialized here — the
+            # create_session guard fails those closed instead.
+            try:
+                await asyncio.to_thread(ensure_agent_materialized, self._agent)
+            except Exception:
+                logger.warning("pre-spawn agent materialization failed", exc_info=True)
 
             argv = [kiro_bin, KIRO_CLI_SUBCMD, "--agent", self._agent]
             if self._model:
@@ -881,11 +1014,50 @@ class AcpRuntime:
         try:
             while True:
                 try:
-                    line = await stdout.readline()
-                except (ValueError, asyncio.LimitOverrunError) as exc:
-                    logger.error("stdout buffer overrun: %s", exc)
-                    self._mark_dead(f"stdout overrun: {exc}")
-                    return
+                    line = await stdout.readuntil(b"\n")
+                except asyncio.IncompleteReadError as exc:
+                    # EOF, possibly holding a trailing unterminated line. Keep
+                    # readline()'s old shape: hand the partial to the parser, and
+                    # an empty partial falls through to the exit branch below.
+                    line = exc.partial
+                except asyncio.LimitOverrunError as exc:
+                    # ONE oversize frame must not kill the demux — same invariant
+                    # as the non-dict and non-numeric-id guards below. Tearing
+                    # the runtime down here ends EVERY multiplexed session
+                    # mid-turn, which is what users see as "process exited /
+                    # chat failure" after a single huge tool result.
+                    #
+                    # _drain_oversize_line consumes the whole line THROUGH its
+                    # terminating newline and discards it, so the stream is back
+                    # on a frame boundary and no byte-slice of the oversize line
+                    # ever reaches json.loads. Its budget is per call and needs no
+                    # cross-iteration state, because every call that returns ends
+                    # on a boundary — so a replay of oversize-but-terminated
+                    # frames is survivable frame after frame.
+                    #
+                    # An awaited request whose response was in a dropped frame is
+                    # not orphaned: _send_and_await wraps every future in
+                    # wait_for(timeout=...), so the caller gets a timeout instead
+                    # of hanging. The ids in flight at the drop are logged so that
+                    # timeout is attributable.
+                    try:
+                        dropped = await _drain_oversize_line(stdout, exc)
+                    except asyncio.IncompleteReadError:
+                        self._mark_dead("stdout closed mid-oversize-line")
+                        return
+                    except OversizeLineUnrecoverable as fatal:
+                        logger.error("stdout unrecoverable: %s", fatal)
+                        self._mark_dead(f"stdout overrun: {fatal}")
+                        return
+                    logger.warning(
+                        "dropped an oversize stdout frame (%d bytes); resynced at "
+                        "next frame (in-flight awaited=%s routed=%s): %s",
+                        dropped,
+                        sorted(self._pending_requests)[:_DROP_IDS_IN_LOG],
+                        sorted(self._routed_requests)[:_DROP_IDS_IN_LOG],
+                        exc,
+                    )
+                    continue
 
                 if not line:
                     rc = self._process.returncode if self._process else "?"
@@ -945,7 +1117,9 @@ class AcpRuntime:
                     future = self._pending_requests.pop(req_id, None)
                     if future and not future.done():
                         if msg.error:
-                            future.set_exception(AcpRuntimeError(f"RPC error: {msg.error}"))
+                            future.set_exception(
+                                AcpRuntimeError(_format_runtime_rpc_error(msg.error))
+                            )
                         else:
                             future.set_result(msg.result or {})
                         continue
@@ -1228,6 +1402,23 @@ class AcpRuntime:
             self._pending_init_notifications.clear()
         return matched
 
+    @staticmethod
+    def _mode_available(agent: str, resp: dict[str, Any]) -> bool:
+        """Whether ``set_mode`` should be attempted for ``agent`` given a
+        ``session/new``|``session/load`` response.
+
+        True when the backend advertised no ``modes`` list at all (older kiro-cli
+        / offline fake backend — attempt for backward compatibility) OR the agent
+        is in the advertised ``availableModes``. False when a modes list WAS
+        advertised (even an empty one) and the agent is absent — the case that
+        would otherwise fault with ``-32603 "Mode '<agent>' not found"``. An
+        explicitly-empty ``availableModes: []`` therefore fails closed, not open.
+        """
+        ids, _current, advertised = parse_session_modes(resp)
+        if not advertised:
+            return True
+        return agent in ids
+
     async def create_session(
         self,
         cwd: str | Path | None = None,
@@ -1284,7 +1475,16 @@ class AcpRuntime:
         # plain local unregister would leak it in the shared process. terminate_
         # session also unregisters the queue. Mirrors the same cleanup in
         # load_session().
-        if agent:
+        #
+        # Guard (A): only activate the mode when the backend advertised it in the
+        # session/new `modes` list, or advertised no modes at all (older kiro-cli
+        # / fake backend → attempt, backward-compatible). If modes ARE advertised
+        # but the requested agent is absent, its ~/.kiro/agents/<agent>.json never
+        # loaded (pre-spawn self-heal covers only the managed default). FAIL CLOSED
+        # rather than silently leaving the session on kiro-cli's default mode: for
+        # a restricted/app agent that would run a BROADER agent than requested (a
+        # privilege escalation), so we terminate and raise an actionable error.
+        if agent and self._mode_available(agent, resp):
             try:
                 await self._send_and_await(
                     METHOD_SET_MODE,
@@ -1293,6 +1493,16 @@ class AcpRuntime:
             except Exception:
                 await self.terminate_session(session_id)
                 raise
+        elif agent:
+            _ids, _current, _adv = parse_session_modes(resp)
+            await self.terminate_session(session_id)
+            raise AcpRuntimeError(
+                f"Agent mode {agent!r} is not available on this session "
+                f"(advertised modes: {_ids or 'none'}); its "
+                f"~/.kiro/agents/{agent}.json is likely missing. Refusing to run "
+                f"the backend default mode {_current or '(unknown)'} in its place. "
+                f"Run `kirocrew setup --agent-only` to materialize the agent config."
+            )
 
         # Drain MCP-server-init / oauth / config notifications before the first
         # prompt so they don't race into the first turn (parity with
@@ -1369,7 +1579,7 @@ class AcpRuntime:
         # succeeded so kiro-cli holds it; a plain local unregister would leak it
         # in the shared process (and leave the reader routing late transcript-
         # replay frames to an abandoned queue). terminate_session unregisters too.
-        if agent:
+        if agent and self._mode_available(agent, resp):
             try:
                 await self._send_and_await(
                     METHOD_SET_MODE,
@@ -1378,6 +1588,20 @@ class AcpRuntime:
             except Exception:
                 await self.terminate_session(resume_sid)
                 raise
+        elif agent:
+            # Guard (A) — see create_session. A resumed session always echoes a
+            # `modes` list (checked above), so an absent agent means its config
+            # isn't loaded. Fail closed rather than silently resuming on a
+            # different (broader) default agent than the one requested.
+            _ids, _current, _adv = parse_session_modes(resp)
+            await self.terminate_session(resume_sid)
+            raise AcpRuntimeError(
+                f"Agent mode {agent!r} is not available for resumed session "
+                f"{resume_sid} (advertised modes: {_ids or 'none'}); its "
+                f"~/.kiro/agents/{agent}.json is likely missing. Refusing to run "
+                f"the backend default mode {_current or '(unknown)'} in its place. "
+                f"Run `kirocrew setup --agent-only` to materialize the agent config."
+            )
 
         # Drain MCP-init / oauth / config notifications before the first prompt
         # (parity with AcpClient). Transcript-replay frames were already dropped

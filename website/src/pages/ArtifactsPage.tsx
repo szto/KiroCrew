@@ -2,14 +2,15 @@ import { safeSetItem } from '../utils/safeStorage'
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useInfiniteQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query'
-import { AlertTriangle, Bookmark, Cloud, ExternalLink, Globe, Rocket, X, Share2, Loader2, LayoutDashboard, Table as TableIcon, Folder as FolderIcon, FolderPlus, FolderOpen, ChevronRight, ChevronDown, MoreVertical, Pencil, Trash2, Star, FileText, FilePlus } from 'lucide-react'
+import { AlertTriangle, Bookmark, Cloud, ExternalLink, Globe, Rocket, X, Share2, Loader2, LayoutDashboard, Table as TableIcon, Folder as FolderIcon, FolderPlus, FolderOpen, ChevronRight, ChevronDown, ChevronUp, MoreVertical, Pencil, Trash2, Star, FileText, FilePlus } from 'lucide-react'
 import { openPopout } from '../utils/artifactPopout'
 import { VirtuosoMasonry } from '@virtuoso.dev/masonry'
 import type { ItemContent } from '@virtuoso.dev/masonry'
 import { DndContext, PointerSensor, useSensor, useSensors, DragOverlay, MeasuringStrategy, pointerWithin, type DragEndEvent, type DragStartEvent, type CollisionDetection, type Modifier } from '@dnd-kit/core'
 import SegmentedControl from '../components/SegmentedControl'
 import { api } from '../api/client'
-import { Card, CardTitle, PageHeader, Btn, Badge, SearchInput, EmptyState, Input } from '../components/ui'
+import { Card, CardTitle, PageHeader, Btn, Badge, SearchInput, EmptyState, Input, IconButton } from '../components/ui'
+import SimpleSelect from '../components/SimpleSelect'
 import RemoteArtifactCard from '../components/RemoteArtifactCard'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '../components/ui/dropdown-menu'
@@ -31,6 +32,7 @@ import { THEME_VAR_NAMES, buildSrcdoc } from '../lib/widgetSrcdoc'
 import type { Artifact, ArtifactFolder, PublishProviderDescriptor, RemoteArtifact, SessionDoc } from '../types'
 
 import { i18nT } from '../i18n/t'
+import { FOLDER_COLOR_PALETTE } from '../components/folderColorCatalog'
 /** Read the current computed theme CSS vars (capped to the known set, each
  * value sanitized) so a sandboxed preview iframe matches the dashboard theme.
  * Mirrors the helper in ArtifactDetailPage. */
@@ -44,9 +46,6 @@ function readThemeVars(): Record<string, string> {
   }
   return out
 }
-
-const sel =
-  'bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-none cursor-pointer transition-colors focus-ring'
 
 const KIND_OPTIONS = ['', 'widget', 'html', 'markdown', 'svg', 'json', 'text', 'webapp'] as const
 
@@ -206,7 +205,7 @@ function WidgetThumb({ content, slug }: { content: string; slug: string }) {
           ref={iframeRef}
           src={blobUrl}
           sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
-          title={`Preview: ${slug}`}
+          title={i18nT('pages.artifactsPage.preview', { slug })}
           tabIndex={-1}
           className="border-none bg-card block"
           style={{
@@ -336,7 +335,7 @@ function WebAppThumb({ art, mini = false }: { art: Artifact; mini?: boolean }) {
             sandbox={previewBase ? 'allow-scripts' : 'allow-scripts allow-same-origin'}
             referrerPolicy="no-referrer"
             loading="lazy"
-            title={`App preview: ${art.slug}`}
+            title={i18nT('pages.artifactsPage.app_preview', { slug: art.slug })}
             tabIndex={-1}
             className="border-none bg-card block"
             style={{ width: BASE_W, height: BASE_H, transform: `scale(${scale})`, transformOrigin: 'top left' }}
@@ -401,19 +400,21 @@ type FolderActions = {
 }
 
 /** Curated folder color palette (works on light + dark themes). '' = none. */
-const FOLDER_COLORS = ['#ef4444', '#f59e0b', '#22c55e', '#06b6d4', '#3b82f6', '#8b5cf6', '#ec4899', '#94a3b8'] as const
-
-/** Swatch strip for picking a folder color ('' clears back to default). */
+/** Swatch strip for picking a folder color ('' clears back to default).
+ *  The palette is the shared folder catalog (folderColorCatalog.tsx), so
+ *  artifact folders and chat folders offer the same hues and the aria labels
+ *  reuse the localized color names. */
 function FolderColorSwatches({ value, onPick, size = 16 }: { value?: string; onPick: (color: string) => void; size?: number }) {
   return (
     <div className="flex items-center gap-1.5 flex-wrap" role="radiogroup" aria-label={i18nT('pages.artifactsPage.folder_color')}>
-      {FOLDER_COLORS.map((c) => (
+      {FOLDER_COLOR_PALETTE.map(({ value: c, label }) => (
         <button
           key={c}
           type="button"
           role="radio"
           aria-checked={value === c}
-          aria-label={`Color ${c}`}
+          aria-label={label()}
+          title={label()}
           onClick={(e) => { e.stopPropagation(); onPick(c) }}
           onPointerDown={(e) => e.stopPropagation()}
           className={`rounded-full border cursor-pointer transition-transform hover:scale-110 ${
@@ -514,7 +515,7 @@ function FolderMenu({ folder, folders, actions }: { folder: ArtifactFolder; fold
           onClick={(e) => e.stopPropagation()}
           className="p-1 rounded text-muted hover:text-text transition-colors cursor-pointer bg-transparent border-none"
           title={i18nT('pages.artifactsPage.folder_actions')}
-          aria-label={`Actions for folder ${folder.name}`}
+          aria-label={i18nT('pages.artifactsPage.actions_for_folder', { name: folder.name })}
         >
           <MoreVertical size={13} />
         </button>
@@ -589,7 +590,7 @@ function FolderCard({ folder, folders, previewArtifacts, actions }: {
               role="button"
               tabIndex={0}
               onKeyDown={(e) => { if (!renaming && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); actions.onOpen(folder.id) } }}
-              aria-label={`Open folder ${folder.name}`}
+              aria-label={i18nT('pages.artifactsPage.open_folder', { name: folder.name })}
               className={`group mr-3 mb-3 rounded-lg border bg-card p-3 cursor-pointer transition-all hover:border-border-strong hover:shadow-md ${
                 isOver ? 'border-accent ring-2 ring-accent/40 bg-accent/5' : 'border-border'
               }`}
@@ -748,7 +749,7 @@ function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
                 <Share2
                   size={12}
                   className={a.publication.last_error ? 'text-danger shrink-0' : 'text-ok shrink-0'}
-                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : `Published (${a.publication.visibility.toLowerCase()})`}
+                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
                 />
               )}
             </div>
@@ -779,7 +780,7 @@ function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
               disabled={pinningSlug === a.slug}
               onClick={(e) => { e.stopPropagation(); onTogglePin(a) }}
               className={`p-1 rounded transition-colors cursor-pointer bg-transparent border-none disabled:cursor-default ${a.pinned ? 'text-accent' : 'text-muted hover:text-accent'}`}
-              title={a.pinned ? i18nT('pages.artifactsPage.starred_click_to_unstar') : i18nT('pages.artifactsPage.star_save_to_library')}
+              title={a.pinned ? i18nT('pages.artifactsPage.starred_click_to_unstar') : i18nT('pages.artifactsPage.star_artifact')}
               aria-label={a.pinned ? i18nT('pages.artifactsPage.remove_star_from_artifact') : i18nT('pages.artifactsPage.star_artifact')}
               aria-pressed={!!a.pinned}
             >
@@ -949,7 +950,7 @@ function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSl
               disabled={pinningSlug === a.slug}
               onClick={(e) => { e.stopPropagation(); onTogglePin(a) }}
               className={`p-0.5 rounded transition-colors cursor-pointer bg-transparent border-none disabled:cursor-default ${a.pinned ? 'text-accent' : 'text-muted/40 hover:text-accent'}`}
-              title={a.pinned ? i18nT('pages.artifactsPage.starred_click_to_unstar') : i18nT('pages.artifactsPage.star_save_to_library')}
+              title={a.pinned ? i18nT('pages.artifactsPage.starred_click_to_unstar') : i18nT('pages.artifactsPage.star_artifact')}
               aria-label={a.pinned ? i18nT('pages.artifactsPage.remove_star_from_artifact') : i18nT('pages.artifactsPage.star_artifact')}
               aria-pressed={!!a.pinned}
             >
@@ -963,7 +964,7 @@ function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSl
                 <Share2
                   size={12}
                   className={a.publication.last_error ? 'text-danger' : 'text-ok'}
-                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : `Published (${a.publication.visibility.toLowerCase()})`}
+                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
                 />
               )}
             </div>
@@ -1020,6 +1021,24 @@ function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSl
   )
 }
 
+/** The star-to-materialize affordance shared by the table/tree rows and the
+ * gallery section, so the two views cannot drift (this PR is already the
+ * second "feature existed in one view only" fix of this class). */
+function SessionDocStar({ d, busy, onMaterialize }: { d: SessionDoc; busy: boolean; onMaterialize: (path: string, sessionKey?: string) => void }) {
+  return (
+    <IconButton
+      variant="accent"
+      disabled={busy}
+      onClick={() => onMaterialize(d.path, d.session_key)}
+      title={i18nT('pages.artifactsPage.star_creates_a_starred_artifact_from_this_docume')}
+      aria-label={i18nT('pages.artifactsPage.star_document')}
+      className="shrink-0"
+    >
+      {busy ? <Loader2 size={14} className="animate-spin" /> : <Star size={14} />}
+    </IconButton>
+  )
+}
+
 /** A single unsaved session-document row (from "your chats"). Leading star
  * materializes it into a real, starred artifact. Shares the same columns as
  * ArtifactRow so both live in one unified table. */
@@ -1028,21 +1047,11 @@ function SessionDocRow({ d, busy, onMaterialize }: { d: SessionDoc; busy: boolea
   return (
     <tr className="transition-colors hover:bg-bg-hover">
       <td className="px-2.5 py-2 border-b border-border text-center">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => onMaterialize(d.path, d.session_key)}
-          className="p-0.5 rounded transition-colors cursor-pointer bg-transparent border-none disabled:cursor-default text-muted/40 hover:text-accent"
-          title={i18nT('pages.artifactsPage.star_creates_a_starred_artifact_from_this_docume')}
-          aria-label={i18nT('pages.artifactsPage.star_document')}
-          aria-pressed={false}
-        >
-          {busy ? <Loader2 size={14} className="animate-spin" /> : <Star size={14} />}
-        </button>
+        <SessionDocStar d={d} busy={busy} onMaterialize={onMaterialize} />
       </td>
       <td className="px-2.5 py-2 border-b border-border">
         <div className="flex items-center gap-1.5 min-w-0">
-          <FileText size={13} className="text-emerald-400 shrink-0" />
+          <FileText size={13} className="text-ok shrink-0" />
           <span className="text-sm text-text-strong font-medium truncate">{d.name}</span>
         </div>
         <div className="text-[11px] text-muted truncate max-w-[420px]">{d.path}</div>
@@ -1055,6 +1064,102 @@ function SessionDocRow({ d, busy, onMaterialize }: { d: SessionDoc; busy: boolea
       <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted whitespace-nowrap">{_timeAgo(isoToTs(d.updated_at))}</td>
       <td className="px-2.5 py-2 border-b border-border"></td>
     </tr>
+  )
+}
+
+/** Unsaved session documents in the GALLERY view. The table and tree views
+ * fold these into their rows (SessionDocRow) — but the gallery is the DEFAULT
+ * view, so without this section a document badged "Artifact" in the chat
+ * transcript is invisible on this page until the user discovers the table
+ * toggle. Same affordance as SessionDocRow: the leading star materializes the
+ * document into a real, starred artifact. */
+/* Cap the docs section so an active user's cross-session firehose cannot push
+ * the saved library — the page's primary content — below the fold (the same
+ * burial this section exists to cure, inverted). Same disclosure pattern as
+ * FileChangeChips' COLLAPSED_COUNT. */
+const SESSION_DOCS_COLLAPSED = 5
+const SESSION_DOCS_COLLAPSE_KEY = 'mc-artifacts-session-docs-collapsed'
+
+function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath }: {
+  docs: SessionDoc[]
+  /** True while the session-docs query is in flight — renders a fixed-height
+   *  skeleton so the section does not pop in and shift the gallery under the
+   *  user's cursor once the query resolves. */
+  pending: boolean
+  onMaterialize: (path: string, sessionKey?: string) => void
+  materializingPath: string | null
+}) {
+  const [expanded, setExpanded] = useState(false)
+  // Persisted: a user who never intends to save these docs can put the section
+  // away for good; the header stays as a one-click way back.
+  const [collapsed, setCollapsed] = useState(
+    () => localStorage.getItem(SESSION_DOCS_COLLAPSE_KEY) === '1',
+  )
+  const listRef = useRef<HTMLDivElement>(null)
+  const toggleCollapsed = () => {
+    setCollapsed((v) => {
+      safeSetItem(SESSION_DOCS_COLLAPSE_KEY, v ? '' : '1')
+      return !v
+    })
+  }
+  // A successful materialize unmounts its row; without this, focus falls to
+  // <body> and keyboard users lose their place. Re-anchor on the list.
+  const handleMaterialize = (path: string, sessionKey?: string) => {
+    onMaterialize(path, sessionKey)
+    listRef.current?.focus()
+  }
+  if (pending && !docs.length) {
+    // Fixed-height placeholder (~header + one row) reserving the slot.
+    return (
+      <Card className="mt-0 p-3" aria-busy="true">
+        <div className="h-[24px] w-40 rounded bg-bg-hover animate-pulse mb-2" />
+        <div className="h-[32px] rounded-lg bg-bg-hover animate-pulse" />
+      </Card>
+    )
+  }
+  if (!docs.length) return null
+  const overflow = docs.length > SESSION_DOCS_COLLAPSED
+  const visible = overflow && !expanded ? docs.slice(0, SESSION_DOCS_COLLAPSED) : docs
+  return (
+    <Card className="mt-0 p-3">
+      <CardTitle className={collapsed ? 'mb-0 px-1' : 'mb-2 px-1'}>
+        <button
+          type="button"
+          onClick={toggleCollapsed}
+          aria-expanded={!collapsed}
+          className="flex items-center gap-2 bg-transparent border-none p-0 cursor-pointer text-inherit font-inherit"
+        >
+          {collapsed ? <ChevronRight size={14} className="shrink-0 text-muted" /> : <ChevronDown size={14} className="shrink-0 text-muted" />}
+          {i18nT('pages.artifactsPage.from_your_chats')}
+          {collapsed && <span className="text-muted font-normal">({docs.length})</span>}
+        </button>
+      </CardTitle>
+      {!collapsed && (
+      <div ref={listRef} tabIndex={-1} className="flex flex-col gap-0.5 outline-none">
+        {visible.map((d) => (
+          <div key={d.path} className="flex items-center gap-2.5 px-2 py-1.5 rounded-lg">
+            <SessionDocStar d={d} busy={materializingPath === d.path} onMaterialize={handleMaterialize} />
+            <FileText size={13} className="text-ok shrink-0" />
+            <span className="text-sm text-text-strong font-medium truncate min-w-0 max-w-[280px]">{d.name}</span>
+            <span className="text-[11px] text-muted truncate min-w-0 flex-1">{d.path}</span>
+            <span className="text-[12px] text-muted truncate min-w-0 max-w-[180px]" title={d.session_title}>{d.session_title}</span>
+            <span className="text-[12px] text-muted whitespace-nowrap shrink-0">{_timeAgo(isoToTs(d.updated_at))}</span>
+          </div>
+        ))}
+        {overflow && (
+          <Btn
+            onClick={() => setExpanded((v) => !v)}
+            className="justify-center w-full px-2 py-1.5 rounded-lg text-[11.5px] font-medium border-none"
+            aria-expanded={expanded}
+          >
+            {expanded
+              ? <><ChevronUp size={13} className="shrink-0" /> {i18nT('pages.artifactsPage.show_less')}</>
+              : <><ChevronDown size={13} className="shrink-0" /> {i18nT('pages.artifactsPage.show_all_count', { count: docs.length })}</>}
+          </Btn>
+        )}
+      </div>
+      )}
+    </Card>
   )
 }
 
@@ -1729,6 +1834,13 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
       qc.invalidateQueries({ queryKey: ['artifact-session-docs'] })
     },
   })
+  const handleMaterialize = useCallback(
+    (path: string, sessionKey?: string) => materializeMut.mutate({ path, sessionKey }),
+    [materializeMut],
+  )
+  const materializingPath = materializeMut.isPending
+    ? ((materializeMut.variables as { path: string } | undefined)?.path ?? null)
+    : null
   const sessionDocs = useMemo(() => {
     let docs = (sessionDocsQ.data?.docs || []).filter((d) => !d.saved)
     if (kindFilter) docs = docs.filter((d) => docFileType(d.path) === kindFilter)
@@ -1750,12 +1862,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   )
 
   const handleDelete = useCallback((a: Artifact) => {
-    if (window.confirm(
-      `Remove artifact "${a.slug}" from your library?\n\n` +
-      `This deletes the artifact entry and its version history. ` +
-      `If this artifact came from a file on disk or a chat widget, ` +
-      `the original is NOT touched — you can re-add it later.`
-    )) {
+    if (window.confirm(i18nT('pages.artifactsPage.remove_artifact_confirm', { slug: a.slug }))) {
       deleteMut.mutate(a.slug)
     }
   }, [deleteMut])
@@ -1768,7 +1875,9 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
       ? asMessage(addArtifactMut.error)
       : newArtifactMut.error
         ? asMessage(newArtifactMut.error)
-        : null
+        : materializeMut.error
+          ? asMessage(materializeMut.error)
+          : null
 
   if (isLoading) return <div className="p-6 text-muted">{i18nT('pages.artifactsPage.loading')}</div>
 
@@ -1783,7 +1892,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               <div className="text-sm text-danger font-medium">{i18nT('pages.artifactsPage.error')}</div>
               <div className="text-[13px] text-danger/90 mt-0.5">{errMessage || mutErr || addError}</div>
             </div>
-            <Btn aria-label={i18nT('app.dismiss')} onClick={() => { deleteMut.reset(); addArtifactMut.reset(); newArtifactMut.reset(); setAddError(null) }} className="text-danger/60 hover:text-danger shrink-0"><X className="lucide-inline" /></Btn>
+            <Btn aria-label={i18nT('app.dismiss')} onClick={() => { deleteMut.reset(); addArtifactMut.reset(); newArtifactMut.reset(); materializeMut.reset(); setAddError(null) }} className="text-danger/60 hover:text-danger shrink-0"><X className="lucide-inline" /></Btn>
           </div>
         )}
 
@@ -1847,21 +1956,30 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
             />
-            <select className={sel} value={kindFilter} aria-label={i18nT('pages.artifactsPage.filter_by_kind')} onChange={(e) => setKindFilter(e.target.value)}>
-              {KIND_OPTIONS.map((k) => (
-                <option key={k} value={k}>
-                  {k ? `kind: ${k}` : i18nT('pages.artifactsPage.all_kinds')}
-                </option>
-              ))}
-            </select>
-            <select className={sel} value={tagFilter} aria-label={i18nT('pages.artifactsPage.filter_by_tag')} onChange={(e) => setTagFilter(e.target.value)}>
-              <option value="">{i18nT('pages.artifactsPage.all_tags')}</option>
-              {allTags.map((t) => (
-                <option key={t} value={t}>
-                  {i18nT('pages.artifactsPage.tag')} {t}
-                </option>
-              ))}
-            </select>
+            {/* The "all" row of each filter is the empty string, the value both
+                filters initialise to. SimpleSelect routes '' through an internal
+                sentinel, so it stays a selectable option as long as '' is present
+                in `options` — which is why it leads each array and takes its
+                visible label from the matching `optionLabels` slot. */}
+            <SimpleSelect
+              options={[...KIND_OPTIONS]}
+              optionLabels={KIND_OPTIONS.map((k) => (k ? `kind: ${k}` : i18nT('pages.artifactsPage.all_kinds')))}
+              value={kindFilter}
+              aria-label={i18nT('pages.artifactsPage.filter_by_kind')}
+              onChange={setKindFilter}
+            />
+            {/* The popup is exactly this trigger's width, so a trigger sized to
+                its own placeholder would clip the user-defined tag names it
+                lists. Floor the TRIGGER, not the panel — that keeps the two in
+                lockstep while leaving the rows readable. */}
+            <SimpleSelect
+              style={{ minWidth: 180 }}
+              options={['', ...allTags]}
+              optionLabels={[i18nT('pages.artifactsPage.all_tags'), ...allTags.map((t) => `${i18nT('pages.artifactsPage.tag')} ${t}`)]}
+              value={tagFilter}
+              aria-label={i18nT('pages.artifactsPage.filter_by_tag')}
+              onChange={setTagFilter}
+            />
             <Btn onClick={() => navigate('/deploy')} className="flex items-center gap-1.5 ml-auto" title={i18nT('pages.artifactsPage.artifact_deploy_aws_profiles_and_published_sites')}>
               <Globe size={13} /> {i18nT('pages.artifactsPage.artifact_deploy')}
             </Btn>
@@ -1950,12 +2068,29 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               </div>
             )}
 
+            {/* Session docs render ABOVE the masonry: at ≥30 artifacts the
+              * virtualized gallery becomes a viewport-height scroller, and a
+              * section after it would hide below the fold — the exact
+              * discoverability gap this feature exists to close. Table/tree
+              * views fold the docs into their own rows instead. Skipped while
+              * folder-scoped (docs are unfiled) and in the Starred view. */}
+            {view === 'grid' && !pinnedOnly && !tagFilter && (filtersActive || !scopeFolderId) && (
+              <SessionDocsGallery
+                docs={sessionDocs}
+                pending={sessionDocsQ.isPending}
+                onMaterialize={handleMaterialize}
+                materializingPath={materializingPath}
+              />
+            )}
+
             {gridEntries.length === 0 && (view === 'grid' || filtersActive) ? (
               (artifacts.length === 0 && folders.length === 0) ? (
                 <EmptyState
                   icon={<Bookmark className="lucide-inline" />}
                   title={i18nT('pages.artifactsPage.no_artifacts_yet')}
-                  subtitle={i18nT('pages.artifactsPage.click_the_bookmark_icon_on_any_rendered_widget_i')}
+                  subtitle={sessionDocs.length > 0 && !pinnedOnly
+                    ? i18nT('pages.artifactsPage.star_a_document_in_from_your_chats_to_save_it_he')
+                    : i18nT('pages.artifactsPage.click_the_bookmark_icon_on_any_rendered_widget_i')}
                 />
               ) : (
                 <div className="text-muted italic px-2.5 py-3.5 text-sm">
@@ -1983,9 +2118,9 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                 deletingSlug={deleteMut.isPending ? (deleteMut.variables as string) : null}
                 onTogglePin={handleTogglePin}
                 pinningSlug={pinningSlug}
-                sessionDocs={pinnedOnly ? [] : sessionDocs}
-                onMaterialize={pinnedOnly ? undefined : (path, sessionKey) => materializeMut.mutate({ path, sessionKey })}
-                materializingPath={materializeMut.isPending ? ((materializeMut.variables as { path: string } | undefined)?.path ?? null) : null}
+                sessionDocs={pinnedOnly || tagFilter ? [] : sessionDocs}
+                onMaterialize={pinnedOnly ? undefined : handleMaterialize}
+                materializingPath={materializingPath}
               />
             ) : (
               <LibraryTree
@@ -2001,9 +2136,9 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                 pinningSlug={pinningSlug}
                 overFolderId={overFolderId}
                 dragActive={!!activeDrag}
-                sessionDocs={pinnedOnly ? [] : sessionDocs}
-                onMaterialize={pinnedOnly ? undefined : (path, sessionKey) => materializeMut.mutate({ path, sessionKey })}
-                materializingPath={materializeMut.isPending ? ((materializeMut.variables as { path: string } | undefined)?.path ?? null) : null}
+                sessionDocs={pinnedOnly || tagFilter ? [] : sessionDocs}
+                onMaterialize={pinnedOnly ? undefined : handleMaterialize}
+                materializingPath={materializingPath}
               />
             )}
 
@@ -2108,7 +2243,7 @@ function RemoteBrowseSection({ provider, onForked, onCloned }: {
     <Card className="mt-4">
       <CardTitle>{i18nT('pages.artifactsPage.on')} {provider.display_name}</CardTitle>
       <div className="mb-2">
-        <SearchInput placeholder={`Filter ${provider.display_name} artifacts…`} value={search} onChange={e => setSearch((e.target as HTMLInputElement).value)} />
+        <SearchInput placeholder={i18nT('pages.artifactsPage.filter_artifacts', { provider: provider.display_name })} value={search} onChange={e => setSearch((e.target as HTMLInputElement).value)} />
       </div>
       <div className="divide-y divide-border">
         {filtered.map((a) => (
@@ -2130,7 +2265,7 @@ function RemoteBrowseSection({ provider, onForked, onCloned }: {
           <Btn
             onClick={() => fetchNextPage()}
             disabled={isFetchingNextPage}
-            aria-label={`Load more ${provider.display_name} artifacts`}
+            aria-label={i18nT('pages.artifactsPage.load_more_artifacts', { provider: provider.display_name })}
           >
             {isFetchingNextPage
               ? <Loader2 className="lucide-inline w-3.5 h-3.5 animate-spin" />

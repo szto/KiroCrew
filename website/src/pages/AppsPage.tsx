@@ -21,7 +21,8 @@ import {
   Package, Bot, Zap, Clock, ShoppingBag, Lock, Trash2, X, ArrowUp, Boxes,
 } from 'lucide-react'
 import { api } from '../api/client'
-import { Btn, EmptyState, PageHeader, SearchInput, Select } from '../components/ui'
+import { Btn, EmptyState, PageHeader, SearchInput } from '../components/ui'
+import SimpleSelect from '../components/SimpleSelect'
 import { recordEvent } from '../rum'
 import SegmentedControl from '../components/SegmentedControl'
 import FeaturedSpotlight from '../components/appstore/FeaturedSpotlight'
@@ -29,12 +30,14 @@ import FeatureCard from '../components/appstore/FeatureCard'
 import CategoryRail, { type SourceRow } from '../components/appstore/CategoryRail'
 import AppListRow from '../components/appstore/AppListRow'
 import InstalledAppCard from '../components/appstore/InstalledAppCard'
+import TrustAppModal, { isTrustDeniedError, useTrustGate, type TrustAppTarget } from '../components/appstore/TrustAppModal'
 import SourcesPopover from '../components/appstore/SourcesPopover'
 import { categoryFor, categoryCounts, type Category } from '../components/appstore/categories'
 import { hasHeroArt } from '../components/appstore/useHeroArt'
 import { isVerified, normalizeRegistryApp, type InstalledApp, type RegistryApp } from '../components/appstore/types'
 
 import { i18nT } from '../i18n/t'
+import ErrorNotice from '../components/ErrorNotice'
 /** Uninstall preview payload (mirrors ``api.uninstallPreview`` return shape). */
 type UninstallPreview = Awaited<ReturnType<typeof api.uninstallPreview>>
 type RemovableDep = UninstallPreview['dependencies']['removable'][number]
@@ -258,18 +261,43 @@ export default function AppsPage() {
   }
   // autoAction travels as router STATE, never a query param — a URL-reachable
   // trigger would let a cross-site navigation start a privileged install.
+  //
+  // Get / Update on this page NAVIGATE and never call an install endpoint
+  // themselves (FeaturedSpotlight, the Browse cards and AppListRow all route
+  // their `onGet` here), so the registry-install trust refusal — which the
+  // gateway now raises before cloning — surfaces on the detail page, where
+  // `handleInstall` owns the consent modal. Nothing to gate here.
   const getApp = (name: string) => navigate(`/apps/detail/${name}`, { state: { autoAction: 'install' } })
   const updateApp = (name: string) => navigate(`/apps/detail/${name}`, { state: { autoAction: 'update' } })
+
+  // Provenance the consent modal shows. The browse-catalog row is preferred:
+  // registry rows carry `repo`/`_registry`, which the installed record does not.
+  const trustTarget = (name: string): TrustAppTarget => {
+    const row = browseApps.find(a => a.name === name)
+    if (row) return { name: row.name, displayName: row.displayName, repo: row.repo, origin: row.origin, _registry: row._registry }
+    const installed = apps.find(a => a.name === name)
+    return { name, displayName: installed?.displayName, repo: installed?.manifest?.repo, origin: installed?.origin }
+  }
+
+  /** The single enable path — shared by Discover, Library, and the trust retry. */
+  const runEnable = async (name: string) => {
+    await api.enableApp(name)
+    recordEvent('app_enable', { app: name })
+    invalidate()
+  }
+
+  const trust = useTrustGate(runEnable)
 
   const enableApp = async (name: string) => {
     setActionLoading(`${name}:enable`)
     setError('')
     try {
-      await api.enableApp(name)
-      recordEvent('app_enable', { app: name })
-      invalidate()
+      await runEnable(name)
     } catch (e) {
-      setError((e as Error)?.message || `Failed to enable ${name}`)
+      // A third-party app that has not been granted execution trust yet is a
+      // consent prompt, not an error — branch on the machine-readable code.
+      if (isTrustDeniedError(e)) trust.open(trustTarget(name))
+      else setError((e as Error)?.message || i18nT('pages.appsPage.failed_to_enable', { name }))
     } finally {
       setActionLoading(null)
     }
@@ -302,7 +330,7 @@ export default function AppsPage() {
     setActionLoading(`${name}:${action}`)
     setError('')
     try {
-      if (action === 'enable') await api.enableApp(name)
+      if (action === 'enable') await runEnable(name)
       else if (action === 'disable') await api.disableApp(name)
       invalidate()
       // Show toast when hiding a builtin app
@@ -314,7 +342,8 @@ export default function AppsPage() {
         }
       }
     } catch (e) {
-      setError((e as Error)?.message || `Failed to ${action} ${name}`)
+      if (action === 'enable' && isTrustDeniedError(e)) trust.open(trustTarget(name))
+      else setError((e as Error)?.message || i18nT('pages.appsPage.action_failed', { action, name }))
     } finally {
       setActionLoading(null)
     }
@@ -330,7 +359,7 @@ export default function AppsPage() {
       recordEvent('app_uninstall', { app: name, version: uninstallTarget.version })
       invalidate()
     } catch (e) {
-      setError((e as Error)?.message || `Failed to uninstall ${name}`)
+      setError((e as Error)?.message || i18nT('pages.appsPage.failed_to_uninstall', { name }))
     } finally {
       setActionLoading(null)
       setUninstallTarget(null)
@@ -354,7 +383,7 @@ export default function AppsPage() {
     }
     setUpdatingAll(null)
     invalidate()
-    if (failed.length) setError(`Failed to update: ${failed.join(', ')}`)
+    if (failed.length) setError(i18nT('pages.appsPage.failed_to_update', { names: failed.join(', ') }))
     else {
       setSuccessMsg(`Updated ${targets.length} app${targets.length === 1 ? '' : 's'}.`)
       setTimeout(() => setSuccessMsg(''), 4000)
@@ -394,10 +423,11 @@ export default function AppsPage() {
       <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         {/* Notifications */}
         {displayError && (
-          <div className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-center gap-3 animate-rise">
-            <span className="text-danger text-sm flex-1">{displayError}</span>
-            <button aria-label={i18nT('pages.appsPage.dismiss_error')} className="text-danger/60 hover:text-danger text-sm" onClick={() => { setError(''); setDismissedQueryError(true) }}><X className="lucide-inline" /></button>
-          </div>
+          <ErrorNotice
+            message={displayError}
+            onDismiss={() => { setError(''); setDismissedQueryError(true) }}
+            className="mb-4 animate-rise"
+          />
         )}
         {successMsg && (
           <div className="mb-4 bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--ok) 45%, transparent)' }}>
@@ -405,6 +435,18 @@ export default function AppsPage() {
             <button aria-label={i18nT('pages.appsPage.dismiss_message')} className="text-muted hover:text-text text-sm" onClick={() => setSuccessMsg('')}><X className="lucide-inline" /></button>
           </div>
         )}
+
+        {/* Third-party execution-trust consent. Opened when an enable is
+            refused with code `app_execution_denied`, instead of surfacing the
+            raw backend string in the error card above. */}
+        <TrustAppModal
+          app={trust.target}
+          pending={trust.pending}
+          failed={trust.failed}
+          granted={trust.granted}
+          onCancel={trust.cancel}
+          onConfirm={trust.confirm}
+        />
 
         {/* Uninstall confirmation modal. The backdrop closes on click (mouse
             convenience); keyboard users press Escape (handled) or the Cancel
@@ -483,7 +525,7 @@ export default function AppsPage() {
                                 <input
                                   id={`keep-dep-${d.id}`}
                                   type="checkbox"
-                                  aria-label={`Keep dependency ${d.id.split('/').pop()}`}
+                                  aria-label={i18nT('pages.appsPage.keep_dependency', { name: d.id.split('/').pop() })}
                                   checked={keepSpecific.has(d.id)}
                                   onChange={e => {
                                     const next = new Set(keepSpecific)
@@ -593,18 +635,21 @@ export default function AppsPage() {
                 <div className="min-w-0">
                   <div className="flex items-center justify-between mb-3 text-[12.5px] text-muted">
                     <span>{i18nT('pages.appsPage.app', { count: filteredBrowse.length })}</span>
-                    <label className="flex items-center gap-1.5">
+                    {/* A `<label>` cannot wrap this any more: `SimpleSelect`
+                        renders a button, and a button takes its accessible name
+                        from its own content, not from an enclosing label. The
+                        name is on `aria-label` instead. */}
+                    <span className="flex items-center gap-1.5">
                       <span>{i18nT('pages.appsPage.sort')}</span>
-                      <Select
+                      <SimpleSelect
+                        options={['name', 'category']}
+                        optionLabels={[i18nT('pages.appsPage.name'), i18nT('pages.appsPage.category')]}
                         value={sort}
-                        onChange={e => setSort(e.target.value as 'name' | 'category')}
+                        onChange={v => setSort(v as 'name' | 'category')}
                         aria-label={i18nT('pages.appsPage.sort_apps')}
-                        className="text-[12.5px] py-1"
-                      >
-                        <option value="name">{i18nT('pages.appsPage.name')}</option>
-                        <option value="category">{i18nT('pages.appsPage.category')}</option>
-                      </Select>
-                    </label>
+                        style={{ flexShrink: 0 }}
+                      />
+                    </span>
                   </div>
                   {filteredBrowse.length === 0 ? (
                     <EmptyState icon={<ShoppingBag size={32} />} title={i18nT('pages.appsPage.no_matching_apps')} subtitle={i18nT('pages.appsPage.try_a_different_search_or_category')} />
@@ -652,7 +697,7 @@ export default function AppsPage() {
                     onClick={updateAll}
                     disabled={!!updatingAll}
                   >
-                    {updatingAll ? `Updating ${updatingAll.done}/${updatingAll.total}…` : i18nT('pages.appsPage.update_all')}
+                    {updatingAll ? i18nT('pages.appsPage.updating_progress', { done: updatingAll.done, total: updatingAll.total }) : i18nT('pages.appsPage.update_all')}
                   </Btn>
                 </div>
               )}

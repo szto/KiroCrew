@@ -45,7 +45,7 @@ files / uploads / artifacts / URLs
 | `FETCH_TIMEOUT` | `120.0` | `llm_pool.py`, `agent_fetch.py` | URL-fetch worker timeout |
 | `AGENT_NAME` | `"kirocrew-knowledge"` | `llm_pool.py` | kiro-cli agent the ACP worker drives |
 | `_VALID_SANDBOX_MODES` | `{auto, standard, strict, cc, off}` | `llm_pool.py` | Accepted `agent.sandbox` values |
-| `HARD_SKIP_DIRS` | `{.git, node_modules, __pycache__, .venv, venv}` | `folder_watcher.py` | Directories never walked |
+| `HARD_SKIP_DIRS` | `{.git, node_modules, __pycache__, .venv, venv, dist, build, out, target, cdk.out}` | `folder_watcher.py` | Directories never walked |
 | `_LARGE_REBUILD_WARN_THRESHOLD` | `1000` | `watcher.py` | Stale-item count at which the self-heal rebuild logs a prominent WARNING (usually an embedder-sig change invalidating the whole corpus) |
 | `DEFAULT_MAX_FILES` | `5000` | `folder_watcher.py` | Per-source file cap (newest-first) |
 | `CHUNK_TOKEN_SIZE` | `800` | `chunker.py` | Target chunk size (words) |
@@ -86,9 +86,15 @@ Base metadata always carries `format`, `title` (file stem), `file_size`, `extens
 `FolderWatcher.scan_source(source)` scans a folder-type source under a per-`source_id` `asyncio.Lock` (one scan per source at a time) and returns `{new, changed, deleted, skipped, capped, failed}`.
 
 **`_walk(root, ignore_patterns, extra_skip_dirs)`** (run via `asyncio.to_thread`) is the discovery step:
-- Prunes `HARD_SKIP_DIRS`, any per-source-type extra skip dirs (`SOURCE_TYPE_SKIP_DIRS["obsidian_vault"] = {.obsidian, .trash}`), and **all** dotfiles/dot-dirs in place during `os.walk`.
-- Skips OS junk/lock files by case-insensitive basename match against `DEFAULT_IGNORE_GLOBS` (macOS AppleDouble `._*`, `.ds_store`, Office `~$*`, LibreOffice `.~lock.*`, `thumbs.db`, `desktop.ini`, `*.tmp`, editor swap/backup, partial downloads). This exists because a discovered-but-unreadable file that carries a supported extension fails ingestion, is never auto-retried, and would otherwise leave a source permanently stalled below 100%.
+- Prunes `HARD_SKIP_DIRS`, any per-source-type extra skip dirs (`SOURCE_TYPE_SKIP_DIRS["obsidian_vault"] = {.obsidian, .trash}`), and **all** dotfiles/dot-dirs in place during `os.walk`. Build-output trees are in `HARD_SKIP_DIRS` because a rebuild presents hundreds of regenerated files as changed content; `cdk.out` (AWS CDK synth output) needs its own entry because its name only *contains* a dot, so the dot-prefix rule never prunes it.
+- Skips files that are never documents by case-insensitive basename match against `DEFAULT_IGNORE_GLOBS`. Two classes:
+  - OS junk / editor and Office lock files (macOS AppleDouble `._*`, `.ds_store`, Office `~$*`, LibreOffice `.~lock.*`, `thumbs.db`, `desktop.ini`, `*.tmp`, editor swap/backup, partial downloads). A discovered-but-unreadable file carrying a supported extension fails ingestion, is never auto-retried, and would leave a source permanently stalled below 100%.
+  - Dependency lock files (`package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `bun.lock`, `poetry.lock`, `uv.lock`, `pipfile.lock`, `cargo.lock`, `gemfile.lock`, `composer.lock`, `packages.lock.json`, `gradle.lockfile`, `flake.lock`). These ingest successfully, which is the problem: they are large machine-generated resolution output, each chunk costs one extraction call, and regenerating one bills it again on the next sweep.
 - Applies the source's `ignore_patterns` (fnmatch against the relative path).
+- **`.kiroignore` (`kiroignore.py`)**: when the SOURCE ROOT holds a `.kiroignore`, its rules are compiled once per sweep and applied on top of everything above. Matching **directories are pruned in place** during `os.walk`, so a generated tree (`cdk.out`, coverage output) is never descended rather than filtered file by file. The rule file itself is never indexed — its extensionless name is in `FileReader.SUPPORTED`, so it would otherwise be ingested as a document.
+  - Syntax is a documented SUBSET of gitignore: `#` comments, blank lines, trailing `/` (directories only), leading `/` (root-anchored), any other embedded `/` (also anchored; a separator-free pattern matches that basename at any depth), `*` / `?` / `**`, and `!` negation where the last matching rule wins. NOT supported: `[a-z]` character classes (brackets match literally), backslash escapes other than a leading `\#` / `\!`, nested `.kiroignore` files in subdirectories, and re-including a path underneath an excluded directory (as in git).
+  - **Defensive by contract**: the file is user-authored and re-read every sweep, so an unreadable, oversized (> `MAX_FILE_BYTES` = 64 KiB) or undecodable one degrades to "no extra exclusions" and never raises mid-scan; a single unusable pattern is dropped and the rest of the file still applies. Rules are capped at `MAX_RULES` = 1000.
+  - **`.gitignore` is deliberately NOT read as a fallback.** A scan treats a file that stops being discovered as DELETED and archives its items (`_handle_deleted`), so honouring `.gitignore` implicitly would, on the next sweep, drop already-indexed documents out of every existing folder source whose root happens to be a repository — including every auto-registered `project_docs.py` source. Creating a `.kiroignore` is an explicit act, so the same removal is the user's intent.
 - **Extension filter**: keeps a file only if its lower-cased suffix is in `FileReader.SUPPORTED` **or** equals `.canvas` (Obsidian canvas files).
 - **Sensitive-path guard**: resolves each candidate (`Path.resolve()`) and skips it if `is_sensitive_path()` matches.
 - Returns `[(full_path, mtime)]`.
@@ -100,7 +106,118 @@ Base metadata always carries `format`, `title` (file stem), `file_size`, `extens
 - Per-file state lives in the `folder_file_state` table with `status` ∈ `{done, scanning, skipped, failed, deduped}`. `scanning` is written **before** ingest so a crash mid-file is recoverable; `skipped`/`failed`/`deduped` files are not auto-retried (user must retry).
 - **TOCTOU defense**: `_ingest_file` re-resolves symlinks and re-checks `is_sensitive_path` at ingest time; a block writes `status='failed'` and emits an SEL `knowledge.source.file.ingest_denied` (`outcome="denied"`, `reason=sensitive_path_toctou`) audit event.
 - After a successful scan, each newly ingested/changed file gets a **targeted** cross-source dedup (`dedup_document(..., apply=True)`) — O(k·n) over the k changed files rather than a full O(n²) corpus sweep — so a folder copy collapses any matching one-shot upload.
-- **Aggregate sources are not dedup units.** Sources in `_AGGREGATE_SOURCE_TYPES` (currently `artifact` — one source holding many independent documents) are excluded from dedup at every layer: `enumerate_docs` skips them, `_build_doc_for` returns `None` for whole-source builds, and `_delete_doc` refuses a cascade delete on them. A whole-aggregate DocRef keyed on one item's `content_hash` misrepresents the collection, and losing a dedup pair used to cascade-delete the entire artifact library. Per-artifact-slug dedup is future work; until then artifact↔folder overlap is intentionally left in place.
+- **The dedup unit is always the DOCUMENT, never the source.** For a folder source a document is a `folder_file_state` row; for everything else it is one `content_hash` group of `items` (`enumerate_docs` groups by `(source_id, content_hash)`), so an aggregate source holding many documents (`artifact`, `agent`) dedups per document like any other. `_delete_doc` drops that document's items and marks its owning state row `deduped` so nothing re-ingests it; it removes the source row only once the source is provably empty (no items, no state rows, and not a folder/vault), which is what keeps a collapsed one-shot upload from lingering as an empty row. There is no source-level unit, so the former `_AGGREGATE_SOURCE_TYPES` carve-out — whose cost was that aggregate documents were never deduped at all — is gone.
+- **Scheduled sweeps.** `KnowledgeWatcher._maybe_dedup_sweep` runs a full `dedup_sweep` every `knowledge.dedup_every_n_sweeps` sweeps (default 12, ~hourly at the 300s interval; 0 disables). The targeted per-ingest call and the pre-ingest exact-hash gate cannot catch a near-duplicate or a pre-existing one, so the periodic pass is required for duplicates to actually be collapsed.
+- **One document, several locations.** A document held by two sources is ONE stored copy with a `source_locations` row per source, not two copies where one is destroyed. A collapse attaches the loser's source as a location of the winner's items, deletes the loser's redundant copy, and records `merged_into_source_id` on the loser's state row. Three consequences follow, and each closes a way the previous design lost data: `delete_source_cascade` re-points `items.source_id` to a surviving holder instead of deleting a document another source holds (`reassign_item_source` is the only path that moves ownership, since `_ITEM_COLUMNS` deliberately excludes the column); deleting the winner clears the marker so the document is ingested again rather than stranded; and "empty source" now means holding nothing by location either, in both the dedup check and the boot-time orphan sweep, because reaping a source would delete the very rows recording co-ownership. The marker names a SOURCE and never the winner's item ids: `item_ids` means "the items this row owns", and dedup derives a document's hash and embedding from whatever it points at, so a row naming the winner's items would be enumerated as a second document over one physical item set — and collapsing that pair deletes the surviving copy. `_match_reason` refuses any pair whose `item_ids` overlap for the same reason. Per-source counts report what a source HOLDS, while the Library total counts documents, so a shared document is visible under both sources without inflating the total.
+
+- **Pre-ingest duplicate gate.** `IngestionPipeline._skip_as_duplicate` refuses a write whose whole-text `content_hash` already exists in another source, on every ingest path, recording a terminal `ingestion_jobs` row with `status='skipped_duplicate'`. Refusing is not the same as doing nothing: the items the call was going to REPLACE are deleted first, because the document's content changed to something already stored elsewhere and its previous items are now superseded. Leaving them would keep the old text searchable and — since the state row is then recorded with an empty group — unreachable by the deleted-file path. A folder file refused this way is marked `deduped` rather than `done`; an artifact or agent document gets the same marker in its item-state row so the owning sync does not retry a write the gate will refuse again. The gate is not order-blind: it consults the same `PERSISTENT_SOURCE_TYPES` ranking `pick_winner` uses, so an incoming **persistent** source (folder / vault / wiki) is allowed to land when the current holder is **transient** (a one-shot upload or chat capture), and the post-ingest sweep then collapses the pair keeping the persistent copy. Refusing on arrival order alone inverted that ranking: the folder copy was marked `deduped`, the only searchable copy stayed inside the upload, and deleting the upload left none. Equal rank still refuses, which is the cheap path — it skips the chunking and extraction the sweep would immediately undo. Exact-hash only — the fuzzy tier needs embeddings and cannot run inline.
+- **Legacy items with a null `content_hash` are not exact-matchable.** The column arrived by `ALTER TABLE`, so rows written before it are null, and tier-1 requires both sides non-null — on a real Library that was 435 of 526 folder items. Those documents reach de-duplication only through the filename+embedding tier. Backfilling is NOT done here: the extracted text is not retained, so the pipeline's hash cannot be reproduced, and any derived value has to be grouped per DOCUMENT (`folder_file_state` / item-state rows) rather than per source — grouping by source gives every file in a folder one identical key, which the sweep then reads as an exact match and collapses. What IS enforced is that every ingest path stamps the column, asserted by test, so the gap cannot grow.
+
+## 2b. Automatic write paths (`doc_filter.py`, `project_docs.py`, `agent_source.py`)
+
+Two automatic paths add documents without the user registering a source by hand. Both
+are on by default, both are user-disableable, and both are bounded by the same two
+mechanisms: a document filter that bounds WHAT is taken, and a per-sweep chunk budget
+that bounds what it COSTS. File filters control pollution; only the chunk budget
+controls spend, because a handful of large documents dominates the chunk count.
+
+**The document rule (`doc_filter.py`).** Auto-add prose written for HUMANS about
+intent, decisions, and how things work; exclude prose written for AGENTS, generated
+files, and machine-readable lists. Expressed as the `properties` a folder source
+already understands — `include_extensions` (`.md .pdf .docx .org`; `.txt` is excluded
+because inside a repository it is nearly always a list), `ignore_patterns`,
+`extra_skip_dirs`, `min_file_bytes` (2048) — so the ordinary scan path applies it with
+no special casing. `should_ingest_doc` is the same rule as a callable predicate, pinned
+against `_walk` by a test so the two cannot drift.
+
+Repository boilerplate (`AGENTS.md`, `SECURITY.md`, `LICENSE*`, …) is denied
+**root-anchored**: the patterns match against the path relative to the project root and
+carry no separator, so they can only match a top-level path. Matching them as bare
+basenames at any depth destroys real documents — measured deleting
+`docs/kiro-cli/mcp/security.md` and `docs/system-specs/modules/security.md`. This is the
+single most likely way to ship a silently-wrong filter.
+
+**Project documents (`project_docs.py`).** Each live chat slot's project dir resolves to
+its nearest `.git` ancestor and is registered as an `active` `local_folder` source
+carrying the document filter. Deliberately NOT the recent-projects list — that includes
+directories the user merely picked once. A repo root that resolves to the user's home
+directory is refused: a dotfiles repo in `$HOME` would otherwise make any project dir
+under it register the whole home directory.
+
+No confirmation step. The manual folder-add path uses `pending_confirmation` because an
+unfiltered folder walk is unbounded; the filter plus the budget makes it bounded, so the
+gate is unnecessary rather than skipped. Dismissal is after-the-fact instead: deleting
+the source writes a `dismissed_auto_sources` tombstone that survives the delete.
+
+Containment is re-validated every sweep, but on a different invariant from the drop
+folder: a project repo root lives OUTSIDE the workspace by design, so
+`project_source_still_valid` checks that the recorded path still resolves to itself (it
+did at registration, so a divergence means the directory was swapped for a link
+elsewhere) and is still a non-sensitive directory. Applying workspace containment to
+both would skip every project source with a `denied` audit event.
+
+Containment also applies per FILE, via the `confine_to_root` source property: a file
+whose resolved path lands outside the registered root is skipped. `os.walk` does not
+descend a directory symlink, but a file symlink IS followed on open, so a repository
+containing `docs/runbook.md -> ../../private/runbook.md` would otherwise get that
+external file indexed and LLM-extracted. The property is off for a folder the user
+registered by hand -- following a link they placed there is their choice -- and on for
+an auto-registered source, where nobody confirmed the scope.
+
+**Agent-added documents (`agent_source.py`).** The `knowledge_add_document` MCP tool
+lands documents in one aggregate `agent://` source named "Auto-added", with per-document
+groups in `agent_item_state` keyed by a slug derived from the document's `source_uri` and
+never from its content, so an edit replaces the group rather than accumulating copies. The
+identity must not be the title alone: two unrelated documents are both routinely called
+"README", and since a matching key means "same document, replace it", a title-keyed group
+lets the second add delete the first document's items. It routes
+through `IngestionPipeline.ingest_file` — one ingestion path — and content and title are
+redacted before they cross into the store. Adds are serialised by a module lock, because
+new items are attributed to a document by diffing the source's item ids around the
+ingest.
+
+The tool takes the document TEXT and **never opens a file**. A path opened here on
+behalf of whatever supplied it is exactly the case where a component can be swapped for a
+link to a credential file between the check and the open, and a path pointing at a binary
+crashes the decode. Text the agent has already read carries no such window: it was read
+through the agent's own file tools, under their approval and audit. Documents that
+arrive fetched are text to begin with, and documents in the user's project are covered
+by project-docs registration, which scans through the guarded folder path.
+
+`source_uri` is an **opaque identity label**, not a read instruction: it is redacted,
+capped, stored and hashed, and never opened, resolved, stat-ed or fetched. It is
+**required**, because a title does not identify a document. The identity is hashed from
+the RAW uri while only the redacted form is stored or audited — redaction is lossy, so two
+uris differing only in a same-length credential-shaped segment reduce to the same string,
+and hashing that would merge two documents into one group. A caller needing the bytes at
+that location reads them itself and passes `content`.
+
+This replaces the never-built server-side doc-link scanner. Rather than Kiro Crew
+regex-matching links in chat and fetching them unattended, the agent reads the document
+with its own tools under its own approval and hands over text. Kiro Crew fetches nothing,
+so `knowledge.doc_ingest_hosts` — whose default is `[]` = deny-all — must NOT gate this
+path, or the feature would ingest nothing on a default config while its toggle read on.
+
+**Chunk budget.** `folder_watcher._do_scan` orders discovered files newest-first
+unconditionally and stops once a sweep has ingested its budget of chunks. Files not
+reached keep (or lack) their `folder_file_state` row, so the next sweep resumes from
+them — the existing `status` column already carries the resume point. Every folder
+source is budgeted: `knowledge.auto_ingest_chunk_budget` for an auto-registered one,
+`knowledge.folder_ingest_chunk_budget` (resolved by `folder_watcher.folder_chunk_budget`,
+overridable per source via a `chunk_budget` property, 0 = unbounded) for one the user
+added by hand. A hand-added folder still gets ingested in full; the budget only decides
+how fast. It applies to the confirm- and resume-triggered scans as well as the sweep,
+because the confirm scan is the largest burst — nothing is ingested yet, so every
+discovered file is new.
+
+**Cost visibility.** `POST /api/knowledge/sources` walks a folder before ingesting
+anything and returns `file_count`, `capped_file_count`, `estimated_chunks`,
+`estimated_llm_calls` and `chunk_budget_per_sweep` alongside the
+`pending_confirmation` status. The walk uses `folder_watcher.walk_filters`, the same
+filter set the sweep applies, so the count describes the files that would actually be
+ingested. The chunk figure is derived from the chunker's target size and file bytes
+(`_estimated_chunks`), never measured: it exists to show order of magnitude before the
+user confirms, and no code path treats it as a bound.
 
 ## 3. LLMPool workers (`llm_pool.py`)
 

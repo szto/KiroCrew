@@ -1,7 +1,9 @@
+import { Fragment, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Plus, X, Zap } from 'lucide-react'
 import type { ChatTag } from '../types'
 import { api } from '../api/client'
+import { FOLDER_COLOR_PALETTE } from './folderColorCatalog'
 
 import { i18nT } from '../i18n/t'
 export interface TagManagerListProps {
@@ -37,6 +39,8 @@ export interface TagManagerListProps {
 export default function TagManagerList({ mode, selectedIds = [], onToggleTag, createTestId = 'tag-create' }: TagManagerListProps) {
   const queryClient = useQueryClient()
   const { data: tags = [] } = useQuery<ChatTag[]>({ queryKey: ['chat-tags'], queryFn: () => api.chatTags() })
+  /** Tag id whose inline colour palette is expanded (manage mode only). */
+  const [openColorId, setOpenColorId] = useState<string | null>(null)
 
   const createTagMutation = useMutation({
     mutationFn: ({ name, color, status }: { name: string; color?: string; status?: boolean }) => api.createChatTag(name, color, status),
@@ -64,21 +68,30 @@ export default function TagManagerList({ mode, selectedIds = [], onToggleTag, cr
           const on = mode === 'column-filter' && selectedIds.includes(t.id)
           const nextIds = on ? selectedIds.filter(x => x !== t.id) : [...selectedIds, t.id]
           return (
-            <div key={t.id} data-testid={`tag-row-${t.id}`} className={`group/tag flex items-center gap-1.5 px-1.5 py-1 rounded transition-all ${on ? 'bg-accent-subtle' : 'hover:bg-bg-hover'}`}>
+            <Fragment key={t.id}>
+            <div data-testid={`tag-row-${t.id}`} className={`group/tag flex items-center gap-1.5 px-1.5 py-1 rounded transition-all ${on ? 'bg-accent-subtle' : 'hover:bg-bg-hover'}`}>
               {mode === 'column-filter' ? (
                 /* Filter toggle — the colour swatch is the click target. role=checkbox
                  *  (not menuitemcheckbox) because the row lives in a form popover, not a
                  *  menu: a native <button> is Tab-reachable and Space/Enter-operable, and
                  *  the owning popover owns focus/Escape (no orphan menuitem ARIA). */
-                <button type="button" role="checkbox" aria-checked={on} aria-label={`Include ${t.name} in filter`}
+                <button type="button" role="checkbox" aria-checked={on} aria-label={i18nT('components.tagManagerList.include_in_filter', { name: t.name })}
                   className="w-4 h-4 rounded-sm border border-border shrink-0 cursor-pointer relative outline-none focus-visible:ring-2 focus-visible:ring-accent"
                   style={{ background: t.color }}
                   onClick={() => onToggleTag?.(t.id, nextIds)}>
                   {on && <span className="absolute inset-0 flex items-center justify-center" style={{ color: t.color === '#ffffff' ? '#000' : '#fff' }}><Check size={10} /></span>}
                 </button>
               ) : (
-                /* Manage mode — static colour chip, no filter semantics */
-                <span className="w-4 h-4 rounded-sm border border-border shrink-0" style={{ background: t.color }} aria-hidden />
+                /* Manage mode — the swatch is a button that expands an inline
+                 *  colour palette row beneath the tag (backend PATCH already
+                 *  supports recolor; this is its first UI surface). */
+                <button type="button" data-testid={`tag-color-${t.id}`}
+                  aria-expanded={openColorId === t.id}
+                  aria-label={i18nT('components.tagManagerList.change_color', { name: t.name })}
+                  title={i18nT('components.tagManagerList.change_color', { name: t.name })}
+                  className="w-4 h-4 rounded-sm border border-border shrink-0 cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                  style={{ background: t.color }}
+                  onClick={() => setOpenColorId(cur => (cur === t.id ? null : t.id))} />
               )}
               {/* Inline rename */}
               {/* key={t.name} remounts the uncontrolled input when the canonical
@@ -89,7 +102,7 @@ export default function TagManagerList({ mode, selectedIds = [], onToggleTag, cr
                 key={t.name}
                 type="text"
                 data-testid={`tag-name-${t.id}`}
-                aria-label={`Rename tag ${t.name}`}
+                aria-label={i18nT('components.tagManagerList.rename_tag', { name: t.name })}
                 defaultValue={t.name}
                 className="flex-1 min-w-0 bg-transparent border-none outline-none text-[12px] text-text py-0 px-0.5 rounded focus:bg-bg-elevated focus:border focus:border-accent/50"
                 onBlur={e => { const v = e.target.value.trim(); if (!v) { e.target.value = t.name; return } if (v !== t.name) updateTagMutation.mutate({ id: t.id, body: { name: v } }) }}
@@ -112,19 +125,59 @@ export default function TagManagerList({ mode, selectedIds = [], onToggleTag, cr
                 className={`shrink-0 cursor-pointer bg-transparent border-none p-[2px] transition-all outline-none focus-visible:ring-1 focus-visible:ring-accent ${t.status ? 'text-accent hover:text-accent-hover' : 'text-transparent group-hover/tag:text-muted focus-visible:!text-muted hover:!text-text'}`}
                 title={t.status ? i18nT('components.tagManagerList.status_tag_mutually_exclusive_on_cards_click_to') : i18nT('components.tagManagerList.make_status_tag')}
                 aria-pressed={!!t.status}
-                aria-label={t.status ? `Remove status flag from ${t.name}` : `Make ${t.name} a status tag`}
+                aria-label={t.status ? i18nT('components.tagManagerList.remove_status_flag_from', { name: t.name }) : i18nT('components.tagManagerList.make_a_status_tag', { name: t.name })}
                 onClick={() => updateTagMutation.mutate({ id: t.id, body: { status: !t.status } })}>
                 <Zap size={11} fill={t.status ? 'currentColor' : 'none'} />
               </button>
               {/* Delete */}
               <button type="button" data-testid={`tag-delete-${t.id}`}
                 className="shrink-0 cursor-pointer bg-transparent border-none p-[2px] text-transparent group-hover/tag:text-muted focus-visible:!text-muted hover:!text-danger transition-all outline-none focus-visible:ring-1 focus-visible:ring-accent"
-                title={`Delete tag "${t.name}"`}
-                aria-label={`Delete tag ${t.name}`}
+                title={i18nT('components.tagManagerList.delete_tag', { name: t.name })}
+                aria-label={i18nT('components.tagManagerList.delete_tag_2', { name: t.name })}
                 onClick={() => { if (confirm(`Delete tag "${t.name}"?`)) deleteTagMutation.mutate(t.id) }}>
                 <X size={11} />
               </button>
             </div>
+            {/* Inline colour palette — expanded by the manage-mode swatch. Reuses
+              *  the folder palette so tags and folders speak one visual language.
+              *  Picking a colour PATCHes the tag and returns focus to the swatch
+              *  (the palette unmounts, so focus would otherwise fall to <body>). */}
+            {mode === 'manage' && openColorId === t.id && (
+              <div
+                role="group"
+                data-testid={`tag-palette-${t.id}`}
+                aria-label={i18nT('components.tagManagerList.change_color', { name: t.name })}
+                className="flex items-center gap-1 flex-wrap pl-7 pr-1.5 pb-1"
+                onKeyDown={e => {
+                  if (e.key !== 'Escape') return
+                  e.stopPropagation()
+                  setOpenColorId(null)
+                  document.querySelector<HTMLElement>(`[data-testid="tag-color-${t.id}"]`)?.focus()
+                }}
+              >
+                {FOLDER_COLOR_PALETTE.map(({ value, label }) => {
+                  const colorName = label()
+                  return (
+                    <button
+                      key={value}
+                      type="button"
+                      data-testid={`tag-color-${t.id}-${value.slice(1)}`}
+                      title={i18nT('components.tagManagerList.set_color_to_name', { name: colorName })}
+                      aria-label={i18nT('components.tagManagerList.set_color_to_name', { name: colorName })}
+                      aria-pressed={t.color === value}
+                      className={`w-4 h-4 rounded-full cursor-pointer border transition-transform hover:scale-110 outline-none focus-visible:ring-2 focus-visible:ring-accent ${t.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                      style={{ background: `color-mix(in srgb, ${value} 30%, var(--bg-elevated))`, borderColor: value }}
+                      onClick={() => {
+                        updateTagMutation.mutate({ id: t.id, body: { color: value } })
+                        setOpenColorId(null)
+                        document.querySelector<HTMLElement>(`[data-testid="tag-color-${t.id}"]`)?.focus()
+                      }}
+                    />
+                  )
+                })}
+              </div>
+            )}
+            </Fragment>
           )
         })}
       </div>

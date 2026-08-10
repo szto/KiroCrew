@@ -69,6 +69,19 @@ describe('ToolCallLine simplifiedToolNames', () => {
 })
 
 describe('ToolCallLine inline expansion', () => {
+  it('shows an indeterminate activity status for a running shell tool', () => {
+    const store = createTestStore({
+      chat: {
+        messages: [toolMsg()],
+        toolLog: [{ type: 'tool', text: 'echo hello', tool_call_id: 'tc_1', is_shell: true, ts: 1 }],
+        slotRunning: true,
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<ToolCallLine message={toolMsg()} running />, { store })
+    expect(screen.getByText(/Running ·/)).toBeTruthy()
+    expect(screen.getByLabelText('Show details for tool: Running: echo hello')).toBeTruthy()
+  })
+
   it('starts collapsed and expands on click, defaulting to Output section', () => {
     const store = createTestStore({
       chat: {
@@ -479,5 +492,77 @@ describe('ToolCallLine MCP app side-panel placeholder', () => {
       { store: appStore() },
     )
     expect(screen.queryByRole('button', { name: /side.?panel/i })).toBeNull()
+  })
+})
+
+describe('ToolCallLine auto-denied detection', () => {
+  // The gateway appends a hidden "🚫 <title> — <reason>" tool message sharing
+  // the visible 🔧 pill's tool_call_id when a security-policy deny rule or
+  // hook blocks a call. The pill must find that sibling and render amber
+  // (warn) instead of the green success state.
+  it('renders warn tone and a standard blocked message when a 🚫 sibling shares the tool_call_id', () => {
+    const pill = toolMsg({ meta: { tool_call_id: 'tc_deny' } })
+    const denySibling: ChatMessage = {
+      role: 'tool',
+      content: '🚫 shell — Blocked by security policy: deny rule',
+      cls: 'msg msg-tool',
+      meta: { tool_call_id: 'tc_deny' },
+    }
+    const store = createTestStore({
+      chat: {
+        messages: [pill, denySibling],
+        toolLog: [{ type: 'tool', text: 'kirocrew token', tool_call_id: 'tc_deny', output: 'User denied tool execution', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    const { container } = renderWithProviders(<ToolCallLine message={pill} running={false} />, { store })
+    // Amber slash icon, not the green success dot
+    expect(container.querySelector('.text-warn')).toBeTruthy()
+    expect(container.querySelector('.text-ok')).toBeFalsy()
+    // Expanded output shows the standard blocked message — the 🚫 sibling's
+    // content is a redacted title (often just "shell"), not a usable reason —
+    // and never kiro-cli's misleading boilerplate.
+    fireEvent.click(screen.getByRole('button', { name: /show details/i }))
+    expect(screen.getByText('Blocked by security policy')).toBeTruthy()
+    expect(screen.queryByText('User denied tool execution')).toBeFalsy()
+  })
+
+  it('keeps the green success state when no 🚫 sibling exists', () => {
+    const store = createTestStore({
+      chat: {
+        messages: [toolMsg()],
+        toolLog: [{ type: 'tool', text: 'echo hello', tool_call_id: 'tc_1', output: 'hello', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    const { container } = renderWithProviders(<ToolCallLine message={toolMsg()} running={false} />, { store })
+    expect(container.querySelector('.text-ok')).toBeTruthy()
+    expect(container.querySelector('.text-warn')).toBeFalsy()
+  })
+
+  it('user rejection (resolved permission) stays red even with a 🚫 sibling', () => {
+    const pill = toolMsg({ meta: { tool_call_id: 'tc_userreject' } })
+    const denySibling: ChatMessage = {
+      role: 'tool',
+      content: '🚫 Running: rm file (rejected)',
+      cls: 'msg msg-tool',
+      meta: { tool_call_id: 'tc_userreject' },
+    }
+    const perm: ChatMessage = {
+      role: 'permission',
+      content: 'Running: rm file',
+      cls: '',
+      meta: { tool_call_id: 'tc_userreject', resolved: 'rejected' },
+    }
+    const store = createTestStore({
+      chat: {
+        messages: [pill, perm, denySibling],
+        toolLog: [{ type: 'tool', text: 'rm file', tool_call_id: 'tc_userreject', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    const { container } = renderWithProviders(<ToolCallLine message={pill} running={false} />, { store })
+    expect(container.querySelector('.text-danger')).toBeTruthy()
+    expect(container.querySelector('.text-warn')).toBeFalsy()
   })
 })

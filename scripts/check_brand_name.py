@@ -41,6 +41,7 @@ sparingly: it is unscoped and silences the whole line.
 from __future__ import annotations
 
 import bisect
+import math
 import os
 import re
 import subprocess
@@ -50,6 +51,28 @@ from dataclasses import dataclass
 from typing import Iterable, Iterator
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Self-test timing budget for the growth-ratio check. It divides two measured
+# durations, so it is only as trustworthy as the smaller one: pair each baseline
+# with its own doubled sample and keep the least noisy RATIO, then refuse to
+# judge one whose baseline is too small to measure. The floor sits above the
+# ~15.625ms granularity Windows reports process CPU time at, so a coarse clock
+# cannot on its own manufacture a regression.
+_PERF_ATTEMPTS = 5
+_PERF_MIN_BASE_SECS = 0.020
+
+# Baseline workloads, tried in order until one produces a measurable baseline.
+# A single fixed size cannot serve both ends of the hardware range: 20k costs a
+# fast machine ~19-21ms, which straddles the floor above, so the ratio went
+# UNJUDGED on a large fraction of runs -- the check reported `ok` while testing
+# nothing. Growing the workload buys a measurable baseline instead of abandoning
+# the check.
+#
+# Escalating is close to free because a REGRESSED scan never reaches it: its
+# baseline is ~25x the linear one, so it clears the floor at the first size and
+# is judged there. Only linear scans -- the fast case -- ever pay for a larger
+# size, and a slow runner clears the floor at 20k and pays nothing at all.
+_PERF_BASE_SIZES = (20_000, 50_000, 120_000)
 
 # ---------------------------------------------------------------------------
 # What counts as a misspelling
@@ -608,25 +631,84 @@ def self_test() -> int:
     # prefix. The assertion is on the GROWTH RATIO, not a wall-clock budget: an
     # absolute threshold generous enough for a loaded CI runner is also generous
     # enough to let a quadratic implementation pass at this size.
-    def timed(count: int) -> tuple[float, int]:
-        line = "!KiroCrew" * count
-        began = time.monotonic()
-        found = len(list(scan_line("big.md", 1, line, in_code=False)))
-        return time.monotonic() - began, found
+    #
+    # Measuring a ratio puts the whole burden on the timer, and the original
+    # form (one `time.monotonic()` sample per size) had two independent ways to
+    # report a regression that was not there. It was the single largest source
+    # of Windows CI flakes:
+    #
+    # * WRONG CLOCK. `time.monotonic()` is `GetTickCount64()` on Windows, a
+    #   ~15.625ms tick. The base scan costs ~60ms there, so a sample was only
+    #   ~4 ticks wide and quantisation ALONE moved the ratio ~25%. Every
+    #   observed failure reported times that were exact multiples of 15.625ms
+    #   (0.047/0.062/0.109 -> 0.156/0.188/0.203).
+    # * WALL CLOCK AT ALL. Four xdist workers on a 4-vCPU runner means the
+    #   timed region gets descheduled, and the LONGER scan absorbs more
+    #   preemption than the shorter one -- which inflates the ratio
+    #   systematically rather than symmetrically. Taking the best of several
+    #   wall-clock samples does NOT fix this (measured: it made linear scans
+    #   breach 3.0x MORE often, because the shorter scan cleans up better).
+    #
+    # So measure CPU time, which simply does not advance while the thread is
+    # off-CPU, and pair each baseline with its own doubled sample so the two
+    # halves of a ratio always come from the same conditions. Measured under 2x
+    # CPU oversubscription: a linear scan stays at most 2.02x (never breaching)
+    # while a deliberately quadratic one never drops below 3.88x, so this keeps
+    # every bit of the check's teeth. `process_time` is also coarse on Windows,
+    # so the floor below still applies.
+    def ratio_of(base: int) -> tuple[float, float, int, int]:
+        """Best (least noisy) doubled/base CPU-time ratio over several attempts."""
+        best = math.inf
+        best_pair = (0.0, 0.0)
+        found: tuple[int, int] = (0, 0)
 
-    base_time, base_found = timed(20_000)
-    doubled_time, doubled_found = timed(40_000)
-    ratio = doubled_time / base_time if base_time > 0 else 0.0
-    if (base_found, doubled_found) != (20_000, 40_000):
-        print(f"  FAIL repeated-brands: found {base_found}/{doubled_found}, want 20000/40000")
+        def once(count: int) -> tuple[float, int]:
+            began = time.process_time()
+            hits = len(list(scan_line("big.md", 1, "!KiroCrew" * count, in_code=False)))
+            return time.process_time() - began, hits
+
+        for _ in range(_PERF_ATTEMPTS):
+            base_time, base_hits = once(base)
+            doubled_time, doubled_hits = once(base * 2)
+            found = (base_hits, doubled_hits)
+            if base_time <= 0.0:
+                continue
+            candidate = doubled_time / base_time
+            if candidate < best:
+                best, best_pair = candidate, (base_time, doubled_time)
+        return (0.0 if best is math.inf else best), best_pair[0], found[0], found[1]
+
+    # Grow the workload until the baseline is big enough to divide. `ratio_of`
+    # is only called again when the previous size came in under the floor, so
+    # the common cases cost exactly one call.
+    base_count = 0
+    ratio = base_time = 0.0
+    base_found = doubled_found = 0
+    for base_count in _PERF_BASE_SIZES:
+        ratio, base_time, base_found, doubled_found = ratio_of(base_count)
+        if base_time >= _PERF_MIN_BASE_SECS:
+            break
+
+    if (base_found, doubled_found) != (base_count, base_count * 2):
+        print(f"  FAIL repeated-brands: found {base_found}/{doubled_found}, "
+              f"want {base_count}/{base_count * 2}")
         failures += 1
+    elif base_time < _PERF_MIN_BASE_SECS:
+        # Even the largest workload was too fast to measure. Quadratic growth at
+        # that size costs orders of magnitude more than the floor, so this cannot
+        # be hiding a regression -- report the fact rather than dividing noise by
+        # noise.
+        print(f"  ok   repeated-brands (baseline {base_time * 1000:.1f}ms at {base_count} "
+              f"brands still below the {_PERF_MIN_BASE_SECS * 1000:.0f}ms measurement "
+              f"floor; ratio not judged)")
     elif ratio > 3.0:
-        print(f"  FAIL repeated-brands: doubling the input cost {ratio:.1f}x "
-              f"({base_time:.3f}s -> {doubled_time:.3f}s); linear is ~2x, so a "
-              f"per-match scan of the line has come back")
+        print(f"  FAIL repeated-brands: doubling the input cost {ratio:.1f}x CPU time "
+              f"(best of {_PERF_ATTEMPTS}, baseline {base_time:.3f}s at {base_count} "
+              f"brands); linear is ~2x, so a per-match scan of the line has come back")
         failures += 1
     else:
-        print(f"  ok   repeated-brands (doubling cost {ratio:.1f}x, linear)")
+        print(f"  ok   repeated-brands (doubling cost {ratio:.1f}x at {base_count} "
+              f"brands, linear)")
 
     # A wider fence is not closed by a narrower run inside it, so a doc can quote
     # a fenced example without exposing its contents as prose.

@@ -96,9 +96,9 @@ describe('DisplayPanel — language picker Auto row', () => {
 
   it('falls back to the default language when the browser matches nothing', () => {
     localStorage.setItem(LANG_STORAGE_KEY, 'zh-CN')
-    // `ja-JP` is deliberately a language we do NOT ship — a shippable tag makes
-    // this assert the opposite of its name once that language lands.
-    vi.spyOn(navigator, 'languages', 'get').mockReturnValue(['ja-JP'])
+    // Klingon is deliberately not a product locale. A plausible future language
+    // would make this assert the opposite of its name when its catalog lands.
+    vi.spyOn(navigator, 'languages', 'get').mockReturnValue(['tlh-US'])
 
     renderWithProviders(<DisplayPanel />)
 
@@ -106,6 +106,19 @@ describe('DisplayPanel — language picker Auto row', () => {
     expect(text).toContain('English')
     expect(text).not.toContain('简体中文')
   })
+
+  // The endonym, not the English name: a user looking for Korean scans for
+  // 한국어. `languages.ts` is the only place these strings live, so a language
+  // registered there and missing from the picker fails here.
+  it.each([['Japanese', '日本語'], ['Korean', '한국어']])(
+    'offers %s as a display language',
+    (_language, endonym) => {
+      renderWithProviders(<DisplayPanel />)
+
+      fireEvent.click(screen.getByRole('combobox', { name: 'Language' }))
+      expect(screen.getByRole('option', { name: endonym })).toBeInTheDocument()
+    },
+  )
 })
 
 describe('DisplayPanel — zoom level description', () => {

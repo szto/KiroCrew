@@ -1,6 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, memo } from 'react'
-import { ArrowUpFromLine, ArrowUp, Loader2, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Globe, FolderOpen, FileText, ChevronDown, Check } from 'lucide-react'
-import { Toggle } from './ui'
+import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, ChevronDown, Check } from 'lucide-react'
 import CopyBranchButton from './CopyBranchButton'
 import { usePointerDrag } from '../hooks/usePointerDrag'
 import VoiceStatusBar from './VoiceStatusBar'
@@ -72,17 +71,23 @@ export {
 import { effortLabel } from '../lib/effort'
 import SlashCommandMenu from './SlashCommandMenu'
 import FilePickerMenu from './FilePickerMenu'
+import type { FileKind } from './FilePickerMenu'
 import SkillPickerMenu from './SkillPickerMenu'
 import { matchFileToken, matchSkillToken, replaceTokenAtCaret } from './composerTokens'
 import { useStopEscapeHatch } from '../hooks/useStopEscapeHatch'
 
 import { i18nT } from '../i18n/t'
 import { fmtDateFields } from '../i18n/format'
+import SessionRefStrip from './SessionRefStrip'
+import type { SessionRef } from '../utils/sessionRefs'
 const INPUT_MIN_H = 44
 const INPUT_DEFAULT_MAX_H = 140
 const INPUT_PREFILL_MAX_H = 320
 const INPUT_DRAG_MIN_H = 93
 const FILE_PREVIEW_H = 81 // h-16 (64px) + py-2 (16px) + border-t (1px)
+/** Height of the staged-session-reference strip: one chip row (py-1 + 12px text
+ *  ≈ 26px) + py-2 (16px) + border-t (1px). Keep in sync with SessionRefStrip. */
+const SESSION_REF_STRIP_H = 43
 const INPUT_DRAG_MAX_RATIO = 0.5
 const INPUT_HEIGHT_LS_KEY = 'mc-input-height'
 
@@ -242,10 +247,20 @@ interface ChatInputProps {
   uploading?: boolean
   /** Pending file paths (images + non-images) for preview strip */
   pendingFiles?: string[]
+  /** Pending directory references for the preview strip (path handed to the agent, not an upload) */
+  pendingDirs?: string[]
   /** Resize details keyed by pending-file path; renders a badge on the chip */
   resizedInfo?: Record<string, ResizeInfo>
   /** Remove a pending file by path */
   onRemoveFile?: (path: string) => void
+  /** Remove a pending directory reference by path */
+  onRemoveDir?: (path: string) => void
+  /** Session references staged by dragging a session onto the chat pane.
+   *  Rendered as chips above the textarea, the same treatment as attachments.
+   *  Serialized as links (never transcripts) when the message is sent. */
+  pendingSessions?: SessionRef[]
+  /** Unstage a session reference by its session key */
+  onRemoveSessionRef?: (key: string) => void
   /** Show macOS-only buttons (screenshot) */
   isMac?: boolean
   /** Drag-and-drop handler for the entire input bar */
@@ -300,13 +315,38 @@ interface ChatInputProps {
   showContextPct?: boolean
   isRunning?: boolean
   onStop?: () => void
+  /**
+   * True when an EMPTY composer can hand the thread back to the agent, so the
+   * dead send button becomes a Continue control instead. Offered on any idle
+   * slot with a conversation — a force-quit leaves no trace of the turn it
+   * killed, so restricting this to visibly-broken transcripts would miss exactly
+   * the case that needs it most.
+   */
+  continuable?: boolean
+  /**
+   * True when the transcript SHOWS the last turn ending badly (unanswered user
+   * row, or a trailing error). Picks between "the last turn was interrupted" and
+   * the neutral "keep going" wording, so the button never asserts a breakage it
+   * cannot see. NOT copy-only any more: `ChatPage` composes this into the
+   * `continuable` it passes, so on the dashboard it also decides whether the
+   * control appears at all. A caller may still pass `continuable` alone — the
+   * component keeps working, it just gets the neutral wording.
+   */
+  continueIsRecovery?: boolean
+  onContinue?: () => void
+  /** True while a continue request is in flight. */
+  continuing?: boolean
   isQueued?: boolean
   stopState?: 'idle' | 'soft_pending' | 'killing'
   approvalMode?: string
   reasoningEffort?: string
   onReasoningEffortClick?: (rect: DOMRect) => void
   providerId?: string
-  onFileSelect?: (path: string) => void
+  /** Invoked when an @-mention picks a file or directory. `kind` defaults to
+   *  'file'. `token` is the exact composer text the pick inserted (e.g.
+   *  "@src/pages/"), computed against the picker's search root — the staging
+   *  side records it so a later chip-remove can strip precisely this token. */
+  onFileSelect?: (path: string, kind?: FileKind, token?: string) => void
   onFileOpen?: (path: string) => void
   project?: string
   /** Checked-out branch of the active project (or short SHA when detached). */
@@ -344,9 +384,6 @@ interface ChatInputProps {
   knowledgeChip?: React.ReactNode
   /** When this key changes, focus the textarea (e.g. on chat session switch). */
   autoFocusKey?: string | null
-  /** Browse mode — when true, [BROWSE] prefix is prepended to sent messages */
-  browseMode?: boolean
-  onBrowseToggle?: () => void
   /** Gateway WebSocket connection state. When false, send is blocked and a
    *  warning banner appears above the input. Defaults to true so callers that
    *  don't track connectivity (e.g. tests, embedded previews) keep working. */
@@ -376,7 +413,7 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
       <span
         ref={ref}
         tabIndex={0}
-        aria-label={`Resized to fit model limits: ${resize.fromW}×${resize.fromH} to ${resize.toW}×${resize.toH}`}
+        aria-label={i18nT('components.chatInput.resized_to_fit_model_limits_2', { fromW: resize.fromW, fromH: resize.fromH, toW: resize.toW, toH: resize.toH })}
         className="absolute bottom-1 left-1 z-10 px-1.5 py-[1px] rounded-full text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default"
         onMouseEnter={show} onMouseLeave={hide} onFocus={show} onBlur={hide}
       >{i18nT('components.chatInput.resized')}</span>
@@ -395,10 +432,10 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
   )
 }
 
-function FilePreviewStrip({ files, resizedInfo, onRemove }: { files: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void }) {
+function FilePreviewStrip({ files, dirs = [], resizedInfo, onRemove, onRemoveDir }: { files: string[]; dirs?: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void; onRemoveDir?: (path: string) => void }) {
   const imgs = files.filter(p => IMG_EXT.test(p))
   const nonImgs = files.filter(p => !IMG_EXT.test(p))
-  if (!imgs.length && !nonImgs.length) return null
+  if (!imgs.length && !nonImgs.length && !dirs.length) return null
   return (
     // NOTE: rendered height must match FILE_PREVIEW_H constant, update both together
     <div className="flex gap-2 px-5 py-2 border-t border-border bg-chrome/50 overflow-x-auto items-end" data-image-scope="">
@@ -410,7 +447,7 @@ function FilePreviewStrip({ files, resizedInfo, onRemove }: { files: string[]; r
             <span className="absolute -top-1.5 -left-1.5 w-5 h-5 rounded-full bg-accent text-accent-fg text-[10px] font-bold flex items-center justify-center z-10">{i + 1}</span>
             <button
               type="button"
-              aria-label={`Open preview of ${path.split('/').pop()}`}
+              aria-label={i18nT('components.chatInput.open_preview_of', { name: path.split('/').pop() })}
               className="block cursor-pointer"
               onClick={(e) => { const img = e.currentTarget.querySelector('img'); if (img) dispatchLightbox(img) }}
             >
@@ -436,6 +473,22 @@ function FilePreviewStrip({ files, resizedInfo, onRemove }: { files: string[]; r
           )}
         </div>
       ))}
+      {/* Folder references: a path handed to the agent, not an upload. No
+          /api/file-raw thumbnail is fetched — there is no content to preview. */}
+      {dirs.map(path => (
+        <div
+          key={path}
+          data-dir-chip=""
+          title={path}
+          className="relative group/preview shrink-0 flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-bg-hover text-[12px] text-text"
+        >
+          <Folder size={12} aria-label={i18nT('components.filePickerMenu.folder')} className="shrink-0 lucide-inline" />
+          <span>{(path.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || path) + '/'}</span>
+          {onRemoveDir && (
+            <button aria-label={i18nT('components.filePickerMenu.remove_folder')} className="text-muted hover:text-danger cursor-pointer bg-transparent border-none p-0" onClick={() => onRemoveDir(path)} title={i18nT('components.filePickerMenu.remove_folder')}><X size={12} /></button>
+          )}
+        </div>
+      ))}
     </div>
   )
 }
@@ -458,8 +511,12 @@ function ChatInput({
   onUploadFiles,
   uploading = false,
   pendingFiles = [],
+  pendingDirs = [],
   resizedInfo,
   onRemoveFile,
+  onRemoveDir,
+  pendingSessions = [],
+  onRemoveSessionRef,
   isMac = false,
   onDrop,
   dragOver = false,
@@ -494,6 +551,10 @@ function ChatInput({
   showContextPct,
   isRunning = false,
   onStop,
+  continuable = false,
+  continueIsRecovery = false,
+  onContinue,
+  continuing = false,
   isQueued = false,
   stopState,
   approvalMode,
@@ -523,8 +584,6 @@ function ChatInput({
   onPasteBlocksChange,
   knowledgeChip,
   autoFocusKey,
-  browseMode = false,
-  onBrowseToggle,
   connected = true,
   onOptimizeResult,
 }: ChatInputProps) {
@@ -648,7 +707,7 @@ function ChatInput({
         // a dashboard bug rather than the job's documented timeout.
         setApprovalNotice(
           approvalIsUnattended
-            ? `That ${approvalSource} request already timed out and was denied — the job is no longer waiting. Check the approvals feed for the record.`
+            ? i18nT('components.chatInput.that_request_already_timed_out_and_was_denied', { source: approvalSource })
             : i18nT('components.chatInput.that_approval_expired_the_turn_it_belonged_to_is')
         )
         return
@@ -799,11 +858,11 @@ function ChatInput({
   // is truncated or the shelf has collapsed to icon-only.
   const projectChipTitle = useMemo(() => {
     if (!project) return i18nT('components.chatInput.select_project')
-    const base = `Project: ${project}`
+    const base = i18nT('components.chatInput.project_2', { path: project })
     if (!projectBranch) return base
     return projectDetached
-      ? `${base}\nDetached HEAD at ${projectBranch}`
-      : `${base}\nBranch: ${projectBranch}`
+      ? `${base}\n${i18nT('components.chatInput.detached_head_at', { branch: projectBranch })}`
+      : `${base}\n${i18nT('components.chatInput.branch', { branch: projectBranch })}`
   }, [project, projectBranch, projectDetached])
   // Focus the composer when the dictation panel is up (as before) OR while a
   // batch transcript is landing (voiceTranscribing), so Enter sends and typing
@@ -969,6 +1028,24 @@ function ChatInput({
   const isMobile = useIsMobile()
   const ime = useImeGuard()
   const resolvedPlaceholder = placeholder || i18nT('components.chatInput.message_placeholder', { bot: botName })
+  // An icon swap alone announces nothing, so the empty-state placeholder carries
+  // the explanation — and it names typing as the other way out, so the morph
+  // never feels like a trap.
+  //
+  // But ONLY when the transcript actually shows a broken turn. The default
+  // placeholder is not dead space: it is the only surface that teaches the three
+  // sigils (`/command · @file · $skill`), so overriding it unconditionally would
+  // delete that hint for every returning chat and leave it visible only in a
+  // brand-new one. On the dashboard the two conditions now coincide — ChatPage
+  // gates the control on the interruption itself — but this component is still
+  // callable with `continuable` alone, and in that case the hint survives and
+  // the labeled Resume button carries the affordance on its own.
+  const continuePlaceholder = continuable && onContinue && continueIsRecovery
+    ? i18nT('components.chatInput.turn_interrupted_press_continue')
+    : ''
+  const continueLabel = i18nT(continueIsRecovery
+    ? 'components.chatInput.continue_interrupted_turn'
+    : 'components.chatInput.continue_thread')
   const [slashMenuOpen, setSlashMenuOpen] = useState(false)
   const [filePickerOpen, setFilePickerOpen] = useState(false)
   const [fileQuery, setFileQuery] = useState('')
@@ -1201,7 +1278,7 @@ function ChatInput({
       wrapperRef.current.style.height = ''
       wrapperRef.current.style.maxHeight = ''
     }
-  }, [manualHeight, pendingFiles.length])
+  }, [manualHeight, pendingFiles.length, pendingSessions.length])
 
   // Auto-resize textarea to fit content
   useEffect(() => {
@@ -1983,28 +2060,35 @@ function ChatInput({
     e.target.value = '' // reset so same file can be re-selected
   }, [onUploadFiles])
 
-  const hasFiles = pendingFiles.length > 0
-  const prevHadFiles = useRef(hasFiles)
-  const dragMinH = hasFiles ? INPUT_DRAG_MIN_H + FILE_PREVIEW_H : INPUT_DRAG_MIN_H
+  // The preview strip renders for folder references too, so height
+  // compensation must key off both staged families — otherwise a dirs-only
+  // strip appears with no wrapper expansion and eats into the textarea.
+  const hasFiles = pendingFiles.length > 0 || pendingDirs.length > 0
+  const hasSessionRefs = pendingSessions.length > 0
+  /** Combined height of every strip currently stacked above the textarea. The
+   *  manual-resize floor and the transient height adjustment below both work off
+   *  this total, so adding a strip can never leave one of them counting only
+   *  attachments. */
+  const stripH = (hasFiles ? FILE_PREVIEW_H : 0) + (hasSessionRefs ? SESSION_REF_STRIP_H : 0)
+  const prevStripH = useRef(stripH)
+  const dragMinH = INPUT_DRAG_MIN_H + stripH
   const dragMinHRef = useRef(dragMinH)
   dragMinHRef.current = dragMinH
-  // Adjust height transiently when file strip appears/disappears (not persisted — files are session-only)
+  // Adjust height transiently when a strip appears/disappears (not persisted —
+  // staged files and session refs are both session-scoped). Diffing the TOTAL
+  // rather than a per-strip boolean keeps the arithmetic correct when both
+  // strips change in the same commit (e.g. send clears files and refs at once).
   useLayoutEffect(() => {
-    const wasShowingFiles = prevHadFiles.current
-    prevHadFiles.current = hasFiles
-    if (wasShowingFiles && !hasFiles) {
-      setManualHeight(h => h !== null ? Math.max(INPUT_DRAG_MIN_H, h - FILE_PREVIEW_H) : h)
-    } else if (!wasShowingFiles && hasFiles) {
-      setManualHeight(h => h !== null ? h + FILE_PREVIEW_H : h)
-    }
-  }, [hasFiles])
+    const prev = prevStripH.current
+    prevStripH.current = stripH
+    if (prev === stripH) return
+    setManualHeight(h => h !== null ? Math.max(INPUT_DRAG_MIN_H, h + (stripH - prev)) : h)
+  }, [stripH])
 
   return (
     // 'input-area' is a stable theming hook — see website/docs/theming-contract.md
     <div className={`input-area px-5 pb-1 ${hasApproval ? 'pt-0' : 'pt-1'} mx-auto w-full flex flex-col`}
-      style={{ maxWidth: 'var(--mc-input-width, 900px)', ...(manualHeight !== null ? { minHeight: (pendingFiles.length > 0 ? INPUT_DRAG_MIN_H + FILE_PREVIEW_H : INPUT_DRAG_MIN_H) + 'px' } : {}) }}>
-
-      {aboveComposer}
+      style={{ maxWidth: 'var(--mc-input-width, 900px)', ...(manualHeight !== null ? { minHeight: (INPUT_DRAG_MIN_H + stripH) + 'px' } : {}) }}>
 
       {/* Knowledge context chip */}
       {!showGhost && knowledgeChip}
@@ -2013,6 +2097,13 @@ function ChatInput({
       {!showGhost && followUpOptions && followUpOptions.length > 0 && onFollowUpSelect && (
           <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={onFollowUpSelect} onSend={sendFollowUp} quickSend={quickSend} layout={followUpLayout} />
       )}
+
+      {/* Tip / folder-suggestion band — LAST above the composer so it always
+          hugs the input box. Options (FollowUpBar) answer the assistant's
+          question and belong with the transcript above; the tip is an ambient
+          note attached to the composer, so a taller options row must never
+          push it away from the box. */}
+      {aboveComposer}
 
       {/* Drag handle — always visible, sits above approval bar or input */}
       {/* Pointer-drag resize handle for the message input (double-click resets).
@@ -2104,7 +2195,7 @@ function ChatInput({
                         <div className="flex items-center gap-1 shrink-0">
                           <button
                             type="button"
-                            aria-label={`Approve sub-agent: ${a.task || a.agent || a.id}`}
+                            aria-label={i18nT('components.chatInput.approve_sub_agent', { name: a.task || a.agent || a.id })}
                             onClick={() => resolveOneSpawn(a, 'approve')}
                             className={approvalBtnClass}
                           >
@@ -2112,7 +2203,7 @@ function ChatInput({
                           </button>
                           <button
                             type="button"
-                            aria-label={`Reject sub-agent: ${a.task || a.agent || a.id}`}
+                            aria-label={i18nT('components.chatInput.reject_sub_agent', { name: a.task || a.agent || a.id })}
                             onClick={() => resolveOneSpawn(a, 'reject')}
                             className={`${approvalBtnClass} hover:!text-danger hover:!border-danger`}
                           >
@@ -2248,10 +2339,13 @@ function ChatInput({
           open={filePickerOpen}
           project={project}
           onFileOpen={onFileOpen}
-          onSelect={({ path, relativePath }) => {
+          onSelect={({ path, relativePath, kind }) => {
+            // relativePath already carries a trailing slash for directories
+            // (see selectionFor in FilePickerMenu), so the inserted token reads
+            // as e.g. "@src/pages/ " and is unambiguously a folder.
             applyPickedToken(/(^|[\s])@\S*$/, `@${relativePath} `)
             setFilePickerOpen(false); setFileQuery('')
-            onFileSelect(path)
+            onFileSelect(path, kind, `@${relativePath}`)
           }}
           onClose={() => { setFilePickerOpen(false); setFileQuery('') }}
         />
@@ -2303,7 +2397,8 @@ function ChatInput({
         onDragLeave={onDragLeave}
         onDrop={onDrop}
       >
-        <FilePreviewStrip files={pendingFiles} resizedInfo={resizedInfo} onRemove={onRemoveFile} />
+        <SessionRefStrip refs={pendingSessions} onRemove={onRemoveSessionRef} />
+        <FilePreviewStrip files={pendingFiles} dirs={pendingDirs} resizedInfo={resizedInfo} onRemove={onRemoveFile} onRemoveDir={onRemoveDir} />
 
         {showDictation ? (
           <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} />
@@ -2317,9 +2412,10 @@ function ChatInput({
         <textarea
           ref={inputRef}
           aria-label={i18nT('components.chatInput.message_input')}
+          data-composer-typo
           className={`relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-none min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}
           style={manualHeight !== null ? { height: '100%' } : undefined}
-          placeholder={!connected ? i18nT('components.chatInput.gateway_offline_message_will_not_send') : disabledProp ? i18nT('components.chatInput.stopping') : voiceRecording ? i18nT('components.chatInput.recording_click_mic_to_stop') : voiceTranscribing ? i18nT('components.chatInput.transcribing_please_wait') : resolvedPlaceholder}
+          placeholder={!connected ? i18nT('components.chatInput.gateway_offline_message_will_not_send') : disabledProp ? i18nT('components.chatInput.stopping') : voiceRecording ? i18nT('components.chatInput.recording_click_mic_to_stop') : voiceTranscribing ? i18nT('components.chatInput.transcribing_please_wait') : continuePlaceholder || resolvedPlaceholder}
           readOnly={optimizing}
           rows={1}
           value={value}
@@ -2443,15 +2539,6 @@ function ChatInput({
                         </div>
                       </button>
                     </div>
-                    {onBrowseToggle && (
-                      <div className="flex items-start justify-between gap-2 mt-2 pt-2.5 border-t border-border">
-                        <div className="min-w-0">
-                          <div className="text-[12px] font-medium text-text flex items-center gap-1.5"><Globe size={13} className="text-muted shrink-0" />{i18nT('components.chatInput.let_the_agent_use_the_browser')}</div>
-                          <div className="text-[11px] text-muted mt-0.5 leading-snug">{i18nT('components.chatInput.it_can_click_type_and_navigate_pages_not_just_re')}</div>
-                        </div>
-                        <div className="pt-0.5"><Toggle checked={browseMode} onChange={() => onBrowseToggle()} label={i18nT('components.chatInput.let_the_agent_use_the_browser')} /></div>
-                      </div>
-                    )}
                   </div>,
                   document.body
                 )}
@@ -2538,7 +2625,17 @@ function ChatInput({
                 <button className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 transition-all" onClick={onStop} title={i18nT('components.chatInput.stopping')} aria-label={i18nT('components.chatInput.stopping_2')}>
                   <Loader2 size={18} className="animate-spin" />
                 </button>
-              ) : value.trim() || pendingFiles.length ? (
+              ) :
+              // Deliberately NOT gated on hasSessionRefs, unlike the idle send
+              // button below. This branch is the mid-turn split button, whose
+              // steer mode refuses a payload of refs alone (ChatPage's steer()
+              // bails on `!raw && !files.length`, because a failed steer cannot
+              // restore what it cleared). Including refs here would enable a
+              // primary button whose press does nothing — and that state was
+              // unreachable before session refs existed, since an empty composer
+              // mid-turn rendered the stop button instead. A bare ref therefore
+              // waits for the turn to end and rides the idle send button.
+              value.trim() || pendingFiles.length ? (
                 canSteer && onSteer ? (
                   /* Split send button (mock: [ action | ▾ ]) — main area fires the
                    * selected busy-send mode (steer by default, same as Enter);
@@ -2623,21 +2720,60 @@ function ChatInput({
                 // disabled on the originating session too.
                 disabled={!value.trim() || optimizePending || !connected}
                 aria-label={optimizePending && !optimizing ? i18nT('components.chatInput.optimize_prompt_busy_optimizing_another_chat') : i18nT('components.chatInput.optimize_prompt')}
-                title={optimizePending && !optimizing ? i18nT('components.chatInput.optimizing_another_chat_please_wait') : `Optimize prompt (${platformShortcut('Cmd+Shift+Enter')})`}
+                title={optimizePending && !optimizing ? i18nT('components.chatInput.optimizing_another_chat_please_wait') : i18nT('components.chatInput.optimize_prompt_2', { shortcut: platformShortcut('Cmd+Shift+Enter') })}
                 {...offlineProps(connected, 'optimize', 'Optimize')}
               >
                 {optimizing ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
               </button>
               {/* 'primary' is a stable theming hook (button.primary) — see website/docs/theming-contract.md */}
+              {/*
+                Sixth state of this button. The first five are send / stop /
+                queue / steer / disabled; this one claims the ONE state that was
+                previously dead weight — an empty composer on a slot whose last
+                turn was cut off. Pressing it hands the thread back to the agent
+                instead of sending nothing. The moment the user types a character
+                the arrow and the send action come back, so the control never
+                carries two meanings at once.
+
+                Labeled, not an icon: this is the only control in the row whose
+                action a first-time user cannot infer from its glyph. A bare ▶
+                reads as "resume paused media", which is the wrong model — the
+                agent is not paused, it is being asked for another turn — and an
+                icon-only button puts that correction in a tooltip, which does
+                not exist on touch. The word carries it instead, and RotateCw
+                replaces Play so the glyph stops promising playback. Widening to
+                a pill is deliberate: at 32px round it was pixel-identical to
+                Send, so the two most consequential buttons in the composer
+                differed only by the symbol inside them.
+
+                The visible text is also the accessible name — no aria-label,
+                which would override the label a sighted user reads and break
+                WCAG 2.5.3 (Label in Name). `title` carries the longer
+                explanation for hover.
+              */}
+              {continuable && onContinue && !value.trim() && !pendingFiles.length && !hasSessionRefs ? (
+                <button
+                  className="primary h-8 px-3 rounded-full bg-accent text-accent-fg border-none inline-flex items-center gap-1.5 text-[12px] font-medium leading-none cursor-pointer hover:bg-accent-hover disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                  onClick={onContinue}
+                  disabled={continuing || disabled || optimizing || !connected}
+                  title={continueLabel}
+                  data-testid="composer-continue"
+                  {...offlineProps(connected, 'continue', continueLabel)}
+                >
+                  {continuing ? <Loader2 size={14} className="animate-spin" /> : <RotateCw size={14} />}
+                  {i18nT('components.chatInput.resume')}
+                </button>
+              ) : (
               <button
                 className="primary w-8 h-8 rounded-full bg-accent text-accent-fg border-none flex items-center justify-center cursor-pointer hover:bg-accent-hover disabled:opacity-30 disabled:cursor-not-allowed transition-all"
                 onClick={fireComposer}
-                disabled={(!value.trim() && !pendingFiles.length) || disabled || optimizing || !connected}
+                disabled={(!value.trim() && !pendingFiles.length && !hasSessionRefs) || disabled || optimizing || !connected}
                 aria-label={i18nT('components.chatInput.send')}
                 {...offlineProps(connected, 'send', 'Send')}
               >
                 <ArrowUp size={18} />
               </button>
+              )}
             </>)}
           </div>
         </div>
@@ -2659,8 +2795,8 @@ function ChatInput({
               className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
               onClick={e => onAgentClick(e.currentTarget.getBoundingClientRect())}
               disabled={isRunning}
-              title={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents') : `Agent: ${agentName}`}
-              aria-label={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents') : `Agent: ${agentName}`}
+              title={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents') : i18nT('components.chatInput.agent', { name: agentName })}
+              aria-label={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents') : i18nT('components.chatInput.agent', { name: agentName })}
             >
               <Bot size={13} className="shrink-0 opacity-70" />
               {!shelfCompact && <span className="truncate max-w-[160px]">{agentName}</span>}
@@ -2755,7 +2891,7 @@ function ChatInput({
               className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
               onClick={e => onModelClick(e.currentTarget.getBoundingClientRect())}
               disabled={isRunning}
-              title={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_model') : `Model: ${modelName}`}
+              title={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_model') : i18nT('components.chatInput.model_2', { name: modelName })}
             >
               <span className="truncate max-w-[180px]">{modelName}</span>
               {onReasoningEffortClick && !shelfCompact && (

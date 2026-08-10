@@ -3,14 +3,14 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect, SettingsInput, SettingsButtonGroup } from '../../components/settings'
 import { loadChatConfig, saveChatConfig, type ChatConfig, type ContentWidth, type DashboardConfig, type SendMode } from '../chat/ChatSettings'
 import { api } from '../../api/client'
-import { useProvider } from '../../providers'
-import { modelListRefetchInterval } from '../../providers/modelListHealth'
+import { useAvailableModels } from '../../hooks/useAvailableModels'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effort'
 import { isMac } from '../../utils/platform'
 import { capRoleOther, clampRoleOther } from '../../lib/userProfile'
 import { ROLE_SLUGS, TECH_SLUGS } from '../../lib/profileOptions'
 
 import { i18nT } from '../../i18n/t'
+import ErrorNotice from '../../components/ErrorNotice'
 /**
  * Option labels are FUNCTIONS, not module-level arrays.
  *
@@ -28,7 +28,7 @@ const RESTORE_OPTIONS = ['15', '30', '60', '120', '360', '720', '1440', '0']
  *  territory); only the `'0'` sentinel's label is prose. It reuses the in-chat
  *  settings popover's key — same setting, same option, one string to translate. */
 function restoreLabels(): string[] {
-  return ['15m', '30m', '1h', '2h', '6h', '12h', '24h', i18nT('pages.chat.chatSettings.no_limit')]
+  return ['15m', '30m', '1h', '2h', '6h', '12h', '24h', i18nT('pages.settings.chatPanel.no_limit')]
 }
 const COMPACT_OPTIONS = ['20', '40', '60', '80', '90']
 const COMPACT_LABELS = ['20% (aggressive)', '40%', '60%', '80%', '90% (default)']
@@ -73,6 +73,27 @@ const SOFT_STOP_DEFAULT = 10.0
 
 type CompletionKeepMode = 'head' | 'tail' | 'both'
 const COMPLETION_KEEP_OPTIONS: CompletionKeepMode[] = ['head', 'tail', 'both']
+
+type VerbosityLevel = 'default' | 'concise' | 'ultra'
+const VERBOSITY_OPTIONS: VerbosityLevel[] = ['default', 'concise', 'ultra']
+
+/**
+ * Narrow a persisted `dashboard.verbosity` to a level this Select can render.
+ *
+ * The config loader reads the field with a plain `.get()` and does not type-check
+ * it, so a hand-edited or migrated `config.json` can put any JSON there — e.g.
+ * `{"dashboard": {"verbosity": {}}}` — and the GET response hands that object
+ * straight to the UI. `?? 'default'` guards only null/undefined, so an object
+ * would flow into SimpleSelect's `triggerFallback`
+ * (`optionLabels?.[options.indexOf(value)] ?? (value || '—')`): `indexOf` misses,
+ * the object is truthy, and React throws on rendering it as a child — taking the
+ * whole Chat settings page down rather than degrading one row.
+ */
+function asVerbosity(value: unknown): VerbosityLevel {
+  return VERBOSITY_OPTIONS.includes(value as VerbosityLevel)
+    ? (value as VerbosityLevel)
+    : 'default'
+}
 function completionKeepLabels(): string[] {
   return [
     i18nT('pages.settings.chatPanel.head_preserve_start_of_stream'),
@@ -85,9 +106,13 @@ const COMPLETION_KEEP_CHARS_MIN = 0
 const COMPLETION_KEEP_CHARS_MAX = 512000
 const COMPLETION_KEEP_CHARS_DEFAULT = 3000
 
+const CHUNK_BUDGET_MIN = 0
+// Mirrors the bound in the backend allowlist (handlers/core.py _EDITABLE_CONFIG).
+const CHUNK_BUDGET_MAX = 10000
+const CHUNK_BUDGET_DEFAULT = 150
+
 export function ChatPanel() {
   const qc = useQueryClient()
-  const provider = useProvider()
   const [chatCfg, setChatCfg] = useState<ChatConfig>(loadChatConfig)
   const [saveError, setSaveError] = useState('')
 
@@ -96,7 +121,7 @@ export function ChatPanel() {
     queryKey: ['dashboardConfig'],
     queryFn: () => api.dashboardConfig(),
   })
-  const dashCfg = dashQ.data ?? { restore_sessions: false, restore_window_minutes: 30, merge_queued_messages: false, widget_density: 'more' as const, verbosity: 'default' as const, quick_send: false, session_grid: false, tail_fork_enabled: false, link_previews: false, mcp_app_panel: false }
+  const dashCfg = dashQ.data ?? { restore_sessions: false, restore_window_minutes: 30, merge_queued_messages: false, widget_density: 'more' as const, verbosity: 'default' as const, quick_send: false, session_grid: false, tail_fork_enabled: false, link_previews: false, mcp_app_panel: false, folder_suggestions_enabled: true }
 
   // ── Feature Tips opt-out (server-side per-user state) ──
   const tipsQ = useQuery<{ enabled_config: boolean; opted_out: boolean }>({
@@ -145,12 +170,20 @@ export function ChatPanel() {
     agent?: {
       provider?: string
       model?: string
+      role_models?: { background?: string; subagent?: string }
+      role_efforts?: { background?: string; subagent?: string }
       reasoning_effort?: string
       soft_stop_budget_secs?: number
       completion_keep?: CompletionKeepMode
       completion_keep_chars?: number
     }
-    dashboard?: { user_role?: string; user_role_other?: string; user_technical_level?: string }
+    dashboard?: { user_role?: string; user_role_other?: string; user_technical_level?: string; prevent_sleep?: boolean }
+    knowledge?: {
+      auto_add_documents?: boolean
+      auto_register_project_docs?: boolean
+      auto_ingest_artifacts?: boolean
+      auto_ingest_chunk_budget?: number
+    }
   }>({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
@@ -169,6 +202,14 @@ export function ChatPanel() {
       api.patchConfig(path, value),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
     onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_profile')),
+  })
+
+  // ── Prevent sleep while running (server-side; gateway-host behavior) ──
+  const preventSleep = mcCfg?.dashboard?.prevent_sleep ?? false
+  const preventSleepMut = useMutation({
+    mutationFn: (v: boolean) => api.patchConfig('dashboard.prevent_sleep', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_dashboard_config')),
   })
 
   // "Other" reveals a free-text role. Typed locally and committed on blur /
@@ -232,6 +273,30 @@ export function ChatPanel() {
     },
   })
 
+  const [localChunkBudget, setLocalChunkBudget] = useState('')
+  const chunkBudgetInitRef = useRef(false)
+  useEffect(() => {
+    if (mcQ.data && !chunkBudgetInitRef.current) {
+      chunkBudgetInitRef.current = true
+      setLocalChunkBudget(
+        String(mcQ.data.knowledge?.auto_ingest_chunk_budget ?? CHUNK_BUDGET_DEFAULT)
+      )
+    }
+  }, [mcQ.data])
+
+  const knowledgeMut = useMutation({
+    mutationFn: ({ path, value }: { path: string; value: boolean | number }) =>
+      api.patchConfig(path, value),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => {
+      setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_knowledge_setting'))
+      setLocalChunkBudget(
+        String(mcCfg?.knowledge?.auto_ingest_chunk_budget ?? CHUNK_BUDGET_DEFAULT)
+      )
+    },
+  })
+  const knowledgeDisabled = !mcQ.isSuccess || knowledgeMut.isPending
+
   const keepModeMut = useMutation({
     mutationFn: (v: CompletionKeepMode) => api.patchConfig('agent.completion_keep', v),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
@@ -259,14 +324,7 @@ export function ChatPanel() {
   // These are the DEFAULTS for new sessions. A session's own model/effort
   // picker still overrides them per-slot; nothing here touches live sessions.
   // Same query key as every other model picker so the list is fetched once.
-  const { data: availableModels = [{ name: 'auto', description: 'Default' }] } = useQuery({
-    queryKey: ['available-models', provider.id],
-    queryFn: async () => {
-      const models = await provider.fetchAvailableModels()
-      return [{ name: 'auto', description: 'Default' }, ...models.filter(m => m.name !== 'auto')]
-    },
-    refetchInterval: modelListRefetchInterval,
-  })
+  const availableModels = useAvailableModels()
   // '' in config means "unset" and resolves the same way 'auto' does, so both
   // render as the 'auto' option rather than as a missing selection.
   const defaultModel = mcCfg?.agent?.model || 'auto'
@@ -293,6 +351,52 @@ export function ChatPanel() {
     onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_default_reasoning_effort')),
   })
 
+  // ── Per-role model defaults (agent.role_models) ──
+  // Same picker as the chat default above; "auto" (or unset) means "inherit the
+  // chat default". Lets an operator run background (lite / heartbeat) or
+  // sub-agent work on a cheaper model without changing the interactive default.
+  const backgroundModel = mcCfg?.agent?.role_models?.background || 'auto'
+  const subagentModel = mcCfg?.agent?.role_models?.subagent || 'auto'
+  // A pinned model the live backend no longer advertises must stay selectable
+  // (same reasoning as the chat-default picker), so prepend it when missing.
+  const roleModelOptions = (current: string): string[] => {
+    const opts = availableModels.map(m => m.name)
+    if (!opts.includes(current)) opts.unshift(current)
+    return opts
+  }
+  const roleModelLabels = (opts: string[]): string[] =>
+    opts.map(m => (m === 'auto' ? i18nT('pages.settings.chatPanel.default_auto') : m))
+  const backgroundModelMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.role_models.background', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_role_model')),
+  })
+  const subagentModelMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.role_models.subagent', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_role_model')),
+  })
+
+  // Per-role reasoning effort, paired with each role's model. Empty inherits the
+  // chat default. The effort row is only meaningful on a reasoning-capable
+  // model, so it disables against the role's RESOLVED model (its pin, else the
+  // chat default) — mirroring the chat effort row's gate.
+  const backgroundEffort = mcCfg?.agent?.role_efforts?.background ?? ''
+  const subagentEffort = mcCfg?.agent?.role_efforts?.subagent ?? ''
+  const bgEffortSupported = modelSupportsEffort(backgroundModel !== 'auto' ? backgroundModel : defaultModel)
+  const subEffortSupported = modelSupportsEffort(subagentModel !== 'auto' ? subagentModel : defaultModel)
+  const effortLabels = EFFORT_LEVELS.map(l => (l === '' ? i18nT('pages.settings.chatPanel.model_default') : effortLabel(l)))
+  const backgroundEffortMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.role_efforts.background', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_role_effort')),
+  })
+  const subagentEffortMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.role_efforts.subagent', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_role_effort')),
+  })
+
   // ── Local chat config (localStorage) ──
   const setChat = useCallback(<K extends keyof ChatConfig>(k: K, v: ChatConfig[K]) => {
     setChatCfg(prev => {
@@ -310,12 +414,7 @@ export function ChatPanel() {
 
   return (
     <>
-      {saveError && (
-        <div className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-center justify-between animate-rise">
-          <span className="text-[13px] text-danger">{saveError}</span>
-          <button className="text-[13px] text-danger hover:text-text cursor-pointer bg-transparent border-none" onClick={() => setSaveError('')}>{i18nT('pages.settings.chatPanel.dismiss')}</button>
-        </div>
-      )}
+      <ErrorNotice message={saveError} onDismiss={() => setSaveError('')} className="mb-4 animate-rise" />
       {dashQ.isError && (
         <div className="mb-4 text-[13px] text-danger">
           {i18nT('pages.settings.chatPanel.failed_to_load_dashboard_config')}{' '}
@@ -330,7 +429,12 @@ export function ChatPanel() {
       )}
 
       <SettingsSection title={i18nT('pages.settings.chatPanel.model')}>
+        {/* Grouped by role so each block reads as "which model + how hard it
+            thinks" for one kind of work, rather than six stacked selects.
+            Chat is the interactive default; Background and Sub-agents inherit it
+            when left on Auto. */}
         <SettingsCard>
+          <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.settings.chatPanel.role_chat')}</div>
           <SettingsSelect
             label={i18nT('pages.settings.chatPanel.provider')}
             description={i18nT('pages.settings.chatPanel.which_backend_new_sessions_run_on')}
@@ -357,13 +461,59 @@ export function ChatPanel() {
             hint={
               effortSupported
                 ? i18nT('pages.settings.chatPanel.model_default_applies_no_override_the_model_pick')
-                : `Reasoning effort is not available on ${defaultModel}. Choose a reasoning-capable model to set a default.`
+                : i18nT('pages.settings.chatPanel.role_effort_hint')
             }
             value={defaultEffort}
             options={[...EFFORT_LEVELS]}
-            optionLabels={EFFORT_LEVELS.map(l => (l === '' ? i18nT('pages.settings.chatPanel.model_default') : effortLabel(l)))}
+            optionLabels={effortLabels}
             onChange={v => defaultEffortMut.mutate(v)}
             disabled={!mcQ.isSuccess || !effortSupported}
+          />
+        </SettingsCard>
+
+        <SettingsCard>
+          <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.settings.chatPanel.role_background')}</div>
+          <div className="text-[12px] text-muted -mt-0.5">{i18nT('pages.settings.chatPanel.model_for_background_lite_heartbeat_work')}</div>
+          <SettingsSelect
+            label={i18nT('pages.settings.chatPanel.background_model')}
+            hint={i18nT('pages.settings.chatPanel.role_model_auto_hint')}
+            value={backgroundModel}
+            options={roleModelOptions(backgroundModel)}
+            optionLabels={roleModelLabels(roleModelOptions(backgroundModel))}
+            onChange={v => backgroundModelMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+          />
+          <SettingsSelect
+            label={i18nT('pages.settings.chatPanel.background_effort')}
+            hint={i18nT('pages.settings.chatPanel.role_effort_hint')}
+            value={backgroundEffort}
+            options={[...EFFORT_LEVELS]}
+            optionLabels={effortLabels}
+            onChange={v => backgroundEffortMut.mutate(v)}
+            disabled={!mcQ.isSuccess || !bgEffortSupported}
+          />
+        </SettingsCard>
+
+        <SettingsCard>
+          <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.settings.chatPanel.role_subagents')}</div>
+          <div className="text-[12px] text-muted -mt-0.5">{i18nT('pages.settings.chatPanel.model_for_spawned_sub_agents')}</div>
+          <SettingsSelect
+            label={i18nT('pages.settings.chatPanel.subagent_model')}
+            hint={i18nT('pages.settings.chatPanel.role_model_auto_hint')}
+            value={subagentModel}
+            options={roleModelOptions(subagentModel)}
+            optionLabels={roleModelLabels(roleModelOptions(subagentModel))}
+            onChange={v => subagentModelMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+          />
+          <SettingsSelect
+            label={i18nT('pages.settings.chatPanel.subagent_effort')}
+            hint={i18nT('pages.settings.chatPanel.role_effort_hint')}
+            value={subagentEffort}
+            options={[...EFFORT_LEVELS]}
+            optionLabels={effortLabels}
+            onChange={v => subagentEffortMut.mutate(v)}
+            disabled={!mcQ.isSuccess || !subEffortSupported}
           />
         </SettingsCard>
       </SettingsSection>
@@ -400,6 +550,18 @@ export function ChatPanel() {
         </SettingsCard>
       </SettingsSection>
 
+      <SettingsSection title={i18nT('pages.settings.chatPanel.power')}>
+        <SettingsCard>
+          <SettingsToggle
+            label={i18nT('pages.settings.chatPanel.prevent_sleep_while_running')}
+            description={i18nT('pages.settings.chatPanel.keep_your_computer_awake_while_a_task_is_running')}
+            checked={preventSleep}
+            onChange={v => preventSleepMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+          />
+        </SettingsCard>
+      </SettingsSection>
+
       <SettingsSection title={i18nT('pages.settings.chatPanel.composer')}>
         <SettingsCard>
           <SettingsSelect
@@ -410,7 +572,7 @@ export function ChatPanel() {
             optionLabels={[i18nT('pages.settings.chatPanel.enter_sends'), i18nT('pages.settings.chatPanel.mod_enter_sends', { mod: isMac ? '⌘' : 'Ctrl' }), i18nT('pages.settings.chatPanel.enter_sends_mod_enter_newline', { mod: isMac ? '⌘' : 'Ctrl' })]}
             onChange={v => setChat('sendOnEnter', v as SendMode)}
           />
-          <SettingsToggle label={i18nT('pages.settings.chatPanel.quick_send')} description={`Click a suggested reply to send it instantly. ${isMac ? '⇧' : 'Shift'}+Click to select multiple.`} checked={dashCfg.quick_send} onChange={v => setDash({ quick_send: v })} disabled={dashDisabled} />
+          <SettingsToggle label={i18nT('pages.settings.chatPanel.quick_send')} description={i18nT('pages.settings.chatPanel.click_a_suggested_reply_to_send_it_instantly', { mod: isMac ? '⇧' : 'Shift' })} checked={dashCfg.quick_send} onChange={v => setDash({ quick_send: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.merge_queued_messages')} description={i18nT('pages.settings.chatPanel.combine_follow_up_messages_into_a_single_labeled')} checked={dashCfg.merge_queued_messages} onChange={v => setDash({ merge_queued_messages: v })} disabled={dashDisabled} />
           <SettingsButtonGroup label={i18nT('pages.settings.chatPanel.follow_up_bar_layout')} description={i18nT('pages.settings.chatPanel.multiline_wraps_suggestions_onto_multiple_rows_s')} value={chatCfg.followUpLayout} options={[{ value: "multiline", label: i18nT('pages.settings.chatPanel.multiline') }, { value: "scroll", label: i18nT('pages.settings.chatPanel.single_line') }]} onChange={v => setChat('followUpLayout', v as ChatConfig['followUpLayout'])} />
           <SettingsInput
@@ -454,15 +616,16 @@ export function ChatPanel() {
           <SettingsToggle label={i18nT('pages.settings.chatPanel.link_previews')} description={i18nT('pages.settings.chatPanel.show_a_favicon_and_page_title_instead_of_the_raw')} checked={dashCfg.link_previews} onChange={v => setDash({ link_previews: v })} disabled={dashDisabled} />
           <SettingsSelect label={i18nT('pages.settings.chatPanel.widget_density')} description={i18nT('pages.settings.chatPanel.how_aggressively_the_agent_uses_inline_widgets_f')} value={dashCfg.widget_density ?? 'more'} options={['more', 'less']} optionLabels={[i18nT('pages.settings.chatPanel.more_encourage_widgets'), i18nT('pages.settings.chatPanel.less_only_when_needed')]} onChange={v => setDash({ widget_density: v as 'more' | 'less' })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.mcp_apps_in_side_panel')} description={i18nT('pages.settings.chatPanel.render_interactive_mcp_apps_in_the_right_side_pa')} checked={dashCfg.mcp_app_panel} onChange={v => setDash({ mcp_app_panel: v })} disabled={dashDisabled} />
-          <SettingsToggle label={i18nT('pages.settings.chatPanel.concise_responses')} description={i18nT('pages.settings.chatPanel.trim_filler_and_over_narration_lead_with_the_ans')} checked={dashCfg.verbosity === 'concise'} onChange={v => setDash({ verbosity: v ? 'concise' : 'default' })} disabled={dashDisabled} />
+          <SettingsSelect label={i18nT('pages.settings.chatPanel.response_verbosity')} description={i18nT('pages.settings.chatPanel.how_terse_the_agent_s_prose_is_ultra_concise_cap')} value={asVerbosity(dashCfg.verbosity)} options={VERBOSITY_OPTIONS} optionLabels={[i18nT('pages.settings.chatPanel.default_normal_length'), i18nT('pages.settings.chatPanel.concise_trim_filler'), i18nT('pages.settings.chatPanel.ultra_concise_3_sentences')]} onChange={v => setDash({ verbosity: v as VerbosityLevel })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_context_percentage')} description={i18nT('pages.settings.chatPanel.display_usage_percentage_next_to_the_context_pro')} checked={chatCfg.showContextPct} onChange={v => setChat('showContextPct', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.feature_tips')} description={tipsConfigOff ? i18nT('pages.settings.chatPanel.disabled_by_instance_config_tips_enabled_false') : i18nT('pages.settings.chatPanel.show_occasional_feature_discovery_tips_above_the')} checked={!!tipsQ.data && tipsQ.data.enabled_config && !tipsQ.data.opted_out} onChange={v => tipsMut.mutate(v)} disabled={tipsConfigOff || tipsQ.isLoading || tipsQ.isError} />
+          <SettingsToggle label={i18nT('pages.settings.chatPanel.folder_suggestions')} description={i18nT('pages.settings.chatPanel.offer_to_file_a_new_session_into_a_matching_fold')} checked={dashCfg.folder_suggestions_enabled} onChange={v => setDash({ folder_suggestions_enabled: v })} disabled={dashDisabled} />
         </SettingsCard>
       </SettingsSection>
 
       <SettingsSection title={i18nT('pages.settings.chatPanel.sessions')}>
         <SettingsCard>
-          <SettingsToggle label={i18nT('pages.settings.chatPanel.split_view_session_grid')} description={`Opt-in: split the chat into resizable session panes (${isMac ? '⌘' : 'Ctrl'}+D). Experimental.`} checked={dashCfg.session_grid} onChange={v => setDash({ session_grid: v })} disabled={dashDisabled} />
+          <SettingsToggle label={i18nT('pages.settings.chatPanel.split_view_session_grid')} description={i18nT('pages.settings.chatPanel.opt_in_split_the_chat_into_resizable_session_pan', { mod: isMac ? '⌘' : 'Ctrl' })} checked={dashCfg.session_grid} onChange={v => setDash({ session_grid: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.history_expanded')} description={i18nT('pages.settings.chatPanel.expand_history_sidebar_by_default')} checked={chatCfg.historyExpanded} onChange={v => setChat('historyExpanded', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.confirm_before_closing_session')} description={i18nT('pages.settings.chatPanel.show_a_confirmation_dialog_when_closing_a_sessio')} checked={chatCfg.confirmCloseSession} onChange={v => setChat('confirmCloseSession', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.default_to_autopilot_mode')} description={i18nT('pages.settings.chatPanel.new_sessions_start_in_autopilot_mode_plan_approv')} checked={chatCfg.defaultAutopilot} onChange={v => setChat('defaultAutopilot', v)} />
@@ -492,6 +655,60 @@ export function ChatPanel() {
         </SettingsCard>
       </SettingsSection>
 
+      <SettingsSection title={i18nT('pages.settings.chatPanel.knowledge_library')}>
+        <SettingsCard>
+          <SettingsToggle
+            label={i18nT('pages.settings.chatPanel.auto_add_documents')}
+            description={i18nT('pages.settings.chatPanel.let_the_agent_add_documents_it_reads_while_workin')}
+            checked={mcCfg?.knowledge?.auto_add_documents ?? true}
+            onChange={v => knowledgeMut.mutate({ path: 'knowledge.auto_add_documents', value: v })}
+            disabled={knowledgeDisabled}
+          />
+          <SettingsToggle
+            label={i18nT('pages.settings.chatPanel.auto_register_project_documents')}
+            description={i18nT('pages.settings.chatPanel.register_the_documents_of_each_project_you_work_i')}
+            checked={mcCfg?.knowledge?.auto_register_project_docs ?? true}
+            onChange={v =>
+              knowledgeMut.mutate({ path: 'knowledge.auto_register_project_docs', value: v })
+            }
+            disabled={knowledgeDisabled}
+          />
+          <SettingsToggle
+            label={i18nT('pages.settings.chatPanel.auto_add_saved_artifacts')}
+            description={i18nT('pages.settings.chatPanel.mirror_documents_you_save_as_artifacts_into_the_l')}
+            checked={mcCfg?.knowledge?.auto_ingest_artifacts ?? true}
+            onChange={v =>
+              knowledgeMut.mutate({ path: 'knowledge.auto_ingest_artifacts', value: v })
+            }
+            disabled={knowledgeDisabled}
+          />
+          <SettingsInput
+            label={i18nT('pages.settings.chatPanel.auto_ingest_limit_per_scan')}
+            aria-label={i18nT('pages.settings.chatPanel.auto_ingest_limit_per_scan')}
+            hint={i18nT('pages.settings.chatPanel.how_much_an_automatically_registered_source_may_i', {
+              count: CHUNK_BUDGET_DEFAULT,
+            })}
+            type="number"
+            value={localChunkBudget}
+            min={CHUNK_BUDGET_MIN}
+            max={CHUNK_BUDGET_MAX}
+            step={50}
+            onChange={setLocalChunkBudget}
+            onBlur={() => {
+              const n = parseInt(localChunkBudget, 10)
+              if (isNaN(n) || n < CHUNK_BUDGET_MIN || n > CHUNK_BUDGET_MAX) {
+                setLocalChunkBudget(
+                  String(mcCfg?.knowledge?.auto_ingest_chunk_budget ?? CHUNK_BUDGET_DEFAULT)
+                )
+                return
+              }
+              knowledgeMut.mutate({ path: 'knowledge.auto_ingest_chunk_budget', value: n })
+            }}
+            disabled={knowledgeDisabled}
+          />
+        </SettingsCard>
+      </SettingsSection>
+
       <SettingsSection title={i18nT('pages.settings.chatPanel.subagents')}>
         <SettingsCard>
           <SettingsSelect
@@ -506,7 +723,7 @@ export function ChatPanel() {
           <SettingsInput
             label={i18nT('pages.settings.chatPanel.completion_event_characters')}
             aria-label={i18nT('pages.settings.chatPanel.completion_event_characters_2')}
-            hint={`Maximum characters retained in the completion event after applying the truncation mode. 0 disables truncation entirely. Default ${COMPLETION_KEEP_CHARS_DEFAULT}.`}
+            hint={i18nT('pages.settings.chatPanel.maximum_characters_retained_in_the_completion_ev', { n: COMPLETION_KEEP_CHARS_DEFAULT })}
             type="number"
             value={localKeepChars}
             min={COMPLETION_KEEP_CHARS_MIN}

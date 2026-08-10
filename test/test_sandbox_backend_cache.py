@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import os
+import shlex
 import threading
 import types
 
@@ -45,7 +46,11 @@ def clean_backend(monkeypatch):
     preempts the mocked ``detect_backend`` so the fail-closed ``RuntimeError``
     these tests assert on never raises. Point the settings path at a
     non-existent file so delegation is off by default.
+
+    Clears ``KIROCREW_SANDBOX_ACTIVE`` to prevent the "already inside sandbox"
+    passthrough from short-circuiting tests on sandboxed hosts.
     """
+    monkeypatch.delenv("KIROCREW_SANDBOX_ACTIVE", raising=False)
     monkeypatch.setattr(
         sb, "_KIRO_INTERNAL_SETTINGS_PATH", "/nonexistent/kirocrew-test/amazon-internal.json"
     )
@@ -69,8 +74,8 @@ def test_transient_errno_set_covers_resource_exhaustion():
 
 def test_probe_success_clears_failure_detail(monkeypatch):
     monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))  # hermetic: gate precedes the mocked probe
-    monkeypatch.setattr(sb, "_probe_unshare_once", lambda: (True, False, "ok"))
-    sb._last_unshare_failure = (True, "stale detail from a previous probe")
+    monkeypatch.setattr(sb, "_probe_unshare_once", lambda: (True, False, "ok", ""))
+    sb._last_unshare_failure = (True, "stale detail from a previous probe", "")
     assert sb._probe_unshare() is True
     assert sb._last_unshare_failure is None
 
@@ -81,12 +86,12 @@ def test_probe_transient_failure_retries_once(monkeypatch):
 
     def fake_once():
         calls.append(1)
-        return (False, True, _EAGAIN_REASON)
+        return (False, True, _EAGAIN_REASON, "")
 
     monkeypatch.setattr(sb, "_probe_unshare_once", fake_once)
     assert sb._probe_unshare() is False
     assert len(calls) == 2  # one in-probe retry on transient failure
-    assert sb._last_unshare_failure == (True, _EAGAIN_REASON)
+    assert sb._last_unshare_failure == (True, _EAGAIN_REASON, "")
 
 
 def test_probe_permanent_failure_does_not_retry(monkeypatch):
@@ -95,17 +100,17 @@ def test_probe_permanent_failure_does_not_retry(monkeypatch):
 
     def fake_once():
         calls.append(1)
-        return (False, False, _EPERM_REASON)
+        return (False, False, _EPERM_REASON, "")
 
     monkeypatch.setattr(sb, "_probe_unshare_once", fake_once)
     assert sb._probe_unshare() is False
     assert len(calls) == 1
-    assert sb._last_unshare_failure == (False, _EPERM_REASON)
+    assert sb._last_unshare_failure == (False, _EPERM_REASON, "")
 
 
 def test_probe_transient_then_success_recovers(monkeypatch):
     monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))  # hermetic: gate precedes the mocked probe
-    results = [(False, True, _EAGAIN_REASON), (True, False, "ok")]
+    results = [(False, True, _EAGAIN_REASON, ""), (True, False, "ok", "")]
     monkeypatch.setattr(sb, "_probe_unshare_once", lambda: results.pop(0))
     assert sb._probe_unshare() is True
     assert sb._last_unshare_failure is None
@@ -114,20 +119,22 @@ def test_probe_transient_then_success_recovers(monkeypatch):
 def test_probe_non_linux_is_permanent(monkeypatch):
     monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="darwin"))
     assert sb._probe_unshare() is False
-    assert sb._last_unshare_failure == (False, "not Linux")
+    assert sb._last_unshare_failure == (False, "not Linux", "")
 
 
 # ── detect_backend cache policy ──
 
 
-def _install_probe(monkeypatch, outcomes: list[tuple[bool, bool, str]]) -> list[int]:
+def _install_probe(
+    monkeypatch, outcomes: list[tuple[bool, bool, str, str]]
+) -> list[int]:
     """Install a fake _probe_unshare fed by *outcomes*; returns the call log."""
     calls: list[int] = []
 
     def fake_probe() -> bool:
         calls.append(1)
-        ok, transient, reason = outcomes.pop(0)
-        sb._last_unshare_failure = None if ok else (transient, reason)
+        ok, transient, reason, remedy = outcomes.pop(0)
+        sb._last_unshare_failure = None if ok else (transient, reason, remedy)
         return ok
 
     monkeypatch.setattr(sb, "_probe_unshare", fake_probe)
@@ -138,7 +145,7 @@ def _install_probe(monkeypatch, outcomes: list[tuple[bool, bool, str]]) -> list[
 def test_transient_failure_is_not_cached(monkeypatch):
     calls = _install_probe(
         monkeypatch,
-        [(False, True, _EAGAIN_REASON), (False, True, _EAGAIN_REASON)],
+        [(False, True, _EAGAIN_REASON, ""), (False, True, _EAGAIN_REASON, "")],
     )
     assert sb.detect_backend(config_mode="auto") == "none"
     assert sb._backend is None  # transient "none" must not be cached
@@ -147,7 +154,7 @@ def test_transient_failure_is_not_cached(monkeypatch):
 
 
 def test_permanent_failure_is_cached(monkeypatch):
-    calls = _install_probe(monkeypatch, [(False, False, _EPERM_REASON)])
+    calls = _install_probe(monkeypatch, [(False, False, _EPERM_REASON, "")])
     assert sb.detect_backend(config_mode="auto") == "none"
     assert sb._backend == "none"
     assert sb.detect_backend(config_mode="auto") == "none"
@@ -158,7 +165,7 @@ def test_recovery_after_transient_failure(monkeypatch):
     """The incident scenario: a momentary EAGAIN must self-heal on next spawn."""
     calls = _install_probe(
         monkeypatch,
-        [(False, True, _EAGAIN_REASON), (True, False, "ok")],
+        [(False, True, _EAGAIN_REASON, ""), (True, False, "ok", "")],
     )
     assert sb.detect_backend(config_mode="auto") == "none"
     assert sb.detect_backend(config_mode="auto") == "namespace"
@@ -168,7 +175,7 @@ def test_recovery_after_transient_failure(monkeypatch):
 
 def test_positive_result_cached_across_modes(monkeypatch):
     """Backend capability is mode-independent: no re-probe on mode alternation."""
-    calls = _install_probe(monkeypatch, [(True, False, "ok")])
+    calls = _install_probe(monkeypatch, [(True, False, "ok", "")])
     assert sb.detect_backend(config_mode="auto") == "namespace"
     assert sb.detect_backend(config_mode="cc") == "namespace"
     assert sb.detect_backend(config_mode="strict") == "namespace"
@@ -176,7 +183,7 @@ def test_positive_result_cached_across_modes(monkeypatch):
 
 
 def test_off_mode_short_circuits_without_probing(monkeypatch):
-    calls = _install_probe(monkeypatch, [(True, False, "ok")])
+    calls = _install_probe(monkeypatch, [(True, False, "ok", "")])
     assert sb.detect_backend(config_mode="off") == "none"
     assert len(calls) == 0
     assert sb._backend is None  # "off" never touches the cache
@@ -190,7 +197,7 @@ def test_off_mode_short_circuits_without_probing(monkeypatch):
 def test_fail_closed_transient_message_advises_retry_not_optout(monkeypatch):
     monkeypatch.setattr(sb, "detect_backend", lambda config_mode="auto": "none")
     monkeypatch.setattr(sb, "_allow_unsandboxed_exec", lambda: False)
-    sb._last_unshare_failure = (True, _EAGAIN_REASON)
+    sb._last_unshare_failure = (True, _EAGAIN_REASON, "")
     with pytest.raises(RuntimeError) as excinfo:
         sb.wrap_argv(["kiro-cli", "acp"], mode="standard")
     msg = str(excinfo.value)
@@ -210,7 +217,7 @@ def test_fail_closed_permanent_message_includes_optout_and_detail(monkeypatch):
     # Seatbelt-confined — green on CI, red on a sandboxed dev machine.
     monkeypatch.setattr(sb, "_macos_sandbox_state", lambda: False)
     monkeypatch.setattr(sb, "kiro_internal_sandbox_enabled", lambda: False)
-    sb._last_unshare_failure = (False, _EPERM_REASON)
+    sb._last_unshare_failure = (False, _EPERM_REASON, "")
     with pytest.raises(RuntimeError) as excinfo:
         sb.wrap_argv(["kiro-cli", "acp"], mode="standard")
     msg = str(excinfo.value)
@@ -245,7 +252,7 @@ def test_probe_child_killed_by_signal_is_transient(monkeypatch):
     fake_libc = FakeLibC()
     monkeypatch.setattr(_ct, "CDLL", lambda *a, **kw: fake_libc)
 
-    ok, transient, reason = sb._probe_unshare_once()
+    ok, transient, reason, _remedy = sb._probe_unshare_once()
     assert ok is False
     assert transient is True
     assert "signal 9" in reason
@@ -272,7 +279,7 @@ def test_on_loop_cold_cache_returns_none_without_probing(monkeypatch):
     result = asyncio.run(_run())
     assert result is False
     assert sb._last_unshare_failure is not None
-    transient, reason = sb._last_unshare_failure
+    transient, reason, _remedy = sb._last_unshare_failure
     assert transient is True
     assert "deferred to background thread" in reason
     # Cache must stay None (transient → never cached)
@@ -286,7 +293,7 @@ def test_on_loop_kicks_background_warm_that_populates_cache(monkeypatch):
 
     def recording_probe():
         probe_thread_names.append(threading.current_thread().name)
-        return (True, False, "ok")
+        return (True, False, "ok", "")
 
     monkeypatch.setattr(sb, "_probe_unshare_once", recording_probe)
 
@@ -310,7 +317,7 @@ def test_warm_dedupe_two_rapid_calls_start_at_most_one_thread(monkeypatch):
 
     def slow_probe():
         gate.wait(timeout=5.0)
-        return (True, False, "ok")
+        return (True, False, "ok", "")
 
     monkeypatch.setattr(sb, "_probe_unshare_once", slow_probe)
 
@@ -341,7 +348,7 @@ def test_warm_dedupe_two_rapid_calls_start_at_most_one_thread(monkeypatch):
 
 def test_prewarm_backend_populates_cache(monkeypatch):
     """prewarm_backend() fires background probe that fills cache."""
-    monkeypatch.setattr(sb, "_probe_unshare_once", lambda: (True, False, "ok"))
+    monkeypatch.setattr(sb, "_probe_unshare_once", lambda: (True, False, "ok", ""))
     monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))
 
     sb.prewarm_backend()
@@ -349,6 +356,120 @@ def test_prewarm_backend_populates_cache(monkeypatch):
     if sb._warm_thread is not None:
         sb._warm_thread.join(timeout=5.0)
     assert sb._backend == "namespace"
+
+
+# ── Blocking boot warm (warm_backend) ──
+
+
+def test_warm_backend_returns_with_cache_already_populated(monkeypatch):
+    """warm_backend() must not return until the probe has landed.
+
+    This is the whole difference from ``prewarm_backend``: the caller is entitled
+    to assume a settled verdict on return. The probe is made observably slow so a
+    non-joining implementation loses the race and leaves the cache cold — the
+    assertions below then fail rather than passing by luck.
+    """
+    monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))
+
+    def slow_probe():
+        # Independent of sb.time.sleep (patched by the autouse fixture) so the
+        # delay is real for this thread.
+        threading.Event().wait(0.05)
+        return (True, False, "ok", "")
+
+    monkeypatch.setattr(sb, "_probe_unshare_once", slow_probe)
+
+    sb.warm_backend()
+
+    assert sb._backend == "namespace"
+    # The join is what produced the guarantee — prove it happened rather than
+    # inferring it from the cache alone.
+    assert sb._warm_thread is not None
+    assert not sb._warm_thread.is_alive()
+
+
+def test_warm_backend_makes_on_loop_transient_path_unreachable(monkeypatch):
+    """After a warmed boot, an on-loop caller sees the verdict, not a deferral.
+
+    The user-visible symptom being fixed: an on-loop ``detect_backend`` racing a
+    fire-and-forget prewarm logs a transient probe failure that reads as "this
+    host has no sandbox backend".
+    """
+    monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))
+    probe_calls: list[str] = []
+
+    def counting_probe():
+        # Slow, for the same reason as the test above: with an instant probe this
+        # assertion would hold even without the join, by winning the race rather
+        # than by the guarantee under test.
+        threading.Event().wait(0.05)
+        probe_calls.append(threading.current_thread().name)
+        return (True, False, "ok", "")
+
+    monkeypatch.setattr(sb, "_probe_unshare_once", counting_probe)
+
+    sb.warm_backend()
+    assert len(probe_calls) == 1
+
+    async def _on_loop() -> str:
+        return sb.detect_backend()
+
+    assert asyncio.run(_on_loop()) == "namespace"
+    # No re-probe and no synthetic transient: the warm cache answered.
+    assert len(probe_calls) == 1
+    assert sb._last_unshare_failure is None
+
+
+def test_warm_backend_permanent_failure_caches_none(monkeypatch):
+    """A permanent denial is a real verdict and must be cached, not retried."""
+    monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(sb, "_probe_unshare_once", lambda: (False, False, _EPERM_REASON, ""))
+
+    sb.warm_backend()
+
+    assert sb._backend == "none"
+
+
+def test_warm_backend_wait_is_bounded_and_leaves_cache_cold(monkeypatch):
+    """A wedged probe must not stall boot; the cold cache then self-heals.
+
+    Exceeding the join timeout is explicitly not an error — it degrades to the
+    pre-existing ``prewarm_backend`` behaviour (cache uncached, next caller
+    re-probes) rather than failing startup.
+    """
+    monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))
+    release = threading.Event()
+
+    def wedged_probe():
+        release.wait(10.0)
+        return (True, False, "ok", "")
+
+    monkeypatch.setattr(sb, "_probe_unshare_once", wedged_probe)
+
+    try:
+        sb.warm_backend(timeout=0.05)
+        # Returned while the probe is still in flight, so no verdict is cached.
+        assert sb._backend is None
+        assert sb._warm_thread is not None and sb._warm_thread.is_alive()
+    finally:
+        release.set()
+        if sb._warm_thread is not None:
+            sb._warm_thread.join(timeout=5.0)
+
+
+def test_warm_backend_is_a_noop_off_linux(monkeypatch):
+    """Probes are Linux-only — no thread, no cache write, no wait."""
+    monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="darwin"))
+
+    def unexpected_probe():  # pragma: no cover - must never run
+        raise AssertionError("probe must not run off Linux")
+
+    monkeypatch.setattr(sb, "_probe_unshare_once", unexpected_probe)
+
+    sb.warm_backend()
+
+    assert sb._warm_thread is None
+    assert sb._backend is None
 
 
 # ── Off-loop behaviour preserved ──
@@ -359,7 +480,7 @@ def test_off_loop_transient_retry_sleeps(monkeypatch):
     monkeypatch.setattr(sb, "sys", types.SimpleNamespace(platform="linux"))  # hermetic: gate precedes the mocked probe
     sleep_calls: list[float] = []
     monkeypatch.setattr(sb.time, "sleep", lambda s: sleep_calls.append(s))
-    monkeypatch.setattr(sb, "_probe_unshare_once", lambda: (False, True, "EAGAIN"))
+    monkeypatch.setattr(sb, "_probe_unshare_once", lambda: (False, True, "EAGAIN", ""))
     sb._probe_unshare()
     assert len(sleep_calls) == 1
     assert sleep_calls[0] == sb._PROBE_TRANSIENT_RETRY_DELAY_SECS
@@ -367,7 +488,7 @@ def test_off_loop_transient_retry_sleeps(monkeypatch):
 
 def test_off_loop_does_not_kick_background_warm(monkeypatch):
     """Off-loop probes directly — no background thread involved."""
-    monkeypatch.setattr(sb, "_probe_unshare_once", lambda: (True, False, "ok"))
+    monkeypatch.setattr(sb, "_probe_unshare_once", lambda: (True, False, "ok", ""))
     sb._probe_unshare()
     # No warm thread should be started for off-loop probes
     assert sb._warm_thread is None
@@ -400,3 +521,187 @@ def test_probe_unshare_fast_path_on_loop_when_backend_set(monkeypatch):
 
     result = asyncio.run(_check())
     assert result is True
+
+
+# ── Mechanism-specific no-backend guidance (issue #1639) ──
+#
+# The generic "install a sandbox backend, or opt out" text is actively unhelpful
+# on the most common affected host, stock Ubuntu 23.10+, where a backend exists
+# and is one AppArmor profile away from working — and the only concrete thing it
+# suggested was the opt-out that removes the isolation. These pin the replacement
+# WITHOUT losing the escape hatch: the profile is named first, the opt-out last.
+
+
+class TestNoBackendGuidanceNamesTheRightRemedy:
+    """Which remedy is named depends on HOW Kiro Crew was launched."""
+
+    @staticmethod
+    def _apparmor_host(monkeypatch):
+        monkeypatch.setattr(sb.sys, "platform", "linux")
+        monkeypatch.setattr(sb, "_apparmor_userns_restricted", lambda: True)
+
+    def test_appimage_launch_names_the_attach_command_with_the_path(self, monkeypatch):
+        self._apparmor_host(monkeypatch)
+        monkeypatch.setenv("APPIMAGE", "/home/user/Apps/kirocrew.AppImage")
+
+        msg = sb._no_backend_guidance()
+
+        assert "kirocrew sandbox install-profile" in msg
+        assert "/home/user/Apps/kirocrew.AppImage" in msg
+        assert "needs sudo" in msg, "must say why the app cannot do it"
+
+    def test_non_appimage_launch_points_at_the_service(self, monkeypatch):
+        """A foreground gateway has no safe executable to attach to."""
+        self._apparmor_host(monkeypatch)
+        monkeypatch.delenv("APPIMAGE", raising=False)
+
+        msg = sb._no_backend_guidance()
+
+        assert "kirocrew service install" in msg
+        assert "sandbox install-profile" not in msg
+
+    def test_never_advises_disabling_the_kernel_wide_protection(self, monkeypatch):
+        """Setting the sysctl to 0 trades a host-wide protection for one app."""
+        self._apparmor_host(monkeypatch)
+        monkeypatch.setenv("APPIMAGE", "/home/user/Apps/kirocrew.AppImage")
+
+        msg = sb._no_backend_guidance()
+
+        assert "Do NOT set the sysctl to 0" in msg
+        assert "=0" not in msg.replace("apparmor_restrict_unprivileged_userns=1", "")
+
+    @pytest.mark.parametrize("appimage", ["/home/user/Apps/kirocrew.AppImage", None])
+    def test_still_names_the_opt_out_but_only_after_the_real_fix(
+        self, monkeypatch, appimage
+    ):
+        """Regression guard.
+
+        Withholding ``sandbox_allow_unsandboxed_exec`` to stop people reaching for
+        it leaves a genuinely stuck user with no way out, and it broke the
+        pre-existing contract in
+        ``test_fail_closed_permanent_message_includes_optout_and_detail``. The fix
+        is ordering, not omission.
+        """
+        self._apparmor_host(monkeypatch)
+        if appimage:
+            monkeypatch.setenv("APPIMAGE", appimage)
+        else:
+            monkeypatch.delenv("APPIMAGE", raising=False)
+
+        msg = sb._no_backend_guidance()
+
+        assert "sandbox_allow_unsandboxed_exec=true" in msg
+        assert "last resort" in msg
+        profile_at = min(
+            (msg.index(t) for t in ("install-profile", "service install") if t in msg),
+            default=-1,
+        )
+        assert profile_at >= 0
+        assert profile_at < msg.index("sandbox_allow_unsandboxed_exec")
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            "/home/user/KiroCrew-$(touch PWNED).AppImage",
+            "/home/user/`id`.AppImage",
+            "/home/user/a;rm -rf ~/b.AppImage",
+            "/home/user/Bob's Apps/kirocrew.AppImage",
+            "/home/user/a b/kirocrew.AppImage",
+        ],
+    )
+    def test_the_path_is_shell_quoted_for_safe_pasting(self, monkeypatch, hostile):
+        """Raised as blocking in review of #1653.
+
+        This message is printed for the user to paste into a shell, and a filename
+        is attacker-influenced in exactly the cases that matter — a downloaded or
+        unpacked AppImage. Interpolating it bare turns a diagnostic into command
+        injection at paste time.
+        """
+        self._apparmor_host(monkeypatch)
+        monkeypatch.setenv("APPIMAGE", hostile)
+
+        msg = sb._no_backend_guidance()
+
+        quoted = shlex.quote(hostile)
+        assert quoted in msg
+        # The dangerous forms must never appear unquoted.
+        for meta in ("$(", "`", ";"):
+            if meta in hostile:
+                assert f"--path {hostile}" not in msg
+        # And the quoting must survive a round trip through a shell parser.
+        assert shlex.split(f"cmd --path {quoted}")[-1] == hostile
+
+    def test_the_remedy_names_a_cli_the_appimage_user_actually_has(
+        self, monkeypatch, tmp_path
+    ):
+        """Raised as a design concern in review of #1653.
+
+        The AppImage is documented as needing "no Python, pip, npm, or Node", so
+        this persona has no `kirocrew` on PATH — the CLI lives inside the bundle.
+        Naming the bare command would hand exactly the affected user a
+        `command not found` and leave them with only the opt-out.
+        """
+        self._apparmor_host(monkeypatch)
+        monkeypatch.setenv("APPIMAGE", "/home/user/Apps/kirocrew.AppImage")
+        bundled = tmp_path / "kirocrew"
+        bundled.write_text("#!/bin/sh\n")
+        monkeypatch.setattr(sb.sys, "argv", [str(bundled)])
+
+        msg = sb._no_backend_guidance()
+
+        assert str(bundled) in msg
+        assert "while Kiro Crew is open" in msg, "must say the path is live-only"
+
+    def test_which_is_not_trusted_as_evidence_the_user_has_the_cli(
+        self, monkeypatch, tmp_path
+    ):
+        """The gateway's PATH is not the user's PATH.
+
+        This text is generated inside a process that inherited the AppImage's own
+        environment but is pasted into the user's shell. A `which` hit would prove
+        the bundle can find its own CLI, not that the user can, so the absolute
+        path wins regardless.
+        """
+        self._apparmor_host(monkeypatch)
+        monkeypatch.setenv("APPIMAGE", "/home/user/Apps/kirocrew.AppImage")
+        bundled = tmp_path / "kirocrew"
+        bundled.write_text("#!/bin/sh\n")
+        monkeypatch.setattr(sb.sys, "argv", [str(bundled)])
+        monkeypatch.setattr(sb.shutil, "which", lambda _n: "/usr/local/bin/kirocrew")
+
+        msg = sb._no_backend_guidance()
+
+        assert str(bundled) in msg
+
+    @pytest.mark.parametrize("argv", [[], [""], ["-c"], ["/usr/bin/python3"]])
+    def test_falls_back_to_the_bare_name_rather_than_inventing_a_path(
+        self, monkeypatch, argv
+    ):
+        """Better a short command than a confidently wrong absolute path."""
+        self._apparmor_host(monkeypatch)
+        monkeypatch.setenv("APPIMAGE", "/home/user/Apps/kirocrew.AppImage")
+        monkeypatch.setattr(sb.sys, "argv", argv)
+
+        msg = sb._no_backend_guidance()
+
+        assert "kirocrew sandbox install-profile" in msg
+        assert "while Kiro Crew is open" not in msg
+
+    def test_an_unaffected_host_keeps_the_original_text(self, monkeypatch):
+        """macOS, Debian, and a relaxed sysctl must be untouched by this change."""
+        monkeypatch.setattr(sb.sys, "platform", "darwin")
+
+        msg = sb._no_backend_guidance()
+
+        assert "sandbox_allow_unsandboxed_exec=true" in msg
+        assert "AppArmor" not in msg
+
+    def test_a_relaxed_sysctl_is_not_treated_as_the_apparmor_case(self, monkeypatch):
+        monkeypatch.setattr(sb.sys, "platform", "linux")
+        monkeypatch.setattr(sb, "_apparmor_userns_restricted", lambda: False)
+
+        assert "AppArmor" not in sb._no_backend_guidance()
+
+    def test_the_sysctl_reader_never_raises(self, monkeypatch):
+        """A missing knob (Debian 13, older kernels) is a normal answer."""
+        assert sb._apparmor_userns_restricted() in (True, False)

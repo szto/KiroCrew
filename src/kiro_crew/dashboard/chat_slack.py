@@ -2,18 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from typing import Any
 
 from aiohttp import web
 
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard import state as dashboard_state
+from kiro_crew.dashboard.chat_backfill import (
+    backfill_content,
+    gap_summary,
+    select_backfill_messages,
+    session_deep_link,
+)
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
-from kiro_crew.dashboard.chat_utils import effective_session_key
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
+from kiro_crew.dashboard.state import DashboardState, _log_task_exception
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.security import redact_and_truncate
 from kiro_crew.sel import sel
 from kiro_crew.slack.channel_resolver import _CACHE_FILENAME, ChannelNameResolver
+from kiro_crew.slack.format import render_for_slack
 from kiro_crew.sync_bridge import handoff_to_slack
 
 logger = logging.getLogger(__name__)
@@ -48,6 +58,113 @@ def _get_channel_resolver(state: DashboardState) -> ChannelNameResolver:
         cache_path = dashboard_state.config_dir() / _CACHE_FILENAME
         state._channel_resolver = ChannelNameResolver(cache_path=cache_path)
     return state._channel_resolver
+
+
+_USER_ICON = "\U0001f9d1"
+_AGENT_ICON = "\U0001f916"
+
+
+def _format_backfill_parts(content: str, icon: str) -> list[str]:
+    """Render one transcript row into postable Slack parts, icon included.
+
+    Thin delegate to :func:`kiro_crew.slack.format.render_for_slack`, which owns
+    the redact/convert/split ordering this path used to implement privately. The
+    icon is passed as the prefix rather than prepended afterwards: decorating a
+    maximally-sized part after the split pushed it past ``SLACK_MSG_LIMIT`` by
+    the width of the icon plus its space.
+    """
+    return render_for_slack(content, prefix=f"{icon} ", redactor=redact_via_context)
+
+
+async def drain_slack_backfill(
+    state: DashboardState,
+    slot: Any,
+    channel: str,
+    thread_ts: str,
+) -> None:
+    """Seed a freshly linked Slack thread with readable conversation history.
+
+    Posts the opening turn, a gap marker naming how many turns were skipped, then
+    the last few turns in full. Runs as a background task rather than inline in
+    the link request: Slack accepts roughly one message per second per channel,
+    so a long history split across many parts would hold the HTTP request open
+    long enough for the browser fetch to time out while posts kept landing --
+    the user would see a failure on a link that actually worked.
+
+    Backgrounding is safe here specifically because the Slack link path has no
+    per-message governance gate to fail closed on (unlike the configured-channel
+    mirror in ``chat_mirror.py``, which stays inline for that reason).
+    """
+    client = state.slack_client
+    if client is None:
+        return
+    # Offloaded: selection reads the on-disk transcript when the opening turn is
+    # off-window, and read_messages_chained parses every tab_id sibling file (and
+    # globs the sessions dir to rebuild a stale index). On the loop thread that
+    # would stall every other chat turn and the liveness heartbeat.
+    selection = await asyncio.to_thread(select_backfill_messages, state, slot)
+    if not selection.messages:
+        return
+
+    async def _post(text: str) -> bool:
+        try:
+            await client.post_message(channel, text, thread_ts)
+            return True
+        except Exception:
+            # Best-effort: a partially seeded thread is still usable, and the
+            # link itself is already persisted. Never bare-pass -- a silent
+            # swallow here is what made the original failure invisible.
+            logger.debug("slack backfill: post failed", exc_info=True)
+            return False
+
+    for row in selection.first_turn:
+        icon = _USER_ICON if row.get("role") == "user" else _AGENT_ICON
+        for part in _format_backfill_parts(backfill_content(row), icon):
+            if not await _post(part):
+                return
+
+    if selection.skipped_turns and selection.recent:
+        summary = gap_summary(selection.skipped_turns)
+        link = ""
+        try:
+            # Offloaded: KiroCrewConfig.load() reads and validates the config
+            # file, which is blocking I/O like the transcript read above.
+            cfg = await asyncio.to_thread(KiroCrewConfig.load)
+            link = session_deep_link(cfg.dashboard.url, slot.key)
+        except Exception:
+            logger.debug("slack backfill: could not build session link", exc_info=True)
+        marker = f"_… {summary} — <{link}|open in the dashboard>_" if link else f"_… {summary}_"
+        await _post(marker)
+
+    for row in selection.recent_rows:
+        icon = _USER_ICON if row.get("role") == "user" else _AGENT_ICON
+        for part in _format_backfill_parts(backfill_content(row), icon):
+            if not await _post(part):
+                return
+
+
+def _spawn_slack_backfill(
+    state: DashboardState,
+    slot: Any,
+    channel: str,
+    thread_ts: str,
+) -> None:
+    """Fire the backfill drain as a tracked background task.
+
+    Uses the established three-callback shape: keep a strong reference so the
+    task is not garbage-collected mid-flight, discard it on completion, and log
+    any exception through ``_log_task_exception`` (which redacts first). Omitting
+    the third callback is a documented defect -- the failure would surface only
+    as an unretrieved-exception warning at interpreter shutdown.
+
+    ``state._background_tasks`` is never cancelled at shutdown, so a gateway stop
+    mid-drain abandons the task and leaves a partially seeded thread. That is
+    accepted: the link is already persisted and the thread is live.
+    """
+    task = asyncio.create_task(drain_slack_backfill(state, slot, channel, thread_ts))
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+    task.add_done_callback(_log_task_exception)
 
 
 async def api_chat_slot_slack_link(request: web.Request) -> web.Response:
@@ -119,26 +236,20 @@ async def api_chat_slot_slack_link(request: web.Request) -> web.Response:
         if not thread_ts:
             return web.json_response({"error": "failed to create thread"}, status=500)
 
-    state.sessions.set_slack_link(session_key, thread_ts, target_channel)
-    slot._slack_linked = True
-    slot._slack_channel = target_channel
-    slot._slack_thread_ts = thread_ts
+    # Route through the ONE canonical link writer. ``link_slack`` sets the same
+    # three slot fields and persists via ``set_slack_link``, but it ALSO
+    # registers the thread -> slot reverse index that inbound Slack replies
+    # resolve through, and releases the thread from any slot that held it
+    # before. Hand-assigning the fields here duplicated everything except that
+    # index, so a reply in the mirrored thread routed and persisted correctly
+    # while nothing ever told the open tab it had arrived.
+    state.link_slack(slot.key, thread_ts, target_channel)
 
-    # Post last 5 messages as context — only when we created a NEW thread.
-    # Linking to an existing thread (challenge-and-redirect) would duplicate
-    # messages the thread already contains.
+    # Seed the new thread with readable history — only when we created a NEW
+    # thread. Linking to an existing thread (challenge-and-redirect) would
+    # duplicate messages the thread already contains.
     if not existing_thread:
-        for m in slot.messages[-5:]:
-            role = m.get("role", "")
-            txt = redact_and_truncate(m.get("content") or "", max_chars=2000)
-            if role in ("user", "assistant") and txt:
-                icon = "\U0001f9d1" if role == "user" else "\U0001f916"
-                try:
-                    await state.slack_client.post_message(
-                        target_channel, f"{icon} {txt}", thread_ts
-                    )
-                except Exception:
-                    pass
+        _spawn_slack_backfill(state, slot, target_channel, thread_ts)
 
     sel().log_api_access(
         caller="dashboard",
@@ -281,6 +392,24 @@ async def api_chat_slot_handoff(request: web.Request) -> web.Response:
         pass
 
     history_key = effective_session_key(slot)
+    transcript_key = slot_history_key(slot)
+    if transcript_key != history_key:
+        # The tab's conversation is stored somewhere other than the session it
+        # runs on -- an unbound channel tab. Handing off would seed the thread
+        # from the channel transcript while every later reply persisted under
+        # the session's own key, splitting one conversation across two files;
+        # a crash before the next slot flush would drop those replies entirely.
+        # Refuse rather than straddle.
+        return web.json_response(
+            {
+                "error": (
+                    "this tab's conversation lives in a channel transcript, so it "
+                    "cannot be handed off to a new Slack thread"
+                ),
+                "code": "transcript_not_own_session",
+            },
+            status=409,
+        )
     thread_ts = await handoff_to_slack(
         state.slack_client,
         state.owner_id,
@@ -289,6 +418,7 @@ async def api_chat_slot_handoff(request: web.Request) -> web.Response:
         title=slot.title if slot._titled else "",
         channel=channel,
         sessions=state.sessions,
+        transcript_key=transcript_key,
     )
     if not thread_ts:
         return web.json_response({"error": "handoff failed"}, status=500)

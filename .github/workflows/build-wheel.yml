@@ -74,6 +74,13 @@ jobs:
           pip install --upgrade build
           python -m build
 
+      # Guard against MANIFEST.in regressions (e.g. a global-exclude silently
+      # stripping a vendored runtime from the sdist, and therefore from the
+      # wheel built from it). Shared with build.yml's PR-time gate so the two
+      # lanes cannot drift; the script documents the closure and the mechanism.
+      - name: Verify vendored native libs survived into the wheel + sdist
+        run: python scripts/verify_vendored_payload.py
+
       - name: Upload wheel artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

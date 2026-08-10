@@ -560,7 +560,7 @@ class AgentConfig:
     streaming: bool = True
     model: str = "auto"            # resolved from agent config
     provider: str = "acp"          # fixed to "acp" (kiro-cli) — the only provider
-    sandbox: str = "off"           # default "off" (defer to kiro-cli's internal agent sandbox); "auto" (namespace on Linux, seatbelt on macOS), "strict", or "off"
+    sandbox: str = "auto"          # default "auto" (namespace on Linux, seatbelt on macOS; delegates to kiro-cli's internal sandbox on macOS when enabled); "off" skips Kiro Crew's sandbox
     sandbox_allow_no_isolation: bool = False  # SEC-009: acknowledge running un-isolated when no sandbox backend exists; false = loud SECURITY warning, true = info-level
     enforce_denied_commands: str = "all"  # "all" or "kirocrew"
     soft_stop_budget_secs: float = 10.0  # seconds to wait for cooperative cancel before hard kill [0.5, 60.0]
@@ -591,6 +591,11 @@ class MemoryConfig:
 class KnowledgeConfig:
     # Knowledge Library ingestion toggles. Embedding/retrieval settings live
     # under MemoryConfig (shared via create_embedder_from_config).
+    auto_add_documents: bool = True                     # agent adds documents it reads (aggregate "Auto-added" source); legacy spelling auto_ingest_doc_links accepted
+    auto_register_project_docs: bool = True             # register each worked-in project's documents as a folder source (document filter only)
+    auto_ingest_chunk_budget: int = 150                 # chunks per sweep for auto-registered sources; 0 = unbounded
+    folder_ingest_chunk_budget: int = 300               # chunks per sweep for hand-added folder sources; per-source chunk_budget overrides; 0 = unbounded
+    dedup_every_n_sweeps: int = 12                      # full dedup pass cadence; 0 disables
     auto_ingest_artifacts: bool = True                  # on by default; ingest local artifacts into the KB (aggregate "Artifacts" source)
     auto_ingest_artifact_kinds: list[str] = ["markdown", "text", "html", "json"]  # reader-extractable kinds (widget/svg excluded)
     embed_timeout_secs: float = 10.0                    # per-request embed timeout; 0/unset -> built-in TIMEOUT (10s)
@@ -626,7 +631,7 @@ class MessagingConfig:
 
 @dataclass
 class SkillsConfig:
-    max_triggered: int = 3         # max skills loaded per message (>=1)
+    max_triggered: int = 0         # max skills loaded per message (>=0)
     lazy_load: bool = False        # inject only a usage-ranked top-K of on-demand skills (long tail via skill_search / $skillname / triggers); off = legacy full skills dump
     # ... auto_create_from_sessions / auto_refine_on_deviation / extra_paths
 
@@ -640,7 +645,7 @@ class TelemetryConfig:
 class DashboardConfig:
     url: str = ""                  # public URL for the dashboard (used in Slack links)
     # ... restore_sessions / bot_name / avatar / widget_density / auto_open_browser / etc.
-    verbosity: str = "default"     # "default" | "concise"; "concise" injects a brevity guideline block into the agent prompt ({{VERBOSITY_BLOCK}}). Read/written via GET/PUT /api/dashboard/config (rejects values other than default|concise). Resolved for all transports in ContextBuilder._resolve_prompt_templates.
+    verbosity: str = "default"     # "default" | "concise" | "ultra"; "concise" injects a brevity guideline block into the agent prompt ({{VERBOSITY_BLOCK}}), "ultra" injects a stricter punchline-first block (answer within a ~3-sentence opening, then scannable detail). Read/written via GET/PUT /api/dashboard/config (rejects values other than default|concise|ultra). Resolved for all transports in ContextBuilder._resolve_prompt_templates; an unrecognized value injects an empty block.
     theme_mode: str = ""           # "dark" | "light" | "system"; empty = unset (frontend falls back to localStorage or "system")
     theme_color: str = ""          # color-theme slug (e.g. "kiro", "emerald", "monokai"); empty = unset
     language: str = ""             # dashboard UI language, BCP-47 (e.g. "en", "zh-CN"); empty = auto-detect from the browser. See "Dashboard UI language" below.
@@ -650,7 +655,7 @@ class DashboardConfig:
     tips_cadence_hours: float = 6.0    # min hours between surfaced tips (server-side gate; clamped >= 0)
     tips_snooze_hours: float = 48.0    # hours before a snoozed tip is eligible again (clamped >= 0)
     tips_recency_decay: float = 0.6    # weighted-random newer-bias decay (clamped to [0, 1])
-    tips_model: str = "claude-haiku-4.5"  # model for tips generation (pinned to Haiku for cost)
+    tips_model: str = "auto"  # model for tips generation ("auto" inherits the account's governed model)
     tips_explore_ratio: float = 0.2    # probability of random catalog pick vs personalized (clamped to [0, 1])
 
 @dataclass
@@ -820,12 +825,13 @@ question accurately on every surface.
 
 The backend validates **shape only** (`_LANGUAGE_TAG_RE`, a conservative BCP-47
 subset), not membership in the set of shipped catalogs. That keeps "which
-languages exist" a pure frontend data change (`SUPPORTED_LANGUAGES` + one
-`locales/<tag>.json`) and never requires a backend edit to add one; a well-formed
-tag with no catalog falls back to detection client-side.
+languages exist" a pure frontend data change: add `locales/<tag>.json`, register
+the picker entry in `SUPPORTED_LANGUAGES`, and add the static import plus
+`AUTHORED_CATALOGS` entry in `i18n/index.ts`. No backend edit is required; a
+well-formed tag with no catalog falls back to detection client-side.
 
 Shipped catalogs (ordered by global speaker count, which is also the picker
-order): `en`, `zh-CN`, `hi`, `es`, `fr`, `bn`, `pt`, `ru`, `de`, `it`. Right-to-left
+order): `en`, `zh-CN`, `hi`, `es`, `fr`, `bn`, `pt`, `ru`, `de`, `ja`, `ko`, `it`. Right-to-left
 languages are deliberately **not** shipped yet: the catalogs would translate
 fine, but the dashboard's layout uses physical-direction utilities (`pl-*`,
 `left-*`, `text-left`) and unmirrored directional icons, so an RTL locale would
@@ -834,12 +840,19 @@ logical-property conversion first.
 
 All catalogs are **statically bundled**, so `t()` stays synchronous (see the
 rationale in `website/src/i18n/index.ts`). The cost is that every user downloads
-every language (~70–80 KB gzip each; ~615 KB gzip for the ten shipped catalogs
-combined). This is acceptable while the dashboard is served from a loopback
-gateway, but it does not scale indefinitely — the documented next step is to keep
-`en` static and lazily fetch the active non-English catalog. That seam is already
-isolated to `website/src/i18n/index.ts` plus a `<Suspense>` boundary in
-`main.tsx`; no call site changes.
+every language: at 8592 keys the catalogs share one chunk that is **~173 KB gzip
+per catalog, ~2.0 MB gzip for the twelve combined** (`npm run analyze`, then gzip
+the `assets/t-*.js` chunk). This is tolerable only because the dashboard is served
+from a loopback gateway — over a network it is already past the point of
+justification, and each further catalog adds another ~173 KB to every user's first
+load regardless of the language they read.
+
+The documented next step is therefore to keep `en` static and lazily fetch the
+active non-English catalog. That seam is already isolated to
+`website/src/i18n/index.ts` plus a `<Suspense>` boundary in `main.tsx`; no call
+site changes. **Catalog #13 belongs behind that seam**: Korean is #12 and the last
+one this chunk absorbs in front of it. Re-measure when the seam lands — the figure
+above is what says whether it worked.
 
 #### The tag reaches the agent, too
 
@@ -853,12 +866,22 @@ has nothing to go on and mirrors the language the user typed in — an inferred
 signal that flips mid-session the moment the user pastes an English stack trace,
 and one that persists, since purposes are stored in session history.
 
-Reading it back off the wire accepts **both** spellings — kiro-cli echoes the
-reserved arg in `rawInput` as either `__tool_use_purpose` or `__toolUsePurpose`
-depending on the call. `acp/_dispatch.py::extract_tool_purpose` (keys in
-`acp/types.py::TOOL_PURPOSE_KEYS`) is the single reader for both transports;
-matching one literal drops the purpose for the other half of the calls, and the
-concise pill silently falls back to the raw command line.
+Reading it back off the wire matches by **shape**, not by a list of literals.
+kiro-cli injects the `__tool_use_purpose` property into every tool schema it
+exposes, and echoes it back in `rawInput` as either that name or a camelCased
+`__toolUsePurpose` — but nothing validates the key, and the model paraphrases
+it: `__purpose`, `__thinking_purpose` and `__woohoo_purpose` all appear in real
+transcripts. `acp/_dispatch.py::extract_tool_purpose` prefers the canonical
+spellings in `acp/types.py::TOOL_PURPOSE_KEYS`, then accepts any *reserved*
+(dunder-prefixed) key whose name ends in `purpose`
+(`_dispatch.py::is_tool_purpose_key`), scanned in sorted order so the reading is
+deterministic. It is the single reader for both transports; matching literals
+drops the purpose for every paraphrased spelling, and the concise pill silently
+falls back to the raw command line while the unrecognized key leaks into the
+arguments view as if it were a real parameter. The dunder prefix is what keeps a
+tool's own functional `purpose` argument out of the match.
+`website/src/utils/toolPurpose.ts` is the frontend mirror, used by the
+pending-approval preview and the Mochi approval bubble.
 
 Three properties are load-bearing:
 
@@ -987,6 +1010,8 @@ Returns the effective config for a channel:
     "history_max_days": 365
   },
   "knowledge": {
+    "auto_add_documents": true,
+    "auto_register_project_docs": true,
     "auto_ingest_artifacts": true,
     "auto_ingest_artifact_kinds": ["markdown", "text", "html", "json"],
     "embed_timeout_secs": 10.0,

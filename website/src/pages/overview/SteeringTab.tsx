@@ -5,6 +5,7 @@ import { api } from '../../api/client'
 import { Card, Btn, SearchInput, EmptyState } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
 import Modal from '../../components/Modal'
+import SearchableSelect from '../../components/SearchableSelect'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
 import type { SteeringFile, SteeringList } from '../../types'
 
@@ -149,7 +150,7 @@ export default function SteeringTab() {
         role="button"
         tabIndex={0}
         aria-current={isSel ? 'true' : undefined}
-        aria-label={`Select ${f.rel}`}
+        aria-label={i18nT('pages.overview.steeringTab.select', { path: f.rel })}
         onClick={() => select(f)}
         onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(f) } }}
         className={`flex flex-col gap-0.5 px-3 py-2.5 rounded-md cursor-pointer mb-1 transition-colors ${
@@ -196,19 +197,34 @@ export default function SteeringTab() {
             onChange={e => setNewName(e.target.value)}
           />
         </label>
+        {/* The control IS nested here — label-has-for only recognises native
+            form elements, so its nesting check false-positives on the trigger
+            <button> SearchableSelect renders. Same disable as SchedulePage's
+            render-timezone label, for the same component family. */}
+        {/* eslint-disable-next-line jsx-a11y/label-has-for */}
         <label className="flex flex-col gap-1" htmlFor="steering-new-scope">
           <span className="text-[13px] text-muted">{i18nT('pages.overview.steeringTab.scope')}</span>
-          <select
+          {/* SearchableSelect, not SimpleSelect: the workspace row is a REAL option
+              that is conditionally unselectable, and only per-option `disabled`
+              keeps it visible — so "workspace scope exists, you just have no
+              project set" survives instead of the row vanishing. The label keeps
+              both channels: `id`/htmlFor so clicking "Scope" focuses the trigger,
+              and an explicit aria-label so the name does not depend on how a
+              <label> is resolved for the <button> the trigger renders as. */}
+          <SearchableSelect
             id="steering-new-scope"
-            className="w-full bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-[13px] outline-none focus-ring"
+            aria-label={i18nT('pages.overview.steeringTab.scope')}
+            options={[
+              {
+                value: 'workspace',
+                label: i18nT('pages.overview.steeringTab.workspace_this_project_only') + (hasProject ? '' : ' (no project set)'),
+                disabled: !hasProject,
+              },
+              { value: 'user', label: i18nT('pages.overview.steeringTab.global_every_project') },
+            ]}
             value={newSource}
-            onChange={e => setNewSource(e.target.value as 'user' | 'workspace')}
-          >
-            <option value="workspace" disabled={!hasProject}>
-              {i18nT('pages.overview.steeringTab.workspace_this_project_only')}{hasProject ? '' : ' (no project set)'}
-            </option>
-            <option value="user">{i18nT('pages.overview.steeringTab.global_every_project')}</option>
-          </select>
+            onChange={v => setNewSource(v as 'user' | 'workspace')}
+          />
         </label>
         <label className="flex flex-col gap-1" htmlFor="steering-new-body">
           <span className="text-[13px] text-muted">{i18nT('pages.overview.steeringTab.content')}</span>
@@ -267,7 +283,7 @@ export default function SteeringTab() {
         <EmptyState
           icon={<Compass className="lucide-inline" />}
           title={i18nT('pages.overview.steeringTab.no_steering_files_yet')}
-          subtitle={`Steering files are always-on markdown conventions. Looked in: ${rootHint || '~/.kiro/steering'}`}
+          subtitle={i18nT('pages.overview.steeringTab.steering_files_looked_in', { path: rootHint || '~/.kiro/steering' })}
         />
       ) : (
         <div className="flex gap-3 h-[calc(100vh-260px)] min-h-[420px]">
@@ -295,13 +311,13 @@ export default function SteeringTab() {
                       <Btn primary disabled={!draft.trim() || updateFile.isPending} onClick={() => updateFile.mutate({ key: selected.key, content: draft })}>{i18nT('pages.overview.steeringTab.save')}</Btn>
                     </>) : (<>
                       <Btn disabled={detail === undefined} onClick={() => { setDraft(detail?.content ?? ''); setEditing(true) }}>{i18nT('pages.overview.steeringTab.edit')}</Btn>
-                      <Btn danger onClick={() => { if (confirm(`Delete "${selected.rel}"?`)) deleteFile.mutate(selected.key) }}>{i18nT('pages.overview.steeringTab.delete')}</Btn>
+                      <Btn danger onClick={() => { if (confirm(i18nT('pages.overview.steeringTab.delete_confirm', { path: selected.rel }))) deleteFile.mutate(selected.key) }}>{i18nT('pages.overview.steeringTab.delete')}</Btn>
                     </>)}
                   </div>
                 </div>
                 <div className="flex-1 min-h-0 overflow-y-auto p-4">
                   {editing
-                    ? <textarea className={EDITOR_CLASS} aria-label={`Edit ${selected.rel}`} value={draft} onChange={e => setDraft(e.target.value)} />
+                    ? <textarea className={EDITOR_CLASS} aria-label={i18nT('pages.overview.steeringTab.edit_2', { path: selected.rel })} value={draft} onChange={e => setDraft(e.target.value)} />
                     : detail === undefined
                       ? <div className="text-muted text-[13px]">{i18nT('pages.overview.steeringTab.loading')}</div>
                       : <div className="text-sm leading-relaxed"><MarkdownRenderer content={detail.content} /></div>}

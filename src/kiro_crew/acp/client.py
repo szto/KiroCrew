@@ -31,13 +31,14 @@ import time
 from collections import deque
 from contextlib import aclosing
 from pathlib import Path
-from typing import Any, AsyncGenerator, AsyncIterator
+from typing import Any, AsyncGenerator, AsyncIterator, Sequence
 
 from kiro_crew import model_registry, platform_compat
 from kiro_crew.acp._dispatch import (
     _kiro_mcp_server_name,
     _kiro_tool_name,
     extract_tool_purpose,
+    parse_session_modes,
     parse_usage_update,
 )
 from kiro_crew.acp.liveness import VERDICT_UNKNOWN, VERDICT_WORKING, LivenessOracle
@@ -96,6 +97,7 @@ from kiro_crew.acp.types import (
     JsonRpcRequest,
     TurnUsage,
 )
+from kiro_crew.agent import ensure_agent_materialized
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.env import augmented_path, resolve_krb5_ccname
@@ -117,6 +119,7 @@ from kiro_crew.sandbox import (
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.skill_usage import get_global_skill_read_observer
 
 logger = logging.getLogger(__name__)
 
@@ -539,6 +542,62 @@ def _resolve_ssh_auth_sock(env: dict[str, str]) -> None:
 
 # Subprocess stdout buffer — kiro-cli can send large JSON-RPC lines (tool outputs)
 _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
+# Ceiling on the bytes discarded while draining ONE oversize line. Per drain call
+# and expressed in BYTES: each call provably ends ON a frame boundary, so a replay
+# of many legitimately-oversize-but-terminated frames each gets its own budget and
+# stays survivable. A count of oversize FRAMES would kill the runtime on exactly
+# that replay. Only a single blob that never terminates can exhaust this.
+_OVERSIZE_DRAIN_MAX_BYTES = 16 * _STDOUT_BUFFER_LIMIT  # 160MB
+
+
+class OversizeLineUnrecoverable(Exception):
+    """An oversize stdout line exceeded the drain budget without terminating."""
+
+
+async def _drain_oversize_line(
+    reader: asyncio.StreamReader, exc: asyncio.LimitOverrunError
+) -> int:
+    """Discard one oversize line ENTIRELY, leaving the stream on a frame boundary.
+
+    Called after ``readuntil(b"\\n")`` raised ``LimitOverrunError``, which consumes
+    nothing. ``exc.consumed`` is the already-buffered prefix that provably holds no
+    separator, so consuming it cannot cross into the next frame; retrying
+    ``readuntil`` then either returns the remainder of the line or raises for
+    another step. Same consume-prefix-and-retry drain as
+    ``mcp_gateway/backend.py::run_stdout_pump``; a plain ``read(n)`` would instead
+    eat into the NEXT frame.
+
+    The recovered remainder is **discarded, never parsed**. It is a byte-slice of
+    the line cut at an arbitrary offset, so it can split a multibyte UTF-8
+    character — and ``json.loads`` on that raises ``UnicodeDecodeError``, which is
+    NOT a ``json.JSONDecodeError`` and would escape the caller's non-JSON guard
+    into its crash handler, killing every multiplexed session over one oversize
+    frame.
+
+    Returns the bytes discarded. Raises ``OversizeLineUnrecoverable`` past
+    ``_OVERSIZE_DRAIN_MAX_BYTES`` (the stream is garbage, not merely verbose) and
+    propagates ``IncompleteReadError`` on EOF mid-drain so the caller can use its
+    normal end-of-stream path.
+    """
+    discarded = 0
+    while True:
+        if exc.consumed <= 0:
+            # Unreachable via CPython, whose consumed always exceeds the reader's
+            # limit; guarded because a zero would make this loop spin without
+            # awaiting and starve the event loop.
+            raise OversizeLineUnrecoverable(
+                f"stream reported a {exc.consumed}-byte oversize prefix"
+            )
+        discarded += len(await reader.readexactly(exc.consumed))
+        if discarded > _OVERSIZE_DRAIN_MAX_BYTES:
+            raise OversizeLineUnrecoverable(
+                f"discarded {discarded} bytes with no frame boundary "
+                f"(limit {_OVERSIZE_DRAIN_MAX_BYTES})"
+            )
+        try:
+            return discarded + len(await reader.readuntil(b"\n"))
+        except asyncio.LimitOverrunError as again:
+            exc = again
 
 # Max consecutive empty reads before checking if process is alive
 _MAX_CONSECUTIVE_EMPTY = 5
@@ -548,6 +607,40 @@ _MAX_CONSECUTIVE_EMPTY = 5
 # popped on the permission event and wholesale-cleared per prompt; this is just a
 # backstop for the pathological no-permission case).
 _MAX_CACHED_TOOL_PARAMS = 256
+
+#: Basename a skill body lives under. Duplicated from ``skills`` deliberately —
+#: the ACP layer must not import the skills machinery just to test a substring.
+_SKILL_FILE_BASENAME = "SKILL.md"
+
+#: Backstop on the per-session set of tool-call ids already credited as skill
+#: reads. Far above any real turn's distinct skill reads; bounds memory for a
+#: long-lived session at the cost of at most one duplicate credit after a reset.
+_MAX_NOTED_SKILL_READS = 512
+
+
+def _mentions_skill_file(raw_params: dict | None, command: str | None) -> bool:
+    """Whether a tool call's arguments name a skill body at all.
+
+    A cheap pre-filter so observing skill reads costs a substring scan on the
+    overwhelming majority of tool calls, which touch no skill. Scans only string
+    and string-sequence values, since a model-authored argument dict may hold
+    arbitrary shapes.
+    """
+    if isinstance(command, str) and _SKILL_FILE_BASENAME in command:
+        return True
+    if not isinstance(raw_params, dict):
+        return False
+    for value in raw_params.values():
+        if isinstance(value, str):
+            if _SKILL_FILE_BASENAME in value:
+                return True
+        elif isinstance(value, (list, tuple)):
+            if any(
+                isinstance(v, str) and _SKILL_FILE_BASENAME in v for v in value
+            ):
+                return True
+    return False
+
 
 # Emitted by kiro-cli as a plain agent_message_chunk when its built-in, non-overridable
 # security filter cancels every tool use in an assistant turn (e.g. shell commands
@@ -652,6 +745,14 @@ class AcpError(Exception):
     def __init__(self, *args: object, transient: bool | None = None) -> None:
         super().__init__(*args)
         self.transient = transient
+        # Reactive-fallback metadata, set by :func:`_raise_acp_error` when a
+        # prompt-time error names a rejected model (so run_bg_oneliner can retry
+        # once with a served model). Guarded so AcpModelUnavailable — which sets
+        # ``advertised`` BEFORE calling super().__init__ — is not clobbered.
+        if not hasattr(self, "rejected_model"):
+            self.rejected_model: str | None = None
+        if not hasattr(self, "advertised"):
+            self.advertised: list[str] = []
 
 
 class AcpTimeoutError(AcpError):
@@ -682,6 +783,41 @@ class AcpAuthRequired(AcpError):  # noqa: N818
     surface the actionable message and skip the retry ladder rather than
     reset-and-requeue the turn.
     """
+
+
+class AcpModelUnavailable(AcpError):  # noqa: N818
+    """An explicitly requested model is not available to this account.
+
+    A DISTINCT type because the semantics differ from every other ``set_model``
+    failure. The generic ones ("the call didn't land") are legitimately handled
+    by tearing the session down and cold-starting. This one means "the request
+    itself is invalid, and no amount of restarting changes that" — falling back
+    to a reset would destroy a live conversation and then quietly land on a
+    different model, reporting success. Callers must surface it (4xx / user
+    error), not recover from it.
+
+    Non-retryable: ``transient`` is fixed False, since no retry earns an
+    entitlement.
+    """
+
+    def __init__(self, model_id: str, advertised: Sequence[str] | None = None) -> None:
+        self.model_id = model_id
+        self.advertised = list(advertised or [])
+        usable = ", ".join(self.advertised) if self.advertised else "none advertised"
+        # The identity hint is CONDITIONAL by construction ("if you expected") and
+        # names only a read-only probe. A user genuinely on a free tier is
+        # correctly served by the first sentence and should not be nudged toward
+        # re-authenticating, so this must never read as an instruction to log out:
+        # `whoami` answers "which tier am I actually on" for the user who signed in
+        # to the wrong one, and merely confirms the situation for everyone else.
+        super().__init__(
+            f"The model {model_id!r} is not available on your account. "
+            f"Available models: {usable}. "
+            f"If you expected this model to be included in your plan, check which "
+            f"account you are signed in as with `kiro-cli whoami` — a Builder ID "
+            f"sign-in carries a different entitlement than organization SSO.",
+            transient=False,
+        )
 
 
 class AcpPromptBusy(AcpError):  # noqa: N818
@@ -717,6 +853,10 @@ _NOT_LOGGED_IN_MESSAGE = (
 # string); throttle, auth, and the 5xx family match the combined
 # `data + message` haystack so a 5xx token in either field is caught.
 _RE_MODEL_UNAVAILABLE = re.compile(r"[Tt]he model '([^']+)' is not available")
+# MPS ValidationException wording for a model the partition/account does not
+# serve — distinct from the "is not available" capacity string above. Covers the
+# ``auto`` sentinel in partitions that do not serve it.
+_RE_INVALID_MODEL_ID = re.compile(r"[Ii]nvalid model ID:\s*([^\s,;'\"]+)")
 _RE_THROTTLE_NAMED = re.compile(
     r"\b(ThrottlingException|TooManyRequestsException|ServiceQuotaExceededException)\b"
 )
@@ -730,7 +870,56 @@ _RE_5XX_NAMED = re.compile(
     r"|DispatchFailure|ConnectionReset(?:Error)?)\b"
 )
 _RE_5XX_STATUS = re.compile(r"(?:HTTP|status)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE)
-_RE_5XX_HINT = re.compile(r"(please try again|response stream)", re.IGNORECASE)
+# Genuine retry hint only. "response stream" USED TO BE matched here, which made
+# this branch a catch-all: kiro-cli wraps EVERY mid-stream provider failure as
+# "Encountered an error in the response stream: <real cause>", so the wrapper
+# prefix alone — present on quota exhaustion, validation errors, anything —
+# classified the error as a momentary 5xx, told the user to retry, and DISCARDED
+# the real cause. A monthly-usage-limit rejection surfaced as "The model backend
+# hit a transient error (HTTP 5xx)" and burned the retry ladder. The wrapper is
+# a transport envelope, not a signal about the failure inside it; classification
+# now reads the inner detail (see _provider_detail).
+_RE_5XX_HINT = re.compile(r"(please try again)", re.IGNORECASE)
+# Session expiry, by HTTP status. An expired session is rejected with 401/403,
+# and nothing else in this module recognised those codes: the error fell through
+# to the 5xx family (a co-occurring DispatchFailure/ConnectionReset from the
+# aborted request is enough to match) and the user was told to retry or switch
+# models, neither of which can succeed against an expired login. Status is the
+# primary signal because the rejection carries no explanatory wording.
+_RE_AUTH_STATUS = re.compile(r"(?:HTTP|status)\s*(?:code\s*)?(?:401|403)\b", re.IGNORECASE)
+# Session expiry, by wording. Complements the status match for backends that
+# describe the expiry in prose without a machine-readable code. Deliberately
+# excludes Bedrock's named exceptions, which _RE_AUTH already owns.
+_RE_SESSION_EXPIRED = re.compile(
+    r"\b(?:session\s+(?:has\s+)?expired|session\s+timed?\s*out"
+    r"|login\s+(?:has\s+)?expired|authentication\s+(?:has\s+)?expired"
+    r"|not\s+logged\s+in|not\s+authenticated"
+    r"|re-?authenticate|login\s+required|auth(?:entication)?\s+required)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_session_expired(haystack: str) -> bool:
+    """True when the failure is an expired session rather than a backend fault.
+
+    Both signals are terminal: retrying cannot refresh a login. Checked before
+    the 5xx family so an aborted request's transport error does not shadow the
+    real cause.
+    """
+    return bool(_RE_AUTH_STATUS.search(haystack) or _RE_SESSION_EXPIRED.search(haystack))
+
+
+# Account/plan capacity is EXHAUSTED — terminal. Distinct from a throttle: a
+# throttle clears in seconds and a retry is the right move, whereas a spent
+# monthly allowance does not come back until it resets, so retrying only adds
+# latency before the same rejection. Checked BEFORE the throttle branch because
+# some limit messages also carry rate-limit-ish wording.
+_RE_USAGE_LIMIT = re.compile(
+    r"\b(?:monthly|daily|weekly)\s+(?:usage\s+)?limit\b"
+    r"|\busage\s+limit\s+has\s+been\s+reached\b"
+    r"|\b(?:MonthlyLimitError|FreeTierLimitExceeded)\b",
+    re.IGNORECASE,
+)
 # kiro-cli's generic wrapper for a backend generation failure that died BEFORE
 # the response stream was established (so no request_id, no error class, and
 # none of the tokens above). Observed a case where data was exactly "Kiro
@@ -743,8 +932,68 @@ _RE_5XX_HINT = re.compile(r"(please try again|response stream)", re.IGNORECASE)
 # flipping an otherwise-terminal error.
 _RE_GENERATE_FAILED = re.compile(r"failed to generate a response", re.IGNORECASE)
 
+# kiro-cli's envelope for a failure that happened mid-stream. The text after the
+# colon is the provider's own message — the same words the CLI prints in a
+# terminal — so it is what a user needs to see.
+_RE_STREAM_ENVELOPE = re.compile(
+    r"^\s*Encountered an error in the response stream:\s*", re.IGNORECASE
+)
+# Trailing "(request_id: ...)" is stripped from the detail because every branch
+# re-appends it via req_id_suffix; leaving it would print the id twice.
+_RE_TRAILING_REQ_ID = re.compile(r"\s*\(request_id:\s*[0-9a-fA-F-]+\)\s*$")
 
-def _is_transient_raw_error(error: object) -> bool:
+
+def _provider_detail(data: str) -> str:
+    """The provider's own error text, unwrapped from kiro-cli's stream envelope.
+
+    Returns "" when *data* carries nothing worth showing. Used by the
+    unknown-shape fallback so an unrecognised provider failure surfaces its real
+    message (CLI parity) instead of a ``repr`` of the JSON-RPC dict. Recognised
+    failure modes keep their curated guidance and do not call this.
+    """
+    detail = _RE_STREAM_ENVELOPE.sub("", str(data or "")).strip()
+    detail = _RE_TRAILING_REQ_ID.sub("", detail).strip()
+    return detail
+
+
+def _model_is_unentitled(data: str, available_models: Sequence[str] | None) -> str | None:
+    """Return the rejected model name iff the account is not entitled to it.
+
+    Upstream reports entitlement failures and transient capacity failures with
+    the SAME string ("The model 'X' is not available"), so the string alone
+    cannot tell them apart. The advertised model list can: it is captured at
+    session init from what this account is actually served, so a rejected model
+    that is absent from it was never on offer -- an entitlement problem no retry
+    can fix. A rejected model that IS advertised really is a transient
+    capacity/rollout blip.
+
+    Returns None when the model is advertised, when nothing was rejected, or
+    when *available_models* is None/empty (entitlement unknowable -- treat as
+    transient rather than telling a user their plan lacks a model on no
+    evidence).
+
+    Both :func:`_format_acp_error` and :func:`_is_transient_raw_error` route
+    through this single helper so the user-facing wording and the retry verdict
+    cannot drift apart -- see the drift warning above.
+    """
+    match = _RE_MODEL_UNAVAILABLE.search(data)
+    if not match:
+        return None
+    if not available_models:
+        return None
+    rejected = match.group(1)
+    # Compare case-insensitively on the bare id: the rejection echoes back the
+    # id that was sent, but casing has no meaning in these ids and an
+    # entitled-but-differently-cased match must not be reported as unentitled.
+    advertised = {m.strip().lower() for m in available_models if m and m.strip()}
+    if rejected.strip().lower() in advertised:
+        return None
+    return rejected
+
+
+def _is_transient_raw_error(
+    error: object, available_models: Sequence[str] | None = None
+) -> bool:
     """True iff a raw ACP JSON-RPC ``error`` is a retryable transient backend
     failure (Bedrock 5xx / throttle / model-unavailable rollout) rather than an
     auth/validation/unknown error that a retry cannot fix.
@@ -753,19 +1002,37 @@ def _is_transient_raw_error(error: object) -> bool:
     user-facing string — so the retry decision is independent of message
     wording. :class:`AcpError` carries this verdict (``.transient``) to the
     retry layer (``llm_helpers``, ``chat_runner``). Precedence mirrors
-    :func:`_format_acp_error`: model-unavailable → throttle → auth(terminal) →
-    generic 5xx / pre-stream generation failure → unknown(terminal)."""
+    :func:`_format_acp_error`: unentitled-model(terminal) →
+    usage-limit(terminal) → model-unavailable → throttle → auth(terminal) →
+    generic 5xx / pre-stream generation failure → unknown(terminal).
+
+    *available_models* is this account's advertised set when the caller knows
+    it. It only ever makes the verdict MORE conservative: a model the account
+    was never offered is terminal instead of being retried to no purpose. Omit
+    it and behaviour is unchanged from before this parameter existed.
+    """
     if not isinstance(error, dict):
         return False
     data = str(error.get("data", "") or "")
     message = str(error.get("message", "") or "")
     haystack = f"{data} {message}"
+    if _model_is_unentitled(data, available_models):
+        # Terminal: the account is not entitled to this model, so every retry
+        # spends latency to reproduce the same rejection.
+        return False
+    if _RE_USAGE_LIMIT.search(haystack):
+        # Terminal: the allowance is spent until it resets. Ahead of the throttle
+        # check so limit wording that also reads as rate-limiting stays terminal.
+        return False
     if _RE_MODEL_UNAVAILABLE.search(data):
         return True
     if _RE_THROTTLE_NAMED.search(haystack) or _RE_THROTTLE_GENERIC.search(haystack):
         return True
     if _RE_AUTH.search(haystack):
         # Auth is terminal — a retry can't fix an expired/denied credential.
+        return False
+    if _is_session_expired(haystack):
+        # Session expiry is terminal — retrying can't refresh an expired login.
         return False
     return bool(
         _RE_5XX_NAMED.search(haystack)
@@ -775,7 +1042,97 @@ def _is_transient_raw_error(error: object) -> bool:
     )
 
 
-def _format_acp_error(error: object) -> str:
+def advertised_model_ids(entries: object) -> list[str]:
+    """Model ids out of an ``availableModels``-shaped list, defensively.
+
+    The advertised list is remote input reshaped by several backends, so this
+    tolerates anything that is not a list of ``{"modelId": ...}`` dicts and
+    returns what it can. Shared by the three call sites that pre-flight a model
+    so none of them re-derives the shape — and so a surprising payload degrades
+    to "entitlement unknown" (empty list -> :func:`model_is_unusable` allows the
+    send) instead of raising inside session startup.
+    """
+    if not isinstance(entries, (list, tuple)):
+        return []
+    ids: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("modelId") or entry.get("value") or ""
+        if isinstance(model_id, str) and model_id.strip():
+            ids.append(model_id)
+    return ids
+
+
+def model_is_unusable(model_id: str, advertised: Sequence[str] | None) -> bool:
+    """True when *advertised* is known and excludes *model_id*.
+
+    The counterpart to :func:`_model_is_unentitled`, moved BEFORE the wire: that
+    one explains a rejection after the fact, this one declines to send a model
+    the backend already told us the account cannot run. Deliberately ONE shared
+    predicate rather than a copy per call site — the same reason #1550 made the
+    formatter and the retry classifier share a discriminator: two spellings of
+    "can this account use it" would eventually disagree.
+
+    Returns False — allow the send — whenever entitlement is unknowable: an
+    empty/None advertised set (no session yet, or a backend that omits
+    ``models``) must not be read as "nothing is allowed", which would withhold
+    every model on a backend that simply does not advertise.
+
+    Only meaningful where the advertised ids share a namespace with *model_id*,
+    and callers gate on that. kiro-cli's advertised ids are exactly the ids
+    ``session/set_model`` accepts, so an id absent from the list is genuinely
+    unusable. The claude backend advertises BARE ids (``claude-opus-4-8[1m]``)
+    while the configured model is the prefixed provider id
+    (``global.anthropic.claude-opus-4-8[1m]``), so comparing those two
+    namespaces would call every legitimate model unusable; that backend
+    announces its own substitutions through the ``session/new`` advisory
+    instead (see ``_new_session_following_substitution``).
+    """
+    if not advertised:
+        return False
+    wanted = model_id.strip().lower()
+    return wanted not in {m.strip().lower() for m in advertised if m and m.strip()}
+
+
+def resolve_usable_model(preferred: str, advertised: Sequence[str] | None) -> str:
+    """Resolve a SUBSTITUTE (non-explicit) model choice to what the account can
+    run, mirroring the interactive path's reset-to-default (``_wire_model_id``).
+
+    Returns ``""`` to mean **"do NOT override — inherit the session's backend
+    default"** (the served model ``session/new`` already assigned), so the wire
+    never receives a model the partition does not serve. Rules:
+
+      - empty ``preferred``           -> ``""`` (already inheriting the default);
+      - ``advertised`` unknown/empty  -> ``""`` for the ``"auto"`` sentinel (never
+        send a literal ``"auto"`` we cannot verify — some partitions do not
+        serve it), else trust a concrete caller-supplied id (nothing to check
+        it against);
+      - ``"auto"``                    -> ``"auto"`` IFF the backend advertises it,
+        else ``""`` — exactly ``_wire_model_id``'s
+        ``"auto" if "auto" in advertised else ""``;
+      - concrete + usable             -> that id;
+      - concrete + not served         -> ``""`` (inherit the served default rather
+        than substituting a possibly-unavailable ``"auto"``).
+
+    The EXPLICIT user-pick paths do NOT use this: they ``raise``
+    (``model_is_unusable``) so a user who chose a model sees an error, not a swap.
+    A reactive retry (``run_bg_oneliner``) remains a thin backstop for the
+    fail-open case where ``advertised`` was unknown at send time.
+    """
+    if not preferred:
+        return ""
+    if not advertised:
+        return "" if preferred == "auto" else preferred
+    ids = [m for m in advertised if m and m.strip()]
+    if preferred == "auto":
+        return "auto" if not model_is_unusable("auto", ids) else ""
+    if not model_is_unusable(preferred, ids):
+        return preferred
+    return ""
+
+
+def _format_acp_error(error: object, available_models: Sequence[str] | None = None) -> str:
     """Format a JSON-RPC error from the ACP backend into actionable user text.
 
     The ACP backend (kiro-cli or claude-agent-acp) surfaces upstream Bedrock
@@ -805,18 +1162,51 @@ def _format_acp_error(error: object) -> str:
         req_id_match = re.search(r"request_id:\s*([0-9a-fA-F-]+)", data)
         req_id_suffix = f" (request_id: {req_id_match.group(1)})" if req_id_match else ""
 
+        # Entitlement failure: this account was never offered the model, so the
+        # capacity/rollout advice below would be actively misleading (there is
+        # nothing to wait for). Checked FIRST because upstream uses the same
+        # string for both cases.
+        unentitled = _model_is_unentitled(data, available_models)
+        if unentitled:
+            usable = [m.strip() for m in (available_models or []) if m and m.strip()]
+            # Cap the list: an account with many models would otherwise bury the
+            # message, and the picker shows the full set anyway.
+            shown = ", ".join(usable[:8])
+            more = f" (+{len(usable) - 8} more)" if len(usable) > 8 else ""
+            formatted = (
+                f"Your account does not have access to model '{unentitled}'. "
+                f"Available to you: {shown}{more}. Pick one in the model picker, "
+                f"or set agent.model to 'auto' to let the backend choose a model "
+                f"your plan includes. Retrying will not help."
+                f"{req_id_suffix}"
+            )
         # Bedrock model alias resolved to a version that is currently
         # unavailable (capacity throttle, region rollout in progress,
         # deprecated, etc.).
-        model_match = _RE_MODEL_UNAVAILABLE.search(data)
-        if model_match:
-            model = model_match.group(1)
+        elif _RE_USAGE_LIMIT.search(haystack):
+            # Plan allowance exhausted. Quote the provider's own sentence rather
+            # than paraphrasing it: it is the authoritative statement of WHICH
+            # limit was hit, and the CLI shows exactly this, so the dashboard
+            # matching it means the two surfaces cannot tell different stories.
+            _limit_detail = _provider_detail(data)
+            # The provider sentence has no trailing period, so add one before
+            # appending guidance or the two run together as one sentence.
+            if _limit_detail and _limit_detail[-1] not in ".!?":
+                _limit_detail += "."
             formatted = (
-                f"Model '{model}' is unavailable on Bedrock right now (capacity "
-                f"throttle or region rollout). Try: (1) pick a different alias in "
-                f"the model picker, (2) edit ~/.claude/settings.json 'model' field "
-                f"to a different version (e.g. claude-opus-4-6-v1), or (3) wait a "
-                f"minute and retry."
+                f"{_limit_detail} Retrying will not help until the limit resets. "
+                f"Check your plan's usage allowance, or switch to a model or "
+                f"account tier with remaining capacity."
+                f"{req_id_suffix}"
+            )
+        elif _RE_MODEL_UNAVAILABLE.search(data):
+            model = str(_RE_MODEL_UNAVAILABLE.search(data).group(1))  # type: ignore[union-attr]
+            formatted = (
+                f"Model '{model}' is unavailable on the backend right now "
+                f"(capacity throttle or region rollout). Try: (1) pick a "
+                f"different model in the model picker, (2) set agent.model to "
+                f"'auto' in ~/.kiro/crew/config.json, or (3) wait a minute and "
+                f"retry."
                 f"{req_id_suffix}"
             )
         elif _RE_THROTTLE_NAMED.search(haystack) or _RE_THROTTLE_GENERIC.search(haystack):
@@ -835,6 +1225,17 @@ def _format_acp_error(error: object) -> str:
                 "(e.g. re-run your SSO/login or 'aws sso login'), then retry. If "
                 "the failure persists, check that the configured AWS profile has "
                 "Bedrock InvokeModel access."
+                f"{req_id_suffix}"
+            )
+        elif _is_session_expired(haystack):
+            # Session expiry (401/403, or prose saying as much) — distinct from
+            # the Bedrock credential errors above. Retrying or switching models
+            # cannot succeed, so the message must not suggest either.
+            formatted = (
+                "Your session has expired. Run `kiro-cli login` in your "
+                "terminal to sign back in, then start a new chat. "
+                "Retrying or switching models will not help — this is a "
+                "sign-in issue, not a backend error."
                 f"{req_id_suffix}"
             )
         elif (
@@ -891,9 +1292,30 @@ def _format_acp_error(error: object) -> str:
                 "and try again — if it persists, send `!restart` to reset the session."
             )
         else:
-            # Unknown shape — preserve the raw dict so we don't lose
-            # information.  Redaction below scrubs any embedded secrets.
-            formatted = f"Prompt error: {error}"
+            # Unrecognised failure mode. Show the PROVIDER'S OWN message when
+            # there is one — it is the true error, and the same words the CLI
+            # prints, so the two surfaces agree. This is the path every provider
+            # failure without a curated branch above now takes; previously such
+            # errors were swallowed by an over-broad 5xx match and reported as a
+            # momentary blip, so the real cause never reached the user at all.
+            #
+            # Falls back to the raw dict only when there is no usable detail
+            # (empty/odd data), so a genuinely opaque shape still loses nothing.
+            # Redaction below scrubs any embedded secrets either way.
+            _detail = _provider_detail(data)
+            if _detail:
+                # Keep the JSON-RPC `message` too when it carries signal. For
+                # -32603 it is the fixed boilerplate "Internal error" (pure
+                # noise next to the provider text), but other codes use it as
+                # the actual summary, and dropping it there would lose the only
+                # description the error has.
+                _summary = "" if message.strip().lower() == "internal error" else message.strip()
+                if _summary and _summary.lower() not in _detail.lower():
+                    formatted = f"{_summary}: {_detail}{req_id_suffix}"
+                else:
+                    formatted = f"{_detail}{req_id_suffix}"
+            else:
+                formatted = f"Prompt error: {error}"
     else:
         formatted = f"Prompt error: {error}"
 
@@ -920,21 +1342,49 @@ def _format_acp_error(error: object) -> str:
 _PROMPT_BUSY_RE = re.compile(r"already in progress", re.IGNORECASE)
 
 
-def _raise_acp_error(error: object) -> None:
+def _rejected_model_from_error(error: object) -> str | None:
+    """Return the model id a prompt-time error reports as invalid/unavailable.
+
+    Powers the reactive fallback in ``run_bg_oneliner``: on the SUBSTITUTE
+    (background) path, a rejected model is retried once against the account's
+    advertised list. Matches both the MPS ``Invalid model ID: X``
+    ValidationException (including the ``auto`` sentinel where a partition does
+    not serve it) and the ``The model 'X' is not
+    available`` wording. Returns None when the error names no specific model.
+    """
+    if not isinstance(error, dict):
+        return None
+    data = f"{error.get('data', '')} {error.get('message', '')}"
+    m = _RE_INVALID_MODEL_ID.search(data) or _RE_MODEL_UNAVAILABLE.search(data)
+    return m.group(1) if m else None
+
+
+def _raise_acp_error(error: object, available_models: Sequence[str] | None = None) -> None:
     """Format and raise the appropriate AcpError subclass for *error*.
 
     Delegates formatting to ``_format_acp_error`` and raises either
     ``AcpPromptBusy`` (when the backend reports a concurrent in-flight prompt)
     or the generic ``AcpError`` for all other cases.
+
+    *available_models* is passed to BOTH the formatter and the transient
+    classifier so a model-rejection's wording and its retry verdict are decided
+    from the same evidence.
     """
-    formatted = _format_acp_error(error)
+    formatted = _format_acp_error(error, available_models)
     # Detect prompt-busy from the raw error (before formatting rewrites it)
     raw_data = ""
     if isinstance(error, dict):
         raw_data = f"{error.get('data', '')} {error.get('message', '')}"
     if _PROMPT_BUSY_RE.search(raw_data):
         raise AcpPromptBusy(formatted)
-    raise AcpError(formatted, transient=_is_transient_raw_error(error))
+    err = AcpError(formatted, transient=_is_transient_raw_error(error, available_models))
+    # Tag a model-rejection so the SUBSTITUTE (background) retry layer can pick a
+    # served model; harmless on every other error (attributes just stay unset).
+    rejected = _rejected_model_from_error(error)
+    if rejected:
+        err.rejected_model = rejected
+        err.advertised = list(available_models or [])
+    raise err
 
 
 # Matches claude-agent-acp policy-substitution advisories:
@@ -1092,8 +1542,11 @@ def _get_start_time(pid: int) -> int | None:
             fields = stat.rsplit(")", 1)[1].split()
             return int(fields[19])  # field 22 = starttime
         # macOS: use ps -o lstart= (absolute start timestamp, constant for process lifetime)
+        ps_bin = platform_compat.trusted_system_bin("ps")
+        if ps_bin is None:
+            return None
         out = subprocess_mod.check_output(
-            ["ps", "-o", "lstart=", "-p", str(pid)], stderr=subprocess_mod.DEVNULL, timeout=2
+            [ps_bin, "-o", "lstart=", "-p", str(pid)], stderr=subprocess_mod.DEVNULL, timeout=2
         )
         return hash(out.strip())  # stable per-process, changes on recycle
     except Exception:
@@ -1119,8 +1572,11 @@ def _read_basename(pid: int) -> bytes | None:
                 return None
             return cmdline.split(b"\x00", 1)[0].rsplit(b"/", 1)[-1]
         else:
+            ps_bin = platform_compat.trusted_system_bin("ps")
+            if ps_bin is None:
+                return None
             out = subprocess_mod.check_output(
-                ["ps", "-o", "comm=", "-p", str(pid)], stderr=subprocess_mod.DEVNULL, timeout=2
+                [ps_bin, "-o", "comm=", "-p", str(pid)], stderr=subprocess_mod.DEVNULL, timeout=2
             )
             name = out.strip()
             if not name:
@@ -1342,6 +1798,16 @@ class AcpClient:
         # offers rather than a hardcoded guess. Each entry: {modelId, name,
         # description}.
         self._available_models: list[dict[str, str]] = []
+        # Mode ids the backend advertised at session init (session/new|load
+        # `modes.availableModes`). Empty when the backend omits `modes` (older
+        # kiro-cli / offline fake) — the set_mode guard treats empty as "attempt"
+        # for backward compatibility. Populated by _store_session_config.
+        self._available_mode_ids: list[str] = []
+        # Whether the backend advertised a `modes` list at all (even an empty
+        # one). Distinguishes "unknown, attempt for backward compat" (False)
+        # from "advertised zero/some modes, honor the list" (True) so an
+        # explicitly-empty availableModes fails closed rather than attempting.
+        self._modes_advertised: bool = False
         # Model kiro-cli/claude-agent-acp actually resolved to (may differ
         # from self._model when that's the "auto" sentinel). Used to look up
         # the context window when usage_update isn't sent (see _track_metadata).
@@ -1359,6 +1825,14 @@ class AcpClient:
         # the later permission_request event (which carries no kind) can inherit
         # the canonical shell signal. Mirrors _tool_call_inputs lifecycle.
         self._tool_call_is_shell: dict[str, bool] = {}
+        # toolCallIds already credited to the skill-usage ledger as a body read.
+        # The arguments arrive on either the initial tool_call or its refinement
+        # depending on the provider, so both are observed and this prevents one
+        # read being counted twice. Mirrors _tool_call_is_shell's lifecycle.
+        self._skill_read_noted: set[str] = set()
+        # toolCallId -> skill keys resolved at call time, credited only when
+        # the tool reports completion so a denied read leaves no delivery.
+        self._pending_skill_reads: dict[str, list[str]] = {}
         # Map toolCallId → trusted MCP server name (_meta.kiro.mcpServerName),
         # cached from the tool_call notification so the later permission_request
         # event (which carries no _meta) can inherit it — the signal the
@@ -1522,6 +1996,23 @@ class AcpClient:
         """Switch model on a running session (used by warm pool post-claim)."""
         if not self._session_id:
             raise AcpError("Cannot set model before session is initialized")
+        # Unlike the spawn path, this is an explicit request for THIS model, so
+        # a silent downgrade would report success while running something else.
+        # Refuse before the wire and name what the account can use.
+        # AcpModelUnavailable (not a bare AcpError) so callers can tell "invalid
+        # request" from "the call didn't land": the generic failure is recovered
+        # by resetting the session, which for THIS case would destroy a live
+        # conversation and then land on a different model anyway.
+        #
+        # Callers passing an INHERITED value (warm-pool post-claim re-apply of a
+        # persisted slot model) must pre-check with model_is_unusable and skip
+        # instead of calling into here — otherwise the same stale setting that is
+        # quietly withheld on a cold start would raise and kill a warm claim,
+        # making the outcome depend on whether a pooled process happened to exist.
+        if not self._is_claude and self._model_is_unusable(model_id):
+            _rejected_log, _ = redact_exfiltration_urls(str(model_id))
+            _rejected_log, _ = redact_credentials(_rejected_log)
+            raise AcpModelUnavailable(_rejected_log, self._advertised_model_ids())
         if self._is_claude:
             await self.set_config_option("model", model_id)
         else:
@@ -1621,6 +2112,79 @@ class AcpClient:
             ]
         return []
 
+    def _advertised_model_ids(self) -> list[str]:
+        """Advertised model ids, for the model-rejection error path.
+
+        Empty when the backend advertised nothing (no session yet, or a backend
+        that omits ``models``), which the error path reads as "entitlement
+        unknown" and leaves the existing transient/capacity handling alone.
+        """
+        ids = []
+        for entry in self._available_models:
+            model_id = entry.get("modelId") if isinstance(entry, dict) else None
+            if isinstance(model_id, str) and model_id.strip():
+                ids.append(model_id)
+        return ids
+
+    def _model_is_unusable(self, model_id: str) -> bool:
+        """Whether this session's advertised set excludes *model_id*.
+
+        Thin bind of :func:`model_is_unusable` to the set captured at
+        ``session/new`` / ``session/load``, so this client and the
+        ``providers.acp`` live path share one definition of entitlement.
+        """
+        return model_is_unusable(model_id, self._advertised_model_ids())
+
+    async def _apply_startup_model(self) -> None:
+        """Apply the configured model to a freshly initialized session.
+
+        Split out of ``_init_session`` step 5 so the withhold decision is
+        reachable without standing up a whole session.
+
+        The model here was NOT chosen for this turn: it arrives from the agent
+        spec, the config default, or a slot value persisted before the account's
+        entitlements were known. So when the backend has already told us the
+        account cannot run it, withholding beats failing — the user did not pick
+        this model and cannot be expected to know why every turn dies. The
+        session simply stays on the backend's own default, which ``session/new``
+        already applied and reported as ``currentModelId``.
+
+        Note this fixes the WIRE, not the stored setting: the persisted config /
+        slot value is untouched, so a picker reading it still shows the model
+        that was withheld. Healing the stored value is a separate change.
+
+        An EXPLICIT switch is handled the opposite way in :meth:`set_model`:
+        there the user asked for that exact model, and quietly running another
+        one would be a lie.
+        """
+        if not self._model or self._model == DEFAULT_MODEL:
+            logger.info("ACP model: %s (from agent config)", self._model or "auto")
+            return
+        if not self._is_claude and self._model_is_unusable(self._model):
+            _withheld_log, _ = redact_exfiltration_urls(str(self._model))
+            _withheld_log, _ = redact_credentials(_withheld_log)
+            logger.warning(
+                "ACP model %s is not available to this account; staying on the "
+                "backend default %s (advertised: %s)",
+                _withheld_log,
+                self._resolved_model_id or DEFAULT_MODEL,
+                ", ".join(self._advertised_model_ids()),
+            )
+            # Record the session as running the default rather than the value we
+            # declined: the "!= DEFAULT_MODEL" test above is also what the
+            # warm-pool re-apply path reads (session_provider), so leaving the
+            # unusable id here would re-offer it on every claim.
+            self._model = DEFAULT_MODEL
+            return
+        if self._is_claude:
+            await self.set_config_option("model", self._model)
+        else:
+            await self._send_request(
+                METHOD_SET_MODEL,
+                {"sessionId": self._session_id, "modelId": self._model},
+            )
+        logger.info("ACP model: %s", self._model)
+
     async def set_config_option(self, config_id: str, value: str) -> None:
         """Set a session config option (e.g. effort level) via session/set_config_option."""
         if not self._session_id:
@@ -1647,6 +2211,14 @@ class AcpClient:
             self._acp_config_options = config_options
             logger.debug("ACP config options loaded: %d entries", len(config_options))
             self._sync_effort_levels()
+        # Capture advertised mode ids + whether a modes list was advertised at
+        # all, so step 4's set_mode can fail closed against a requested agent the
+        # backend never loaded (would fault with "Mode '<agent>' not found").
+        # Assigned unconditionally so a re-init that omits `modes` clears any
+        # stale state rather than guarding on it.
+        self._available_mode_ids, _current_mode, self._modes_advertised = (
+            parse_session_modes(resp)
+        )
 
     def _handle_config_option_update(self, msg: JsonRpcMessage) -> None:
         """Process a config_option_update session notification.
@@ -1768,6 +2340,14 @@ class AcpClient:
                 raise AcpError(str(exc)) from exc
             if not kiro_bin:
                 raise AcpError(f"{KIRO_CLI_BIN} not found in PATH")
+            # Self-heal (B): ensure the managed default agent file exists before
+            # this --agent spawn, so kiro-cli registers the mode and step 4's
+            # set_mode succeeds instead of faulting "Mode not found". Best-effort,
+            # off the loop; non-managed agents fall through to the step-4 guard.
+            try:
+                await asyncio.to_thread(ensure_agent_materialized, self._agent)
+            except Exception:
+                logger.warning("pre-spawn agent materialization failed", exc_info=True)
             argv = [kiro_bin, KIRO_CLI_SUBCMD, "--agent", self._agent]
 
         # OS-level sandbox: wrap the command to hide sensitive paths.
@@ -2346,25 +2926,32 @@ class AcpClient:
                 self._jsonl_pos = 0
 
         # 4. Activate agent via set_mode (claude-agent-acp does not support set_mode — skip).
+        #    Guard (A): fire only when the backend advertised this agent, or
+        #    advertised no modes at all (older kiro-cli / fake → attempt,
+        #    backward-compatible). If modes ARE advertised but this agent is
+        #    absent, its ~/.kiro/agents/<agent>.json didn't load — FAIL CLOSED
+        #    with an actionable error rather than silently running kiro-cli's
+        #    default (broader) mode, which for a restricted agent is a privilege
+        #    escalation. Self-heal (B, in _spawn) regenerates the managed default
+        #    so the common case never reaches this branch.
         if not self._is_claude:
-            await self._send_request(
-                METHOD_SET_MODE,
-                {"sessionId": self._session_id, "modeId": self._agent},
-            )
-            logger.info("ACP agent activated: %s", self._agent)
+            if not self._modes_advertised or self._agent in self._available_mode_ids:
+                await self._send_request(
+                    METHOD_SET_MODE,
+                    {"sessionId": self._session_id, "modeId": self._agent},
+                )
+                logger.info("ACP agent activated: %s", self._agent)
+            else:
+                raise AcpError(
+                    f"Agent mode {self._agent!r} is not available on this session "
+                    f"(advertised modes: {self._available_mode_ids or 'none'}); its "
+                    f"~/.kiro/agents/{self._agent}.json is likely missing. Refusing "
+                    f"to run the backend default mode in its place. Run "
+                    f"`kirocrew setup --agent-only` to materialize the agent config."
+                )
 
         # 5. Set model — override if KiroCrew config specifies non-default.
-        if self._model and self._model != DEFAULT_MODEL:
-            if self._is_claude:
-                await self.set_config_option("model", self._model)
-            else:
-                await self._send_request(
-                    METHOD_SET_MODEL,
-                    {"sessionId": self._session_id, "modelId": self._model},
-                )
-            logger.info("ACP model: %s", self._model)
-        else:
-            logger.info("ACP model: %s (from agent config)", self._model or "auto")
+        await self._apply_startup_model()
 
         # Drain MCP server init notifications
         await self._drain_notifications()
@@ -2511,14 +3098,29 @@ class AcpClient:
             return None
         except (ValueError, asyncio.LimitOverrunError) as exc:
             # A single JSON-RPC line exceeded the stdout StreamReader buffer
-            # (_STDOUT_BUFFER_LIMIT). asyncio leaves the stream in a corrupted
-            # state after an overrun — every subsequent read also fails — so
-            # treat the process as dead and let session recovery respawn it
-            # instead of freezing the session on an unhandled exception.
-            raise AcpProcessDied(
-                f"ACP stdout line exceeded {_STDOUT_BUFFER_LIMIT}-byte buffer: {exc}"
-            ) from exc
-
+            # (_STDOUT_BUFFER_LIMIT). This does NOT corrupt the stream, contrary
+            # to what this call site used to assume: before raising ValueError,
+            # readline() deletes the oversize line through its terminating
+            # newline when one is already buffered, else clears the buffer, then
+            # resumes the transport (CPython asyncio.streams.StreamReader
+            # .readline — its docstring states this). So drop the frame and let
+            # the caller read the next one, exactly like the blank-line and
+            # non-JSON paths below; raising AcpProcessDied here ended a healthy
+            # live turn over one unreadably large frame.
+            #
+            # NOTE the deliberate asymmetry with AcpRuntime._reader_loop, which
+            # additionally enforces a drain budget: that reader is a standalone
+            # task with no deadline, so an endlessly unterminated stream needs an
+            # explicit terminal state there. HERE every call is bounded by the
+            # caller's `timeout` and the callers run their own deadlines, so the
+            # worst case is one turn ending on its deadline instead of a frame —
+            # no unbounded state, and still strictly better than killing the turn
+            # on the first oversize frame. Computing a byte budget would require
+            # readuntil (readline reports neither the branch taken nor the bytes
+            # dropped), i.e. hand-rolling readline's buffer repair on the path
+            # that is NOT the reported failure.
+            logger.warning("Dropped an oversize ACP stdout frame: %s", exc)
+            return None
         if not line:
             # EOF — process likely died or closing. Check and avoid busy-loop.
             if self._process and self._process.returncode is not None:
@@ -3058,16 +3660,7 @@ class AcpClient:
         await self.ensure_ready()
 
         req_id = await self._send_prompt(message)
-        prev_pct = self.last_prompt_stats.context_pct
-        _prev_used = self.last_prompt_stats.context_used_tokens
-        _prev_window = self.last_prompt_stats.context_window_tokens
-        _prev_from_usage = self.last_prompt_stats.context_tokens_from_usage
-        self.last_prompt_stats = AcpPromptStats(
-            context_pct=prev_pct,
-            context_used_tokens=_prev_used,
-            context_window_tokens=_prev_window,
-            context_tokens_from_usage=_prev_from_usage,
-        )
+        self.last_prompt_stats = self.last_prompt_stats.carry_over()
 
         # aclosing(): _prompt_loop holds _turn_lock and releases it in its
         # finally. Consumers below `return` on "complete" without exhausting the
@@ -3087,7 +3680,7 @@ class AcpClient:
                     self._turn_done.set()
                     return
                 if action == "error":
-                    _raise_acp_error(msg.error)
+                    _raise_acp_error(msg.error, self._advertised_model_ids())
                 if action == "permission":
                     await self._handle_permission(msg)
                 elif action == "server_request_unknown":
@@ -3139,18 +3732,11 @@ class AcpClient:
         extract_agent_from_result: bool = False,
     ) -> AsyncIterator[AcpEvent]:
         """Shared event dispatch loop for prompts and commands."""
-        prev_pct = self.last_prompt_stats.context_pct
-        _prev_used = self.last_prompt_stats.context_used_tokens
-        _prev_window = self.last_prompt_stats.context_window_tokens
-        _prev_from_usage = self.last_prompt_stats.context_tokens_from_usage
-        self.last_prompt_stats = AcpPromptStats(
-            context_pct=prev_pct,
-            context_used_tokens=_prev_used,
-            context_window_tokens=_prev_window,
-            context_tokens_from_usage=_prev_from_usage,
-        )
+        self.last_prompt_stats = self.last_prompt_stats.carry_over()
         self._tool_call_inputs.clear()
         self._tool_call_is_shell.clear()
+        self._skill_read_noted.clear()
+        self._pending_skill_reads.clear()
         self._tool_call_mcp_server.clear()
         self._tool_call_tool_name.clear()
         self._tool_call_params.clear()
@@ -3214,7 +3800,7 @@ class AcpClient:
                 )
                 return
             if action == "error":
-                _raise_acp_error(msg.error)
+                _raise_acp_error(msg.error, self._advertised_model_ids())
             if action == "permission":
                 yield self._build_permission_event(msg)
             elif action == "server_request_unknown":
@@ -3271,6 +3857,7 @@ class AcpClient:
                     # with the main agent / SubagentManager. PostToolUse fires
                     # separately on the tool_result branch below (fire_tool_hooks
                     # is Pre-only). No-op unless audit_source is set.
+                    await self._maybe_note_skill_read(tool_event)
                     await self._maybe_fire_pre_tool_hooks(tool_event)
                     yield tool_event
                 # Real-time tool result from `tool_call_update` session updates.
@@ -3290,6 +3877,7 @@ class AcpClient:
                     # (and its output) exists — the Pre-vs-Post split is required
                     # because fire_tool_hooks above is PreToolUse-only. No-op
                     # unless audit_source is set.
+                    self._maybe_credit_skill_read(tool_result_event)
                     await self._maybe_fire_post_tool_hooks(tool_result_event)
                     yield tool_result_event
                 # claude-agent-acp emits a separate `tool_call_update` carrying
@@ -3300,6 +3888,7 @@ class AcpClient:
                 # patched in place — see `EVENT_TOOL_CALL_UPDATE` in chat_runner.
                 tool_refine_event = self._extract_tool_call_refinement(msg)
                 if tool_refine_event:
+                    await self._maybe_note_skill_read(tool_refine_event)
                     yield tool_refine_event
             elif action == "metadata":
                 self._track_metadata(msg)
@@ -3697,16 +4286,7 @@ class AcpClient:
 
     async def _read_prompt_response(self, req_id: int, timeout: float) -> str:
         output: list[str] = []
-        prev_pct = self.last_prompt_stats.context_pct
-        _prev_used = self.last_prompt_stats.context_used_tokens
-        _prev_window = self.last_prompt_stats.context_window_tokens
-        _prev_from_usage = self.last_prompt_stats.context_tokens_from_usage
-        self.last_prompt_stats = AcpPromptStats(
-            context_pct=prev_pct,
-            context_used_tokens=_prev_used,
-            context_window_tokens=_prev_window,
-            context_tokens_from_usage=_prev_from_usage,
-        )
+        self.last_prompt_stats = self.last_prompt_stats.carry_over()
 
         async for action, msg in self._prompt_loop(req_id, timeout):
             if action == "complete":
@@ -3718,7 +4298,7 @@ class AcpClient:
                 self._turn_done.set()
                 return "".join(output)
             if action == "error":
-                _raise_acp_error(msg.error)
+                _raise_acp_error(msg.error, self._advertised_model_ids())
             if action == "permission":
                 await self._handle_permission(msg)
             elif action == "server_request_unknown":
@@ -3749,9 +4329,11 @@ class AcpClient:
                             tool_event.tool_kind or "",
                         )
                     await self._maybe_audit_tool_call(tool_event)
+                    await self._maybe_note_skill_read(tool_event)
                     await self._maybe_fire_pre_tool_hooks(tool_event)
                 tool_result_event = self._extract_tool_call_update(msg)
                 if tool_result_event:
+                    self._maybe_credit_skill_read(tool_result_event)
                     await self._maybe_fire_post_tool_hooks(tool_result_event)
             elif action == "metadata":
                 self._track_metadata(msg)
@@ -3839,6 +4421,7 @@ class AcpClient:
                 # Mark the counts authoritative so a later metadata
                 # contextUsagePercentage cannot clobber this token-derived pct.
                 self.last_prompt_stats.context_tokens_from_usage = True
+                self.last_prompt_stats.note_pct_reported()
             else:
                 logger.debug("usage_update missing used/size: %s", update)
         elif kind == UPDATE_CONFIG_OPTION:
@@ -3897,6 +4480,85 @@ class AcpClient:
             )
         except Exception:
             logger.warning("ACP-layer SEL audit failed", exc_info=True)
+
+    async def _maybe_note_skill_read(self, tool_event: "AcpEvent") -> None:
+        """Resolve which skills a tool call is about to read, crediting later.
+
+        Lives here because the ACP layer is the one place that sees EVERY
+        surface's tool calls — dashboard, Slack, subagents, task runner. The
+        per-surface permission gate (``HookManager.on_tool_call``) is not usable
+        for this: file reads are auto-approved, so they never reach it.
+
+        Resolution is filesystem-bound (a skills-tree walk after cache expiry,
+        plus a ``resolve()`` per served skill), so it is offloaded to a thread —
+        on the event loop it would stall every session in the gateway. Nothing
+        is recorded here: the keys are held until ``_maybe_credit_skill_read``
+        sees the tool complete, so a denied or failed read leaves no delivery.
+
+        Fires for the initial ``tool_call`` and its ``tool_call_update``
+        refinement, whichever first carries the arguments (claude-agent-acp
+        leaves ``rawInput`` empty on the initial notification), deduped by
+        ``tool_call_id``.
+
+        Gated on the skill basename appearing in the arguments BEFORE any
+        offload, so a tool call unrelated to skills costs one substring scan.
+        Whether the call is a content-delivering READ (rather than a delete,
+        move, or grep that merely names the path) is decided by the observer.
+        Failures are swallowed: telemetry must not disturb the tool call.
+        """
+        observer = get_global_skill_read_observer()
+        if observer is None:
+            return
+        tool_id = tool_event.tool_call_id or ""
+        if tool_id and tool_id in self._skill_read_noted:
+            return
+        raw_params = tool_event.raw_tool_params
+        command = tool_event.shell_command
+        if not _mentions_skill_file(raw_params, command):
+            return
+        if tool_id:
+            if len(self._skill_read_noted) >= _MAX_NOTED_SKILL_READS:
+                # A single turn cannot legitimately hold this many distinct
+                # skill reads; drop the tracking wholesale rather than letting
+                # it grow for the life of the session. Worst case after a reset
+                # is one duplicate credit, not a leak.
+                self._skill_read_noted.clear()
+                self._pending_skill_reads.clear()
+            self._skill_read_noted.add(tool_id)
+        try:
+            keys = await asyncio.to_thread(
+                observer.resolve_tool_read_keys,
+                tool_event.tool_name or "",
+                raw_params,
+                command,
+            )
+        except Exception:
+            logger.warning("skill-read resolution failed", exc_info=True)
+            return
+        if keys and tool_id:
+            self._pending_skill_reads[tool_id] = keys
+
+    def _maybe_credit_skill_read(self, tool_result_event: "AcpEvent") -> None:
+        """Credit the reads resolved for a tool call that has now completed.
+
+        Only a ``status == "completed"`` result (``tool_final``) credits, so a
+        read that was denied, errored, or never ran contributes no delivery.
+        In-memory only — the ledger debounces its own disk write — so this is
+        safe to run inline on the event loop.
+        """
+        if not tool_result_event.tool_final:
+            return
+        tool_id = tool_result_event.tool_call_id or ""
+        keys = self._pending_skill_reads.pop(tool_id, None) if tool_id else None
+        if not keys:
+            return
+        observer = get_global_skill_read_observer()
+        if observer is None:
+            return
+        try:
+            observer.credit_skill_reads(keys)
+        except Exception:
+            logger.warning("skill-read credit failed", exc_info=True)
 
     async def _maybe_fire_pre_tool_hooks(self, tool_event: "AcpEvent") -> None:
         """Fire the PreToolUse HOOK ENGINE for a tool_call, for audit-source clients.
@@ -4595,6 +5257,7 @@ class AcpClient:
                 # valid JSON). NaN is caught by its self-inequality.
                 pct_f = 0.0 if pct_f != pct_f else min(max(pct_f, 0.0), 100.0)
                 self.last_prompt_stats.context_pct = pct_f
+                self.last_prompt_stats.note_pct_reported()
                 self._backfill_context_window(pct_f)
             except (TypeError, ValueError):
                 pass

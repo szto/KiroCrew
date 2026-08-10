@@ -35,7 +35,7 @@ const mockCtx = {
   })),
 }
 
-;(window as unknown as { AudioContext: unknown }).AudioContext = vi.fn(() => mockCtx)
+;(window as unknown as { AudioContext: unknown }).AudioContext = vi.fn(function () { return mockCtx })
 
 beforeEach(() => {
   localStorage.clear()
@@ -136,8 +136,8 @@ describe('presetForKind', () => {
     expect(presetForKind('cron', base)).toBe('ding')
   })
 
-  it('falls back to "all" when no category-specific preset', () => {
-    expect(presetForKind('approval', base)).toBe('chime')
+  it('falls back to built-in category default when no category-specific preset', () => {
+    expect(presetForKind('approval', base)).toBe('pulse')
   })
 
   it('falls back to "all" for undefined kind', () => {
@@ -301,6 +301,6 @@ describe('useNotificationSound', () => {
 // -- SOUND_PRESETS invariant ---------------------------------------------------
 describe('SOUND_PRESETS', () => {
   it('exports the expected preset names', () => {
-    expect(SOUND_PRESETS).toEqual(['chime', 'ding', 'blip', 'pop'])
+    expect(SOUND_PRESETS).toEqual(['chime', 'ding', 'blip', 'pop', 'pulse'])
   })
 })

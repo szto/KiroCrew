@@ -37,6 +37,7 @@ from kiro_crew.config.loader import (
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.origin import check_host, is_direct_local_request
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.stt_stream import _STREAMING_PROVIDERS
 from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token, parse_duration
 from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
@@ -461,14 +462,20 @@ def _is_apple_silicon() -> bool:
 def _stt_providers() -> list[str]:
     """STT provider values offered to the UI.
 
-    ``mlx`` (Whisper on Apple's MLX framework) only runs on Apple Silicon, so
-    it is omitted entirely on every other platform rather than being shown as
-    an unusable option. This is the single source of truth for which providers
-    are advertised (GET) and accepted (PUT).
+    ``mlx`` (Whisper on Apple's MLX framework) only runs on Apple Silicon, and
+    ``apple`` (the on-device SpeechAnalyzer framework) needs macOS 26 or later plus
+    a Swift toolchain — both are omitted entirely elsewhere rather than being shown
+    as unusable options. This is the single source of truth for which providers are
+    advertised (GET) and accepted (PUT).
     """
     providers = list(_VALID_STT_PROVIDERS)
     if not _is_apple_silicon() and "mlx" in providers:
         providers.remove("mlx")
+    if "apple" in providers:
+        from kiro_crew import apple_speech
+
+        if not apple_speech.availability().ok:
+            providers.remove("apple")
     return providers
 
 
@@ -576,6 +583,11 @@ async def api_stt_config(request: web.Request) -> web.Response:
             "models": _STT_MODEL_SIZES,
             "mlx_models": _STT_MLX_MODELS,
             "providers": _stt_providers(),
+            # Which of those providers can stream partial results. Served from the
+            # backend's own `_STREAMING_PROVIDERS` so the Settings UI gates the
+            # streaming controls on a CAPABILITY rather than on a hardcoded provider
+            # name — the latter silently hid the toggle when `apple` was added.
+            "streaming_providers": list(_STREAMING_PROVIDERS),
             "language_codes": list(_STT_LANGUAGE_CODES),
             "install_step": _stt_install_status["step"],
             "install_detail": _stt_install_status["detail"],
@@ -859,6 +871,14 @@ def _build_stt_install_script(provider: str = "whisper") -> str:
 
     - ``mlx``: installs mlx-whisper via pipx (Apple Silicon only) plus ffmpeg.
     - ``whisper`` (default): installs openai-whisper + ffmpeg via brew or pip.
+
+    The pip fallback deliberately targets a SYSTEM python with ``--user`` (never
+    the gateway's own venv, which is replaced on every upgrade). ``--user`` lands
+    in ``~/.local/bin``, which :func:`kiro_crew.transcribe._find_whisper` probes
+    via its ``_WHISPER_SEARCH_PATHS`` (and via ``shutil.which`` when that dir is
+    on PATH). It also constrains the resolve so pip can never drop into a source
+    build — see the ``BINARY_ONLY`` comment in the script for why an incompatible
+    wheel otherwise reports itself as a compiler error.
     """
     prelude = _stt_install_path_prelude()
     if provider == "mlx":
@@ -914,8 +934,41 @@ if [ -z "$PY" ]; then
 fi
 echo "Using: $PY ($($PY --version))"
 
+# openai-whisper itself is a pure-Python sdist, but its dependency tree is not:
+# numpy / numba / llvmlite / torch / triton / tiktoken all ship COMPILED wheels.
+# When pip finds no wheel matching the host it silently falls back to the source
+# tarball and starts a compile — which is why a wheel-compatibility problem
+# surfaces as a toolchain error ("GCC >= 9.3", "metadata-generation-failed")
+# that names numpy and looks unrelated to the missing wheel. Amazon Linux 2 ships
+# glibc 2.26, so pip accepts at most manylinux_2_17, while current numpy publishes
+# manylinux_2_28 only — the default resolve therefore fetches numpy-2.5.1.tar.gz
+# and dies on the system GCC (7.3 on AL2).
+#
+# --only-binary removes sdists from the candidate set for exactly these packages,
+# so the resolver BACKTRACKS to the newest version that does have a compatible
+# wheel instead of compiling (verified on glibc 2.26: numpy 2.5.1 -> 2.2.6
+# manylinux_2_17, exit 0). Deliberately NO pinned version ceiling: a hardcoded cap
+# would rot as hosts and wheel tags move, while letting pip choose the newest
+# wheel-compatible release stays correct on both old and current hosts.
+BINARY_ONLY="numpy,numba,llvmlite,torch,triton,tiktoken,regex"
+
+# torch's default Linux wheels are the CUDA builds, so a plain resolve drags ~2.5 GB
+# of nvidia-* packages onto a machine that has no GPU to use them. --extra-index-url
+# would not help: it only ADDS a source, and pip still prefers the higher-versioned
+# default build. So the CPU wheel gets its own step from the CPU-only index, and the
+# whisper resolve below then sees torch already satisfied and leaves it alone.
+# Non-fatal: if the CPU index is unreachable, fall through and let whisper resolve
+# torch itself rather than failing an install that would otherwise succeed.
+if [ "$(uname -s)" = "Linux" ] && ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "No NVIDIA GPU detected, installing CPU-only torch..."
+    "$PY" -m pip install -q --user --only-binary=torch \
+        --index-url https://download.pytorch.org/whl/cpu torch 2>&1 \
+        || echo "CPU-only torch unavailable; letting openai-whisper resolve torch"
+fi
+
 echo "Installing openai-whisper..."
-"$PY" -m pip install -q --user openai-whisper || { echo "ERROR: pip install openai-whisper failed"; exit 1; }
+"$PY" -m pip install -q --user --only-binary="$BINARY_ONLY" openai-whisper 2>&1 \
+    || { echo "ERROR: pip install openai-whisper failed"; exit 1; }
 
 echo "Done. whisper=$(command -v whisper 2>/dev/null || echo 'check PATH') ffmpeg=$(command -v ffmpeg 2>/dev/null || echo 'MISSING')"
 """
@@ -1055,6 +1108,38 @@ async def api_security_posture(_request: web.Request) -> web.Response:
 # caller raising it arbitrarily (e.g. {"subagent_auto_max": 9999}) to bypass
 # the concurrency limit.
 
+# Agent settings whose ENFORCED effect is fixed at gateway startup.
+# ``SubagentManager`` is constructed with ``max_subagents`` and
+# ``subagent_max_turns`` and never re-reads the config afterwards;
+# ``max_concurrent`` is stored once with no setter, and ``subagent_auto_max``
+# only reaches that enforced value as the ``hard_cap`` inside
+# ``compute_max_subagents``, which the same construction calls.
+#
+# Precisely: persisting one of these does NOT change what the running gateway
+# ENFORCES. It is not inert, though — the advisory cap advertised to the model
+# re-resolves from config on each read, so after a write the reported cap can
+# move while the enforced one stays put. That divergence is pre-existing and
+# deliberate (overflow queues, so the advertised number is guidance rather than
+# a limit); this constant describes only the enforced side, which is what the
+# restart is for.
+#
+# ``dynamic-subagent-sizing.md`` states the contract this mirrors: "The cap is
+# computed once per gateway start. Restart to recompute." The ``restart_required``
+# response field is the existing convention for exactly this case — the channel
+# config handlers already return it for settings read at boot, and the frontend
+# API client already types it.
+#
+# ``conductor_skill`` is deliberately absent: it is applied inline by this
+# handler (the skill file is regenerated/removed in-request), so it takes effect
+# immediately and must not raise the restart hint.
+_STARTUP_READ_AGENT_KEYS = frozenset(
+    {
+        "max_subagents",
+        "subagent_max_turns",
+        "subagent_auto_max",
+    }
+)
+
 
 async def api_kirocrew_config(request: web.Request) -> web.Response:
     """GET/PUT /api/config/kirocrew — read or update KiroCrew config."""
@@ -1093,6 +1178,13 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
         if not isinstance(data.get("agent"), dict):
             data["agent"] = {}
         agent = data["agent"]
+        # Snapshot the persisted values BEFORE any mutation. The dashboard sends
+        # all four settings on every save and enables Save whenever any one is
+        # dirty, so "was applied" is not "was changed" -- keying the restart hint
+        # off the raw applied list would flag a restart for a conductor-only save.
+        # Same truthfulness guard as handlers/messaging.py (see its no-op-save
+        # comments) so the flag stays trustworthy enough to act on.
+        before = dict(agent)
         # subagent_max_turns keeps the generic 1..N validation; max_subagents is
         # special — 0 is the "auto-size" sentinel and its upper bound is the
         # configured hard cap (dynamic-subagent-sizing.md §5.5/§6).
@@ -1193,7 +1285,13 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
                         p.unlink()
                 except Exception:
                     logger.exception("Failed to clean up conductor skill")
-        return web.json_response({"ok": True})
+        # A startup-read key that was merely re-sent with its existing value did
+        # not change the enforced cap, so it must not raise the hint.
+        restart_required = any(
+            key in _STARTUP_READ_AGENT_KEYS and agent.get(key) != before.get(key)
+            for key in applied
+        )
+        return web.json_response({"ok": True, "restart_required": restart_required})
 
     cfg = KiroCrewConfig.load()
     return web.json_response(_masked_config_dict(cfg))
@@ -1205,6 +1303,74 @@ def _agent_values() -> set[str]:
     from kiro_crew.config.loader import KiroCrewConfig
 
     return {"", *KiroCrewConfig.load().agents}
+
+
+def _active_advertised_ids(request: web.Request) -> list[str] | None:
+    """Advertised model ids from the first active provider, or None if unknown.
+
+    Uses the shared :func:`advertised_model_ids` shape parser (#1596) so this
+    validation sees exactly what the session-init withhold check sees. Returns
+    ``None`` when no session has initialized / nothing was advertised, so callers
+    treat entitlement as UNKNOWN rather than denying on no evidence.
+    """
+    from kiro_crew.acp.client import advertised_model_ids
+
+    try:
+        providers = request.app["state"].sessions.active_providers()
+    except (KeyError, AttributeError):
+        return None
+    for provider in providers:
+        getter = getattr(provider, "available_models", None)
+        if not callable(getter):
+            continue
+        try:
+            ids = advertised_model_ids(getter())
+        except Exception:
+            continue
+        if ids:
+            return ids
+    return None
+
+
+def _validate_role_model(value: str, request: web.Request) -> str | None:
+    """Reject a per-role model pin the account cannot use; ``None`` = allow.
+
+    ``""`` / ``"auto"`` always allow (they defer to the chat default). Otherwise
+    reuse the per-session provider guard (rejects display-only canonical keys for
+    the active provider), then — when a live advertised set is known — apply the
+    SAME entitlement predicate the session-init withhold uses
+    (:func:`model_is_unusable`, #1596) so the picker and the wire cannot disagree.
+    No advertised set => accept (entitlement unknowable; don't accuse on no
+    evidence), matching that predicate's own conservative default.
+    """
+    if not value or value == "auto":
+        return None
+    from kiro_crew.acp.client import model_is_unusable
+    from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
+
+    reason = _model_rejected_reason(value)
+    if reason:
+        return reason
+    advertised = _active_advertised_ids(request)
+    if advertised is None:
+        return None
+    if model_is_unusable(value, advertised):
+        usable = ", ".join(advertised[:8]) or "auto"
+        return f"{value!r} is not available on your account; choose one of: {usable}, or 'auto'."
+    return None
+
+
+# Keys a caller may reasonably try to PATCH that have a dedicated endpoint whose
+# side effects the generic config write cannot reproduce. Naming the endpoint turns
+# a dead end ("field not editable") into a next step.
+_MOVED_CONFIG_FIELDS: dict[str, str] = {
+    "agent.apps_allow_third_party": (
+        "agent.apps_allow_third_party is not editable here because turning it off "
+        "must also stop the third-party app code it was admitting. Use "
+        "PUT /api/security/trusted-apps/allow-all, which runs that teardown and "
+        "reports anything it could not stop."
+    ),
+}
 
 
 _EDITABLE_CONFIG: dict[str, dict] = {
@@ -1222,7 +1388,27 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # by kiro itself rather than silently accepted here. "auto"/"" = defer to
     # the agent config / kiro's own default.
     "agent.model": {"type": "str", "max_len": 64, "pattern": r"^[A-Za-z0-9._\-\[\]]*$"},
+    # Per-task-class model overrides. Same grammar as agent.model (the real
+    # vocabulary is whatever the backend advertises). "" / "auto" defers to the
+    # chat default. `validate_fn` additionally rejects a well-formed id the
+    # active provider or the account's entitlement cannot honor.
+    "agent.role_models.background": {
+        "type": "str",
+        "max_len": 64,
+        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "validate_fn": _validate_role_model,
+    },
+    "agent.role_models.subagent": {
+        "type": "str",
+        "max_len": 64,
+        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "validate_fn": _validate_role_model,
+    },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
+    # Per-role reasoning effort, paired with role_models. Same enum as the chat
+    # default; "" = inherit. Applies only on reasoning-capable models.
+    "agent.role_efforts.background": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
+    "agent.role_efforts.subagent": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
     "agent.approval_mode": {"type": "enum", "values": ["auto", "interactive"]},
     # How long an AD-HOC auto-approve grant lasts. Editable from Settings because
     # every value here still ends: the timed ones are capped at the SafetyOverride
@@ -1235,7 +1421,6 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     },
     "agent.sandbox": {"type": "enum", "values": ["auto", "off"]},
     "agent.sandbox_allow_no_isolation": {"type": "bool"},
-    "agent.apps_allow_third_party": {"type": "bool"},
     "agent.completion_keep": {"type": "enum", "values": ["head", "tail", "both"]},
     "agent.completion_keep_chars": {"type": "int", "min": 0, "max": RESULT_FILE_MAX_BYTES},
     "agent.soft_stop_budget_secs": {"type": "float", "min": 0.5, "max": 60.0},
@@ -1247,6 +1432,10 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "auto_update": {"type": "bool"},
     "dashboard.mcp_probe_timeout_secs": {"type": "int", "min": 5, "max": 120},
     "dashboard.recent_tint_count": {"type": "int", "min": 0, "max": 10},
+    # Keep the host awake while the agent is running a task. Gateway-host
+    # behavior (not a display pref), read by the prevent-sleep poll in
+    # dashboard/server.py; off by default.
+    "dashboard.prevent_sleep": {"type": "bool"},
     # User profile (onboarding step 2 + Settings > General > About You).
     # Structured slugs, not free text: context.py maps them to prompt-ready
     # descriptions in its [USER PROFILE] block. "" = unspecified/cleared.
@@ -1270,6 +1459,16 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # Nothing about this key is sensitive to read back, so the masked GET
     # already surfaces it for the toggle's initial state.
     "telemetry.beacon_enabled": {"type": "bool"},
+    # Tailnet-derived dashboard origin (RFC §4). Only the boolean enable is
+    # editable: there is no companion key here for a hand-written tailnet name,
+    # because the name is *derived from the local daemon and validated against the
+    # tailnet's own MagicDNS suffix* — accepting one from an API caller would hand
+    # the CSRF origin allowlist an attacker-chosen value, which is the whole thing
+    # ``tailnet._valid_magicdns_name`` exists to prevent. Enabling takes effect on
+    # the next gateway start (the origin set is built once during startup), and an
+    # enterprise ceiling can refuse the enabling write outright — see the
+    # ``capabilities.tailnet_origin`` gate below.
+    "dashboard.tailscale.enabled": {"type": "bool"},
     # SSO login flags for an edition that supplies a real sso_login_handler.
     # Bounded to a short string here; the companion login handler re-validates
     # each token against its own flag allowlist before spawning the login PTY
@@ -1285,6 +1484,14 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # require approval regardless — enforced in the generation path).
     "skills.auto_create_from_sessions": {"type": "bool"},
     "skills.approval_required": {"type": "bool"},
+    # Knowledge Library auto-ingest. Chunk budget max mirrors the point past which
+    # a single sweep stops being a trickle; dedup cadence max is ~a day of sweeps.
+    "knowledge.auto_add_documents": {"type": "bool"},
+    "knowledge.auto_register_project_docs": {"type": "bool"},
+    "knowledge.auto_ingest_artifacts": {"type": "bool"},
+    "knowledge.auto_ingest_chunk_budget": {"type": "int", "min": 0, "max": 10000},
+    "knowledge.folder_ingest_chunk_budget": {"type": "int", "min": 0, "max": 10000},
+    "knowledge.dedup_every_n_sweeps": {"type": "int", "min": 0, "max": 288},
     # Computer use — BUDGET KNOBS ONLY. There is deliberately no
     # "computer_use.enabled" key here: the primary enable lives on the keystone
     # ``computer_use.json`` (see config.loader.computer_use_state_path) so the
@@ -1328,6 +1535,29 @@ def _beacon_governance_pinned_off() -> bool:
     return beacon.is_governance_pinned_off(audit_tool="config_patch_dashboard")
 
 
+def _tailnet_governance_pinned_off() -> bool:
+    """Return whether a ceiling pins ``capabilities.tailnet_origin`` off (blocking).
+
+    The tailnet twin of :func:`_beacon_governance_pinned_off`, and delegating for
+    the same reason: ``tailnet.is_governance_pinned_off`` is the one resolution, so
+    the PATCH gate, the startup derivation gate and the CLI gate cannot disagree
+    about whether a host is pinned.
+
+    Runs in a worker thread (see the call site): the resolution reads the
+    trust-root policy file and the active profile from disk.
+
+    ``audit_tool``: this is an ENFORCEMENT decision (it refuses the write with a
+    403), so it routes through the audited seam and lands a
+    ``governance_decision`` SEL record. The name is distinct per call site so the
+    trail says which control refused; the route additionally logs its own
+    ``config.patch`` denial via ``_log_sel``, which records the API call while
+    this records the governance decision behind it.
+    """
+    from kiro_crew.dashboard import tailnet  # noqa: F811 - local: keeps the import edge lazy
+
+    return tailnet.is_governance_pinned_off(audit_tool="config_patch_dashboard_tailnet")
+
+
 async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     """PATCH /api/config/kirocrew — update a single config field."""
     from kiro_crew.agent import _atomic_json_write  # noqa: F811
@@ -1362,6 +1592,16 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     value = body.get("value")
     spec = _EDITABLE_CONFIG.get(path_key)
     if not spec:
+        # `agent.apps_allow_third_party` was deliberately REMOVED from the editable
+        # set. It is not an ordinary preference: turning it off has to stop the code
+        # it was admitting, which means a teardown sweep (shutdown hooks, backend
+        # processes, cron deregistration) that this generic read-modify-write knows
+        # nothing about. A plain PATCH here would flip the flag and leave every app
+        # it admitted still executing — trust withdrawn on paper only. The dedicated
+        # endpoint owns that sequencing, so point the caller at it instead of
+        # silently accepting a write that cannot honour the setting's meaning.
+        if path_key in _MOVED_CONFIG_FIELDS:
+            return _deny(_MOVED_CONFIG_FIELDS[path_key], f"{path_key}={value}")
         return _deny(f"field not editable: {path_key}", f"{path_key}={value}")
 
     # Validate value
@@ -1403,6 +1643,11 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         values_fn = spec.get("values_fn")
         if values_fn and value not in values_fn():
             return _deny(f"invalid value for {path_key}", f"{path_key}={value}")
+        validate_fn = spec.get("validate_fn")
+        if validate_fn:
+            reason = validate_fn(value, request)
+            if reason:
+                return _deny(reason, f"{path_key}={value}")
     else:
         return _deny("unsupported config type", f"{path_key}={value}", 500)
 
@@ -1427,6 +1672,23 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                 403,
             )
 
+    # Same rule, same direction, for the tailnet origin derivation. `false` stays
+    # writable under a ceiling that already forbids it, for the same reason as
+    # above: the ceiling is a floor, a narrower local choice composes with it, and
+    # refusing the write would strand the user if the policy were later lifted.
+    # The 403 exists so a pinned host cannot store `true` behind a control that
+    # does nothing — `resolve_tailnet_host` already refuses to derive, so without
+    # this the config file and the card would both claim "on" while no origin is
+    # ever added.
+    if path_key == "dashboard.tailscale.enabled" and value is True:
+        pinned = await asyncio.to_thread(_tailnet_governance_pinned_off)
+        if pinned:
+            return _deny(
+                "tailnet access is disabled by your administrator's security policy",
+                f"{path_key}={value}",
+                403,
+            )
+
     # Read, update, write
     cfg_path = config_path()
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
@@ -1439,16 +1701,21 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             return web.json_response({"error": "failed to read config file"}, status=500)
 
         parts = path_key.split(".")
-        if len(parts) == 2:
-            section = data.setdefault(parts[0], {})
-            if not isinstance(section, dict):
+        # Walk (creating) intermediate objects, then set the leaf. Handles
+        # arbitrary depth uniformly — 1-level ("auto_update"), 2-level
+        # ("agent.model"), and 3-level ("agent.role_models.background") — instead
+        # of the previous special-cases that would clobber a whole section for a
+        # 3-level key.
+        section = data
+        for part in parts[:-1]:
+            nxt = section.setdefault(part, {})
+            if not isinstance(nxt, dict):
                 _log_sel("error", f"{path_key}=section_not_dict")
                 return web.json_response(
-                    {"error": f"config section '{parts[0]}' is not an object"}, status=500
+                    {"error": f"config section '{part}' is not an object"}, status=500
                 )
-            section[parts[1]] = value
-        else:
-            data[parts[0]] = value
+            section = nxt
+        section[parts[-1]] = value
 
         try:
             cfg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1492,10 +1759,28 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     # reload_provider_factory() must NOT be used here: it clears _sessions and
     # shuts every provider down, which is correct for a provider switch but
     # would kill in-flight turns just because a default changed.
-    if path_key in ("agent.model", "agent.reasoning_effort"):
+    if path_key in ("agent.model", "agent.reasoning_effort") or path_key.startswith(
+        "agent.role_efforts."
+    ):
         state = request.app["state"]
         await state.sessions.refresh_defaults()
         logger.info("%s set to %r — session defaults refreshed", path_key, value)
+
+    # The background role model is baked into the lite / heartbeat kiro specs at
+    # agent-build time, so a change must rewrite them to take effect without a
+    # restart. The subagent role is read live at spawn (_subagent_default_model),
+    # so it needs no rebuild. Chat-default inheritance for both roles is picked
+    # up by the refresh_defaults above when agent.model changes.
+    if path_key == "agent.role_models.background":
+        try:
+            from kiro_crew.agent import rebuild_agent_config
+
+            await asyncio.to_thread(rebuild_agent_config)
+            logger.info(
+                "agent.role_models.background set to %r — background agent specs rebuilt", value
+            )
+        except Exception:
+            logger.warning("background-model rebuild failed", exc_info=True)
 
     # If completion-keep mode or budget changed, propagate to the live
     # SubagentManager so the next subagent to complete uses the new value.

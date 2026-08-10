@@ -11,15 +11,20 @@ import sys
 import tempfile
 import zipfile
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from aiohttp import web
 
 from kiro_crew.artifacts import get_default_store
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, data_home
-from kiro_crew.dashboard.handlers.files import _ZIP_CONTAINER_EXTS, _content_matches_ext
+from kiro_crew.dashboard.handlers.files import (
+    _ZIP_CONTAINER_EXTS,
+    _content_matches_ext,
+    _slot_project_snapshot,
+)
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.knowledge.agent_fetch import fetch_url_content
+from kiro_crew.knowledge.agent_source import add_agent_document
 from kiro_crew.knowledge.artifact_ingest import ArtifactKnowledgeSync
 from kiro_crew.knowledge.autosource import AUTO_ADDED_PROP
 from kiro_crew.knowledge.chunker import HeadingAwareChunker
@@ -31,7 +36,12 @@ from kiro_crew.knowledge.embedder import (
     floats_to_bytes,
 )
 from kiro_crew.knowledge.extractor import EntityExtractor
-from kiro_crew.knowledge.folder_watcher import SOURCE_TYPE_SKIP_DIRS
+from kiro_crew.knowledge.folder_watcher import (
+    estimate_scan_cost,
+    folder_chunk_budget,
+    max_files_prop,
+    walk_filters,
+)
 from kiro_crew.knowledge.ingestion import (
     IngestionPipeline,
     _redact,
@@ -105,7 +115,21 @@ async def _start_watcher_async(app: web.Application) -> None:
         await old_watcher.stop()
     pipeline = app["knowledge_pipeline"]
     store = app["state"].knowledge_store
-    watcher = KnowledgeWatcher(store=store, pipeline=pipeline)
+    state = app["state"]
+
+    def _project_dirs() -> list[str]:
+        """Directories the user is currently working in.
+
+        Live chat-slot project dirs only -- deliberately NOT the recent-projects
+        list, which includes directories the user merely picked once. Registering
+        those would spend LLM extraction on trees they are not working in.
+
+        Called by the watcher ON the event loop, because it copies a dict that
+        other coroutines on the loop mutate; it does no I/O.
+        """
+        return _slot_project_snapshot(state)
+
+    watcher = KnowledgeWatcher(store=store, pipeline=pipeline, project_dirs=_project_dirs)
     app["knowledge_watcher"] = watcher
     task = asyncio.create_task(watcher.start())
     app["_knowledge_watcher_task"] = task
@@ -435,16 +459,12 @@ async def delete_item(request: web.Request) -> web.Response:
     item = store.get_item(item_id)
     if not item:
         return web.json_response({"error": "not found"}, status=404)
-    source_id = item.get("source_id")
     store.delete_item(item_id)
-    # Auto-delete orphan source if no items remain
-    if source_id:
-        remaining = store.db.execute(
-            "SELECT COUNT(*) FROM items WHERE source_id = ?", (source_id,)
-        ).fetchone()[0]
-        if remaining == 0:
-            store.db.execute("DELETE FROM sources WHERE id = ?", (source_id,))
-            store.db.commit()
+    # A now-empty source is reclaimed by the store's own orphan rule on the next
+    # open, which checks the document-state tables, in-flight jobs and the location
+    # table first. Deleting the row here instead raised on the foreign keys those
+    # tables hold -- after the item delete had already committed -- and dropped a
+    # source that still held documents by location.
     _sel_log("item.delete", item_id=item_id)
     return web.json_response({"ok": True})
 
@@ -600,17 +620,39 @@ async def source_counts(request: web.Request) -> web.Response:
     if namespace:
         where.append("namespace = ?")
         params.append(namespace)
+    # Counts what each source HOLDS, not only what it owns. After a duplicate
+    # collapse a source is a location of the surviving copy rather than the owner of
+    # a second one, and counting owners only would report 0 for a source that still
+    # holds documents -- which the list view filters out, hiding a source the user
+    # cannot then see or delete. The union is over item ids, so a document held both
+    # ways counts once per source and never twice.
+    where_sl = [w.replace("source_id", "i.source_id") if "source_id" in w else f"i.{w}"
+                if w != "1=1" else w for w in where]
     sql = (
-        f"SELECT COALESCE(NULLIF(source_id, ''), '{_NO_SOURCE}') AS sid, COUNT(*) AS cnt "  # noqa: S608
-        f"FROM items WHERE {' AND '.join(where)} GROUP BY sid"  # noqa: S608
+        f"SELECT COALESCE(NULLIF(sid, ''), '{_NO_SOURCE}') AS sid, "  # noqa: S608
+        "COUNT(DISTINCT item_id) AS cnt FROM ("
+        f"  SELECT i.source_id AS sid, i.id AS item_id FROM items i WHERE {' AND '.join(where_sl)}"  # noqa: S608
+        "  UNION"
+        f"  SELECT sl.source_id AS sid, i.id AS item_id FROM source_locations sl"  # noqa: S608
+        f"  JOIN items i ON i.id = sl.item_id WHERE {' AND '.join(where_sl)}"  # noqa: S608
+        ") GROUP BY sid"
     )
     # This is a full aggregate scan over `items`, which grows without bound, so
     # unlike the point lookups elsewhere in this module it is offloaded rather
     # than run inline: blocking the event loop here would stall chat and
     # heartbeat processing on a large knowledge base.
-    rows = await asyncio.to_thread(lambda: store.db.execute(sql, params).fetchall())
+    # The UNION repeats the filter clause, so the placeholders are bound twice.
+    rows = await asyncio.to_thread(
+        lambda: store.db.execute(sql, params + params).fetchall())
     counts = {r["sid"]: r["cnt"] for r in rows}
-    return web.json_response({"counts": counts, "total": sum(counts.values())})
+    # NOT sum(counts.values()): a document held by two sources appears in both
+    # per-source counts, so summing them would exceed the number of documents and
+    # contradict the Library's own item total.
+    total_row = await asyncio.to_thread(
+        lambda: store.db.execute(
+            f"SELECT COUNT(*) FROM items WHERE {' AND '.join(where)}", params  # noqa: S608
+        ).fetchone())
+    return web.json_response({"counts": counts, "total": total_row[0]})
 
 
 async def list_sources(request: web.Request) -> web.Response:
@@ -716,6 +758,32 @@ async def add_source(request: web.Request) -> web.Response:
     if not source_type:
         return web.json_response({"error": "source_type required"}, status=400)
 
+    # Refuse UNC ("\\host\share") and Win32 extended-length ("\\?\") prefixes
+    # BEFORE anything filesystem-adjacent runs — connector.validate_config()
+    # can do Path.exists() on the value, and resolving a UNC path on Windows
+    # fires an outbound SMB/DNS lookup to `host` before any sensitive-path
+    # check would reject it. This gate also has to precede the Path.resolve()
+    # below, because resolve() leaves "\\?\" un-normalized so is_sensitive_path
+    # misses a `\\?\C:\Users\me\.ssh\id_rsa` bypass of the credential floor.
+    # Windows accepts either slash flavour AND their mixture as a device-path
+    # prefix — Path("\\/?\\C:\\...") normalizes to the same extended path as
+    # \\?\ — so match on "first two chars are any slash", not literal "\\" /
+    # "//" alone.
+    if (
+        isinstance(uri, str)
+        and len(uri) >= 2
+        and uri[0] in ("\\", "/")
+        and uri[1] in ("\\", "/")
+    ):
+        _sel_log("source.add_denied", reason="unsupported_prefix", uri=uri)
+        return web.json_response(
+            {
+                "error": "UNC and extended-length paths are not supported",
+                "code": "uri_unsupported_prefix",
+            },
+            status=400,
+        )
+
     # Validate via connector if available
     sync_scheduler = request.app.get("knowledge_sync")
     if sync_scheduler:
@@ -744,7 +812,15 @@ async def add_source(request: web.Request) -> web.Response:
         # drive letter (C:\... or C:/...), never "/", so the string test
         # rejected every valid Windows input and made single-file ingest 100%
         # unusable there.
-        if not Path(uri).is_absolute():
+        #
+        # UNC / extended-length prefixes are already refused by the pre-gate
+        # above (before any Path.resolve() call), so we do not re-check them
+        # here — that check has to precede the sandbox guard's own resolve().
+        # is_absolute() is flavour-bound to the RUNNING host, so a Windows drive
+        # path is NOT "absolute" to a POSIX gateway (the documented Windows
+        # browser -> Linux gateway topology). Accept either flavour explicitly so
+        # the answer does not depend on which OS the gateway happens to run.
+        if not (PurePosixPath(uri).is_absolute() or PureWindowsPath(uri).is_absolute()):
             return web.json_response(
                 {"error": "local_file URI must be an absolute path", "code": "uri_not_absolute"},
                 status=400,
@@ -785,13 +861,22 @@ async def add_source(request: web.Request) -> web.Response:
         # Run discovery walk to count files (no ingestion)
         watcher = request.app.get("knowledge_watcher")
         file_count = 0
+        # Scale of the ingestion this source is about to start, so the user sees
+        # the cost before it is spent rather than in a credit balance afterwards.
+        # Zeroed when no watcher is wired: reporting 0 files is honest there,
+        # inventing an estimate is not.
+        cost = {"files": 0, "capped": 0, "chunks": 0, "llm_calls": 0}
+        budget = folder_chunk_budget(properties)
         if watcher:
-            extra_skip = SOURCE_TYPE_SKIP_DIRS.get(source_type, set())
-            ignore_patterns = properties.get("ignore_patterns", [])
+            # The same filters the sweep applies, or the count describes a
+            # different file set from the one that gets ingested.
             discovered = await asyncio.to_thread(
-                watcher._folder_watcher._walk, str(folder_path), ignore_patterns, extra_skip
-            )
+                watcher._folder_watcher._walk, str(folder_path),
+                **walk_filters(properties, source_type))
             file_count = len(discovered)
+            cost = await asyncio.to_thread(
+                estimate_scan_cost, discovered,
+                max_files=max_files_prop(properties))
 
         # Store with pending_confirmation status
         if isinstance(properties, dict):
@@ -804,7 +889,20 @@ async def add_source(request: web.Request) -> web.Response:
         )
         _sel_log("source.add", source_id=sid, source_type=source_type)
         return web.json_response(
-            {"id": sid, "status": "pending_confirmation", "file_count": file_count}, status=201
+            {
+                "id": sid,
+                "status": "pending_confirmation",
+                "file_count": file_count,
+                # Files beyond the source's max_files cap, which are discovered
+                # but never ingested.
+                "capped_file_count": cost["capped"],
+                "estimated_chunks": cost["chunks"],
+                # One extraction call per chunk plus one summary call per file.
+                "estimated_llm_calls": cost["llm_calls"],
+                # 0 means unbounded: everything lands in the first sweep.
+                "chunk_budget_per_sweep": budget or 0,
+            },
+            status=201,
         )
 
     sid = store.add_source(
@@ -1097,13 +1195,13 @@ async def confirm_source(request: web.Request) -> web.Response:
     # Trigger scan
     watcher = request.app.get("knowledge_watcher")
     if watcher:
-        source = {
-            "id": source_id,
-            "uri": row["uri"],
-            "source_type": row["source_type"],
-            "properties": json.dumps(props),
-        }
-        task = asyncio.create_task(watcher._folder_watcher.scan_source(source))
+        source = {"id": source_id, "uri": row["uri"], "source_type": row["source_type"], "properties": json.dumps(props)}
+        # Paced like the watcher's own sweeps. This is the burst that costs the
+        # most -- nothing is ingested yet, so every discovered file is new -- so
+        # skipping the budget here would spend the whole folder before the first
+        # sweep ever ran.
+        task = asyncio.create_task(watcher._folder_watcher.scan_source(
+            source, chunk_budget=folder_chunk_budget(props)))
         _track_scan_task(request.app, task)
     return web.json_response({"status": "scanning"})
 
@@ -1156,13 +1254,9 @@ async def resume_source(request: web.Request) -> web.Response:
     # Trigger scan to pick up remaining files
     watcher = request.app.get("knowledge_watcher")
     if watcher:
-        source = {
-            "id": source_id,
-            "uri": row["uri"],
-            "source_type": row["source_type"],
-            "properties": json.dumps(props),
-        }
-        task = asyncio.create_task(watcher._folder_watcher.scan_source(source))
+        source = {"id": source_id, "uri": row["uri"], "source_type": row["source_type"], "properties": json.dumps(props)}
+        task = asyncio.create_task(watcher._folder_watcher.scan_source(
+            source, chunk_budget=folder_chunk_budget(props)))
         _track_scan_task(request.app, task)
     return web.json_response({"status": "scanning"})
 
@@ -1735,7 +1829,7 @@ async def search_for_context(request: web.Request) -> web.Response:
     max_tokens = cfg.get("knowledge", {}).get("fetch_max_tokens", KNOWLEDGE_FETCH_MAX_TOKENS)
 
     try:
-        limit = int(request.query.get("limit", top_n))
+        limit = min(100, max(1, int(request.query.get("limit", top_n))))
     except ValueError:
         limit = top_n
 
@@ -1772,6 +1866,44 @@ async def search_for_context(request: web.Request) -> web.Response:
             "max_tokens": max_tokens,
         }
     )
+
+
+async def add_agent_document_route(request: web.Request) -> web.Response:
+    """POST /api/knowledge/agent-document -- the agent adds one document.
+
+    Gated on ``knowledge.auto_add_documents``. Lives on the gateway rather than in
+    the MCP process because ingestion needs the pipeline (reader, chunker,
+    extraction pool, embedder), which only the gateway holds.
+    """
+    cfg = KiroCrewConfig.load()
+    if not cfg.knowledge.auto_add_documents:
+        return web.json_response(
+            {"error": "Adding documents to the knowledge library is turned off "
+                      "(knowledge.auto_add_documents).",
+             "code": "auto_add_documents_disabled"}, status=403)
+    pipeline = _pipeline(request)
+    if not pipeline:
+        return web.json_response(
+            {"error": "pipeline not configured",
+             "code": "pipeline_unavailable"}, status=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response(
+            {"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    result = await add_agent_document(
+        pipeline,
+        title=str(body.get("title") or ""),
+        content=str(body.get("content") or ""),
+        reason=str(body.get("reason") or ""),
+        source_uri=str(body.get("source_uri") or ""),
+    )
+    if result.get("status") == "error":
+        return web.json_response(
+            {"error": result["error"], "code": "document_rejected"}, status=400)
+    _sel_log("agent_document.add", title=_redact(result.get("title", "")) or "",
+             status=result.get("status", ""))
+    return web.json_response(result)
 
 
 def setup_knowledge_routes(app: web.Application) -> None:
@@ -1847,6 +1979,7 @@ def setup_knowledge_routes(app: web.Application) -> None:
     app.router.add_get("/api/knowledge/graph", get_full_graph)
     app.router.add_get("/api/knowledge/export", export_all)
     app.router.add_post("/api/knowledge/ingest", ingest_file)
+    app.router.add_post("/api/knowledge/agent-document", add_agent_document_route)
     app.router.add_post("/api/knowledge/import", import_bundle)
     app.router.add_get("/api/knowledge/items/{id}", get_item)
     app.router.add_patch("/api/knowledge/items/{id}", update_item)

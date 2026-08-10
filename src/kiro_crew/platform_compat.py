@@ -311,6 +311,7 @@ def _win_acquire_blocking(fd: int, *, timeout: float = _WIN_LOCK_TIMEOUT_SECS) -
     blocking wait, so a legitimately long holder (a data-home migration) is
     waited out rather than raced.
     """
+
     def _try_once() -> bool:
         try:
             os.lseek(fd, 0, os.SEEK_SET)
@@ -469,6 +470,85 @@ def try_acquire_lock(fd: int, *, exclusive: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Win32 struct layouts
+# ---------------------------------------------------------------------------
+# These MUST stay at module scope, never inside the functions that use them.
+# ``ctypes.POINTER(T)`` memoises T -> POINTER(T) in a module-level dict inside
+# ctypes and never evicts it, so a Structure subclass declared in a function
+# body pins a BRAND-NEW pair of type objects on every call. The helpers below
+# are polled (the dashboard's system metrics, the RSS-recycle watchdog, the
+# tree-kill parent-map walk, the MCP pipe's per-connection peer check), which
+# turns that into unbounded growth in a long-lived gateway. Declared once here,
+# the memo holds a single entry for the process lifetime.
+#
+# ``wintypes`` supplies type aliases only, so these definitions import cleanly
+# on POSIX; the functions below still resolve the DLLs lazily, which is what
+# keeps them patchable from the non-Windows test fleet.
+
+
+class _ProcessEntry32(ctypes.Structure):
+    """Toolhelp ``PROCESSENTRY32`` — process-enumeration snapshot entry."""
+
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", ctypes.c_char * 260),
+    ]
+
+
+class _ProcessMemoryCounters(ctypes.Structure):
+    """psapi ``PROCESS_MEMORY_COUNTERS`` — per-process working set."""
+
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+class _MemoryStatusEx(ctypes.Structure):
+    """kernel32 ``MEMORYSTATUSEX`` — system-wide physical memory."""
+
+    _fields_ = [
+        ("dwLength", wintypes.DWORD),
+        ("dwMemoryLoad", wintypes.DWORD),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+class _SidAndAttributes(ctypes.Structure):
+    """advapi32 ``SID_AND_ATTRIBUTES``."""
+
+    _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+
+class _TokenUser(ctypes.Structure):
+    """advapi32 ``TOKEN_USER`` — the ``TokenUser`` information-class payload."""
+
+    _fields_ = [("User", _SidAndAttributes)]
+
+
+# ---------------------------------------------------------------------------
 # Process termination / existence
 # ---------------------------------------------------------------------------
 
@@ -514,26 +594,13 @@ def get_ppid(pid: int) -> int:
 
             TH32CS_SNAPPROCESS = 0x00000002  # noqa: N806 — Windows API constant
             kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-
-            class PE32(ctypes.Structure):
-                _fields_ = [
-                    ("dwSize", wintypes.DWORD),
-                    ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD),
-                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-                    ("th32ModuleID", wintypes.DWORD),
-                    ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD),
-                    ("pcPriClassBase", ctypes.c_long),
-                    ("dwFlags", wintypes.DWORD),
-                    ("szExeFile", ctypes.c_char * 260),
-                ]
+            entry_ptr = ctypes.POINTER(_ProcessEntry32)
 
             kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
             kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-            kernel32.Process32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE32)]
+            kernel32.Process32First.argtypes = [wintypes.HANDLE, entry_ptr]
             kernel32.Process32First.restype = wintypes.BOOL
-            kernel32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE32)]
+            kernel32.Process32Next.argtypes = [wintypes.HANDLE, entry_ptr]
             kernel32.Process32Next.restype = wintypes.BOOL
             kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
             kernel32.CloseHandle.restype = wintypes.BOOL
@@ -542,8 +609,8 @@ def get_ppid(pid: int) -> int:
             if snap == wintypes.HANDLE(-1).value:
                 return -1
             try:
-                entry = PE32()
-                entry.dwSize = ctypes.sizeof(PE32)
+                entry = _ProcessEntry32()
+                entry.dwSize = ctypes.sizeof(_ProcessEntry32)
                 if not kernel32.Process32First(snap, ctypes.byref(entry)):
                     return -1
                 while True:
@@ -643,6 +710,184 @@ def _descendants_from_parent_map(root_pid: int, parent_map: dict[int, int]) -> l
     return result
 
 
+_TRUSTED_SYSTEM_BIN_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+# Windows argv carries a bare name (``taskkill``) while the file on disk carries
+# an extension (``taskkill.exe``), so a trusted lookup must try the suffixes the
+# loader would rather than requiring callers to spell them.
+_WINDOWS_BIN_SUFFIXES = ("", ".exe", ".com")
+
+
+def _windows_system_dirs() -> tuple[str, ...]:
+    """Return the Windows directories a system binary may be resolved from.
+
+    ``GetSystemDirectoryW`` is the authoritative source and, unlike
+    ``%SystemRoot%``, is not read from the process environment — which is
+    precisely the input this module declines to trust. The environment variable
+    and the conventional install path follow only as fallbacks for the
+    unexpected case where the API call fails. PowerShell ships in a versioned
+    directory beside the system binaries, not inside it, so it is appended per
+    root rather than assumed to sit alongside ``taskkill``.
+    """
+
+    dirs: list[str] = []
+    try:
+        buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+        written = ctypes.windll.kernel32.GetSystemDirectoryW(  # type: ignore[attr-defined]
+            buf, len(buf)
+        )
+        if 0 < written < len(buf):
+            dirs.append(buf.value)
+    except Exception:
+        pass
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    # Case-insensitive dedupe: GetSystemDirectoryW reports the on-disk casing
+    # ("C:\Windows\system32"), which names the same directory as the
+    # conventionally-cased fallback and must not be probed twice.
+    seen = {d.casefold() for d in dirs}
+    for fallback in (os.path.join(root, "System32"), r"C:\Windows\System32"):
+        if fallback.casefold() not in seen:
+            seen.add(fallback.casefold())
+            dirs.append(fallback)
+    return tuple(dirs) + tuple(os.path.join(d, "WindowsPowerShell", "v1.0") for d in dirs)
+
+
+# Names already probed for the diagnostic below, so the message costs one PATH
+# scan per name per process. Only the *message* is one-shot; resolution itself
+# stays uncached, so a tool that lands in a trusted directory later is still
+# found on the next call.
+_UNPINNED_TOOL_PROBED: set[str] = set()
+
+
+def _log_tool_outside_trusted_dirs(name: str, directories: tuple[str, ...]) -> None:
+    """Log once per *name* when the pin is what made a present tool unavailable.
+
+    A host that keeps its binaries outside the FHS system directories (NixOS's
+    ``/run/current-system/sw/bin``, a Homebrew or conda prefix) has a working
+    ``lsof`` that this lookup still declines, and the caller's degradation is
+    otherwise indistinguishable from the tool not being installed:
+    ``listening_pid_tool_available()`` would tell such an operator to install a
+    tool they already have, and ``kirocrew stop`` would quietly no-op. The
+    ``PATH`` result is read to write the message and is never spawned, so
+    reporting it does not widen what may run.
+    """
+
+    if name in _UNPINNED_TOOL_PROBED:
+        return
+    # Concurrent first probes of one name can duplicate the line. That is
+    # cheaper than serializing a filesystem scan behind a lock for a message.
+    _UNPINNED_TOOL_PROBED.add(name)
+    on_path = shutil.which(name)
+    if not on_path:
+        return
+    logger.warning(
+        "%s is on PATH at %s but does not resolve under the trusted system "
+        "directories (%s), so it is treated as unavailable; OS introspection "
+        "that needs it degrades instead of running a PATH-chosen binary",
+        name,
+        on_path,
+        ", ".join(directories),
+    )
+
+
+def trusted_system_bin(name: str) -> str | None:
+    """Resolve *name* from fixed system directories, ignoring ``PATH``.
+
+    A gateway's ``PATH`` can legitimately lead with agent-writable directories
+    (a worktree venv's ``bin``, ``~/.local/bin``), so a bare argv name lets a
+    planted shim run with the gateway's environment. Callers that shell out for
+    OS introspection resolve through here and treat ``None`` as "unavailable".
+
+    A miss on a host whose tools live elsewhere is a real functional
+    degradation, so it is logged once per name rather than left silent. The pin
+    still decides; the log only makes the decision diagnosable.
+
+    Deliberately uncached. The lookup is a handful of ``stat`` calls on
+    teardown and introspection paths, and caching the *miss* would pin "tool
+    absent" for the lifetime of a long-lived gateway, so an ``lsof`` installed
+    after boot would never be picked up.
+    """
+
+    if IS_WINDOWS:
+        directories: tuple[str, ...] = _windows_system_dirs()
+        suffixes: tuple[str, ...] = _WINDOWS_BIN_SUFFIXES
+    else:
+        directories = _TRUSTED_SYSTEM_BIN_DIRS
+        suffixes = ("",)
+    for directory in directories:
+        for suffix in suffixes:
+            candidate = os.path.join(directory, name + suffix)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    _log_tool_outside_trusted_dirs(name, directories)
+    return None
+
+
+def tool_outside_trusted_dirs(name: str) -> str | None:
+    """Where ``PATH`` finds *name* when :func:`trusted_system_bin` declined it.
+
+    ``None`` means the pin is not the reason the tool is unavailable: either it
+    resolved normally, or it is not installed anywhere ``PATH`` can see. Callers
+    use this to word a diagnostic — an operator on a host that keeps its
+    binaries elsewhere needs to be told where theirs actually is, not to install
+    a tool they already have. The path is reported and never spawned, so asking
+    does not widen what may run.
+    """
+
+    if trusted_system_bin(name) is not None:
+        return None
+    return shutil.which(name)
+
+
+def _posix_process_parent_map() -> dict[int, int]:
+    """Return one ``ps`` PID -> PPID snapshot; empty when enumeration fails."""
+
+    if IS_WINDOWS:
+        return {}
+    ps_bin = trusted_system_bin("ps")
+    if ps_bin is None:
+        return {}
+    try:
+        out = subprocess.check_output(
+            [ps_bin, "-Ao", "pid=,ppid="], timeout=5, stderr=subprocess.DEVNULL
+        ).decode(errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    parent_map: dict[int, int] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            parent_map[int(parts[0])] = int(parts[1])
+        except ValueError:
+            continue
+    return parent_map
+
+
+def process_descendants(pid: int) -> list[int]:
+    """Return *pid*'s descendants, breadth-first, from a single OS snapshot.
+
+    Best-effort: an unreadable process table yields an empty list rather than
+    raising, so callers using this to broaden a kill still perform their
+    primary kill.
+
+    Snapshot BEFORE killing anything. A kill reparents surviving orphans to
+    init, erasing the PPID links that identify them, so a post-kill snapshot
+    cannot find the very processes a caller needs to clean up.
+    """
+
+    if type(pid) is not int or pid <= 1:
+        return []
+    try:
+        parent_map = (
+            _windows_process_parent_map() if IS_WINDOWS else _posix_process_parent_map()
+        )
+    except Exception:  # noqa: BLE001 - introspection must never break a kill path
+        return []
+    return _descendants_from_parent_map(pid, parent_map)
+
+
 def _windows_process_parent_map() -> dict[int, int]:
     """Return one Toolhelp PID -> PPID snapshot, raising if enumeration fails."""
 
@@ -652,31 +897,13 @@ def _windows_process_parent_map() -> dict[int, int]:
         th32cs_snapprocess = 0x00000002
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
 
-        class ProcessEntry32(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", ctypes.c_long),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", ctypes.c_char * 260),
-            ]
+        entry_ptr = ctypes.POINTER(_ProcessEntry32)
 
         kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
         kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-        kernel32.Process32First.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(ProcessEntry32),
-        ]
+        kernel32.Process32First.argtypes = [wintypes.HANDLE, entry_ptr]
         kernel32.Process32First.restype = wintypes.BOOL
-        kernel32.Process32Next.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(ProcessEntry32),
-        ]
+        kernel32.Process32Next.argtypes = [wintypes.HANDLE, entry_ptr]
         kernel32.Process32Next.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
@@ -687,8 +914,8 @@ def _windows_process_parent_map() -> dict[int, int]:
         if snapshot == wintypes.HANDLE(-1).value:
             raise OSError("Windows process snapshot creation failed")
         try:
-            entry = ProcessEntry32()
-            entry.dwSize = ctypes.sizeof(ProcessEntry32)
+            entry = _ProcessEntry32()
+            entry.dwSize = ctypes.sizeof(_ProcessEntry32)
             if not kernel32.Process32First(snapshot, ctypes.byref(entry)):
                 raise OSError("Windows first process enumeration failed")
             result: dict[int, int] = {}
@@ -793,9 +1020,9 @@ def _windows_last_error() -> int:
 
 
 # Bounds for the exited-but-exit-FILETIME-unpublished window (see
-# _windows_process_handle_identity). The observed window closes within ~20ms;
-# the ceiling is generous enough to absorb a loaded host without letting a
-# genuinely unreadable handle stall a caller.
+# _windows_process_handle_identity). The window closes within a few tens of
+# milliseconds; the ceiling is generous enough to absorb a loaded host without
+# letting a genuinely unreadable handle stall a caller.
 _WINDOWS_EXIT_FILETIME_TIMEOUT_SECS = 0.25
 _WINDOWS_EXIT_FILETIME_POLL_SECS = 0.002
 
@@ -865,11 +1092,10 @@ def _windows_process_handle_identity(handle: int) -> tuple[int, int, int | None]
         exit_value = _filetime_value(exit_)
         # GetExitCodeProcess reports the exit BEFORE the kernel publishes the
         # exit FILETIME, so a just-terminated process reads back as
-        # exited-with-exit_time==0 for a sub-millisecond-to-tens-of-milliseconds
-        # window (observed on 57/60 back-to-back spawns, resolving in
-        # 0.05-20ms). Treating that window as "no identity" makes the caller
-        # reject a perfectly good handle, so poll briefly for the real value
-        # instead. The bound stays short because the only alternative to a
+        # exited-with-exit_time==0 for a brief window (sub-millisecond to a few
+        # tens of milliseconds). Treating that window as "no identity" makes the
+        # caller reject a perfectly good handle, so poll briefly for the real
+        # value. The bound stays short because the only alternative to a
         # published exit time is refusing the handle.
         if not active and exit_value <= 0:
             deadline = time.monotonic() + _WINDOWS_EXIT_FILETIME_TIMEOUT_SECS
@@ -1080,8 +1306,11 @@ def process_matches(pid: int, needles: tuple[str, ...]) -> bool:
             cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
             return any(n.encode() in cmdline for n in needles)
         if sys.platform == "darwin":
+            ps_bin = trusted_system_bin("ps")
+            if ps_bin is None:
+                return False
             out = subprocess.check_output(
-                ["ps", "-o", "command=", "-p", str(pid)],
+                [ps_bin, "-o", "command=", "-p", str(pid)],
                 stderr=subprocess.DEVNULL,
                 timeout=2,
             )
@@ -1103,26 +1332,13 @@ def _win_process_image_name(pid: int) -> str | None:
 
         TH32CS_SNAPPROCESS = 0x00000002  # noqa: N806 — Windows API constant
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-
-        class PE32(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", ctypes.c_long),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", ctypes.c_char * 260),
-            ]
+        entry_ptr = ctypes.POINTER(_ProcessEntry32)
 
         kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
         kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-        kernel32.Process32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE32)]
+        kernel32.Process32First.argtypes = [wintypes.HANDLE, entry_ptr]
         kernel32.Process32First.restype = wintypes.BOOL
-        kernel32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE32)]
+        kernel32.Process32Next.argtypes = [wintypes.HANDLE, entry_ptr]
         kernel32.Process32Next.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
@@ -1131,8 +1347,8 @@ def _win_process_image_name(pid: int) -> str | None:
         if snap == wintypes.HANDLE(-1).value:
             return None
         try:
-            entry = PE32()
-            entry.dwSize = ctypes.sizeof(PE32)
+            entry = _ProcessEntry32()
+            entry.dwSize = ctypes.sizeof(_ProcessEntry32)
             if not kernel32.Process32First(snap, ctypes.byref(entry)):
                 return None
             while True:
@@ -1153,11 +1369,19 @@ def listening_pid_tool() -> str:
 
 def listening_pid_tool_available() -> bool:
     """Whether the port->PID lookup tool (lsof on POSIX / netstat on Windows) is
-    on PATH. Lets callers distinguish "tool absent" from "no listener found",
+    resolvable. Lets callers distinguish "tool absent" from "no listener found",
     which find_listening_pids() alone collapses into an empty list — without that
     a genuinely-running gateway reads as stopped when lsof is missing.
+
+    Resolves through :func:`trusted_system_bin`, the same lookup
+    :func:`find_listening_pids` performs. Probing ``PATH`` here instead would
+    let the two disagree: a shim on ``PATH`` would answer "available" for a tool
+    the pinned lookup refuses to run, turning a live gateway into one that reads
+    as stopped — the exact failure this probe exists to prevent. A tool that is
+    installed but outside those directories therefore reads as absent, which
+    :func:`trusted_system_bin` logs so the answer can be explained.
     """
-    return shutil.which(listening_pid_tool()) is not None
+    return trusted_system_bin(listening_pid_tool()) is not None
 
 
 def find_listening_pids(port: int) -> list[int]:
@@ -1171,9 +1395,12 @@ def find_listening_pids(port: int) -> list[int]:
     to tell a genuine empty result apart from the tool being absent).
     """
     if IS_POSIX:
+        lsof_bin = trusted_system_bin("lsof")
+        if lsof_bin is None:
+            return []
         try:
             out = subprocess.check_output(
-                ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+                [lsof_bin, "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
                 text=True,
                 stderr=subprocess.DEVNULL,
             )
@@ -1190,9 +1417,12 @@ def find_listening_pids(port: int) -> list[int]:
     # "TCP" too — the bracketed address form is what distinguishes v4 vs
     # v6, not the proto token — so once `-p tcp` is dropped the existing
     # port suffix match already handles both families uniformly.
+    netstat_bin = trusted_system_bin("netstat")
+    if netstat_bin is None:
+        return []
     try:
         out = subprocess.check_output(
-            ["netstat", "-ano"],
+            [netstat_bin, "-ano"],
             # encoding="oem" (Windows-only pseudo-codec): netstat emits the
             # console OEM codepage when piped; text=True would decode with the
             # ANSI codepage and can raise UnicodeDecodeError on non-Western
@@ -1259,8 +1489,11 @@ def process_command_line(pid: int) -> str:
             raw = Path(f"/proc/{pid}/cmdline").read_bytes()
             return raw.replace(b"\x00", b" ").decode(errors="replace").strip()
         if sys.platform == "darwin":
+            ps_bin = trusted_system_bin("ps")
+            if ps_bin is None:
+                return ""
             out = subprocess.check_output(
-                ["ps", "-o", "command=", "-p", str(pid)],
+                [ps_bin, "-o", "command=", "-p", str(pid)],
                 text=True,
                 stderr=subprocess.DEVNULL,
                 timeout=2,
@@ -1269,9 +1502,12 @@ def process_command_line(pid: int) -> str:
         if IS_WINDOWS:
             # Query WMI for the exact PID's command line. PowerShell is always
             # present on supported Windows; -NoProfile keeps it fast.
+            powershell_bin = trusted_system_bin("powershell")
+            if powershell_bin is None:
+                return ""
             out = subprocess.check_output(
                 [
-                    "powershell",
+                    powershell_bin,
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
@@ -1306,8 +1542,14 @@ def process_owner_uid(pid: int) -> int | None:
         if sys.platform == "linux":
             return os.stat(f"/proc/{int(pid)}").st_uid
         if sys.platform == "darwin":
+            # An unresolvable ``ps`` yields None, which ``_gateway_owns_port``
+            # treats as "ownership unproven" and denies on — the same direction
+            # as every other failure in that gate.
+            ps_bin = trusted_system_bin("ps")
+            if ps_bin is None:
+                return None
             out = subprocess.check_output(
-                ["ps", "-o", "uid=", "-p", str(int(pid))],
+                [ps_bin, "-o", "uid=", "-p", str(int(pid))],
                 text=True,
                 stderr=subprocess.DEVNULL,
                 timeout=2,
@@ -1589,9 +1831,12 @@ def kill_pid(pid: int, sig: int = SIGTERM) -> bool:
     if IS_POSIX:
         os.kill(pid, sig)
         return True
+    taskkill_bin = trusted_system_bin("taskkill")
+    if taskkill_bin is None:
+        raise OSError("taskkill not found in the trusted system directories")
     try:
         r = subprocess.run(
-            ["taskkill", "/F", "/PID", str(pid)],
+            [taskkill_bin, "/F", "/PID", str(pid)],
             check=False,
             capture_output=True,
             timeout=5,
@@ -1640,9 +1885,12 @@ def kill_process_tree(pid: int, sig: int = SIGTERM) -> bool:
             return True
         os.killpg(pgid, sig)
         return True
+    taskkill_bin = trusted_system_bin("taskkill")
+    if taskkill_bin is None:
+        raise OSError("taskkill not found in the trusted system directories")
     try:
         r = subprocess.run(
-            ["taskkill", "/T", "/F", "/PID", str(pid)],
+            [taskkill_bin, "/T", "/F", "/PID", str(pid)],
             check=False,
             capture_output=True,
             timeout=5,
@@ -1776,6 +2024,7 @@ def rmtree_force(path: str | os.PathLike) -> bool:
     # still supports 3.9+, so pick by capability rather than by version number.
     kwarg = "onexc" if sys.version_info >= (3, 12) else "onerror"
     if kwarg == "onerror":  # pragma: no cover - exercised on Python < 3.12
+
         def _legacy(func: Any, target: str, exc_info: Any) -> None:
             _clear_readonly_and_retry(func, target, exc_info[1])
 
@@ -1931,12 +2180,6 @@ def _process_token_sid_unguarded(pid: int | None = None) -> str | None:
     permits ``OpenProcessToken``, and one a user always holds over their own
     processes without elevation.
     """
-
-    class _SidAndAttributes(ctypes.Structure):
-        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
-
-    class _TokenUser(ctypes.Structure):
-        _fields_ = [("User", _SidAndAttributes)]
 
     try:
         advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
@@ -2436,20 +2679,6 @@ def proc_rss_bytes() -> int:
             return 0
     try:
 
-        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):  # noqa: N801 — Windows struct
-            _fields_ = [
-                ("cb", wintypes.DWORD),
-                ("PageFaultCount", wintypes.DWORD),
-                ("PeakWorkingSetSize", ctypes.c_size_t),
-                ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                ("PagefileUsage", ctypes.c_size_t),
-                ("PeakPagefileUsage", ctypes.c_size_t),
-            ]
-
         psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         # argtypes/restype are load-bearing on 64-bit: without them ctypes
@@ -2460,12 +2689,12 @@ def proc_rss_bytes() -> int:
         kernel32.GetCurrentProcess.restype = wintypes.HANDLE
         psapi.GetProcessMemoryInfo.argtypes = [
             wintypes.HANDLE,
-            ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+            ctypes.POINTER(_ProcessMemoryCounters),
             wintypes.DWORD,
         ]
         psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
-        counters = PROCESS_MEMORY_COUNTERS()
-        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(_ProcessMemoryCounters)
         if psapi.GetProcessMemoryInfo(
             kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
         ):
@@ -2496,21 +2725,6 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
         return None
     try:
 
-        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):  # noqa: N801 — Windows struct
-            _fields_ = [
-                ("cb", wintypes.DWORD),
-                ("PageFaultCount", wintypes.DWORD),
-                ("PeakWorkingSetSize", ctypes.c_size_t),
-                ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                ("PagefileUsage", ctypes.c_size_t),
-                ("PeakPagefileUsage", ctypes.c_size_t),
-            ]
-
-        _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000  # noqa: N806 — Windows constant
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
         psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
         kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -2519,7 +2733,7 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
         kernel32.CloseHandle.restype = wintypes.BOOL
         psapi.GetProcessMemoryInfo.argtypes = [
             wintypes.HANDLE,
-            ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+            ctypes.POINTER(_ProcessMemoryCounters),
             wintypes.DWORD,
         ]
         psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
@@ -2527,8 +2741,8 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
         if not handle:
             return None
         try:
-            counters = PROCESS_MEMORY_COUNTERS()
-            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            counters = _ProcessMemoryCounters()
+            counters.cb = ctypes.sizeof(_ProcessMemoryCounters)
             if psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
                 return int(counters.WorkingSetSize)
             return None
@@ -2536,6 +2750,61 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
             kernel32.CloseHandle(handle)
     except Exception:
         return None
+
+
+def proc_rss_tree_mb_for_pid(pid: int) -> float | None:
+    """Sum RSS (MiB) of *pid* and its LINEAGE-VALIDATED Windows descendants.
+
+    Windows-only; returns None on other platforms (callers keep their /proc or
+    ps route). The naive way to sum a Windows tree — walk Toolhelp's
+    ``th32ParentProcessID`` map — is unsafe for a kill/health decision: that
+    field is never cleared when a parent dies and Windows recycles PIDs
+    aggressively, so a raw walk sums unrelated subtrees rooted at a recycled
+    PID. This reuses :func:`descendant_termination_handles`, which validates
+    every parent->child edge against exact creation/exit times across two
+    snapshots, so only genuine descendants are counted. RSS that cannot be read
+    for a given descendant (another session / higher integrity) is skipped, but
+    the root itself always contributes, so the result is never a phantom-low
+    tree total attached to a recycled root.
+
+    Returns None if even the root's RSS is unavailable, matching the "unknown,
+    do not judge" contract the RSS staleness probe relies on.
+    """
+
+    if not IS_WINDOWS:
+        return None
+    if type(pid) is not int or pid <= 1:
+        return None
+    root_handle = _open_process_termination_handle(pid)
+    if root_handle is None:
+        # Cannot even anchor the root — fall back to the single-process read so a
+        # readable self still yields a number rather than a spurious None.
+        rss = proc_rss_bytes_for_pid(pid)
+        return None if rss is None else rss / (1024 * 1024)
+    descendants: dict[int, int] = {}
+    try:
+        identity = _windows_process_handle_identity(root_handle)
+        if identity is None or identity[0] != pid:
+            rss = proc_rss_bytes_for_pid(pid)
+            return None if rss is None else rss / (1024 * 1024)
+        try:
+            descendants = descendant_termination_handles(pid, root_handle=root_handle)
+        except Exception:
+            # Enumeration failed (transient snapshot race): measure the root
+            # alone rather than an unvalidated tree.
+            descendants = {}
+        total_bytes = 0
+        found = False
+        for member in (pid, *descendants):
+            member_rss = proc_rss_bytes_for_pid(member)
+            if member_rss is not None:
+                total_bytes += member_rss
+                found = True
+        return total_bytes / (1024 * 1024) if found else None
+    finally:
+        for handle in descendants.values():
+            close_process_handle(handle)
+        close_process_handle(root_handle)
 
 
 def proc_cpu_seconds() -> float:
@@ -2554,6 +2823,20 @@ def proc_cpu_seconds() -> float:
     try:
 
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        # argtypes/restype are load-bearing on 64-bit: without them ctypes
+        # defaults GetCurrentProcess's return to a 32-bit int and truncates the
+        # pseudo-handle, so GetProcessTimes fails and this reads 0.0 (mirrors the
+        # proc_rss_bytes fix — same truncation, same cause).
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
         creation = wintypes.FILETIME()
         exit_ = wintypes.FILETIME()
         kernel = wintypes.FILETIME()
@@ -2595,22 +2878,9 @@ def system_memory() -> "tuple[int, int] | None":
         return None
     try:
 
-        class MEMORYSTATUSEX(ctypes.Structure):  # noqa: N801 — Windows struct
-            _fields_ = [
-                ("dwLength", wintypes.DWORD),
-                ("dwMemoryLoad", wintypes.DWORD),
-                ("ullTotalPhys", ctypes.c_ulonglong),
-                ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong),
-                ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong),
-                ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-            ]
-
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        stat = MEMORYSTATUSEX()
-        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        stat = _MemoryStatusEx()
+        stat.dwLength = ctypes.sizeof(_MemoryStatusEx)
         if kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
             return int(stat.ullTotalPhys), int(stat.ullAvailPhys)
         return None

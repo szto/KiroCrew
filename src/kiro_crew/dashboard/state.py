@@ -25,9 +25,14 @@ from aiohttp import web
 from kiro_crew.acp.types import STOP_REASON_CANCELLED
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import DASHBOARD_PORT, config_dir
-from kiro_crew.constants import OPTIONS_RE_LINE
+from kiro_crew.constants import (
+    OPTIONS_RE_LINE,
+    SUBAGENT_BATCH_COMPLETION_PREFIX,
+    SUBAGENT_COMPLETION_PREFIX,
+)
 from kiro_crew.dashboard.chat_compaction_notice import deliver_channel_compaction_notice
 from kiro_crew.dashboard.side_state import SideState
+from kiro_crew.history import latest_transcript_ts, monotonic_transcript_ts
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.messaging.link import (
     SLACK_NAMESPACE,
@@ -44,6 +49,7 @@ from kiro_crew.notifications.bus import (
 from kiro_crew.notifications.rate_limit import AppRateLimiter
 from kiro_crew.notifications.settings import ChannelSettings
 from kiro_crew.preview_text import strip_markdown_preview
+from kiro_crew.release_channel import channel as _release_channel_of_build
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -61,6 +67,7 @@ if TYPE_CHECKING:
     )
     from kiro_crew.dashboard.loop_watchdog import LoopStallWatchdog  # noqa: F401
     from kiro_crew.messaging.transport import MessagingTransport  # noqa: F401
+    from kiro_crew.power import SleepInhibitor  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -428,6 +435,12 @@ _SESSION_RECYCLED_NOTICE = (
     "Conversation history is preserved — your next message starts a fresh process."
 )
 _MAX_SLOT_MESSAGES = 10000  # Keep all messages — virtual scrolling handles performance
+
+#: Roles that exist only on the wire: appended so a reader/flush can see them,
+#: never broadcast as a `chat_message` and never persisted (the mirror of
+#: ``chat_persistence._TRANSIENT_ROLES`` minus the rows that ARE broadcast).
+#: They get no ``meta.mid`` — see ``_ChatSlot.append``.
+_WIRE_ONLY_ROLES = frozenset({"chunk", "done", "streaming"})
 _MAX_SOURCE_LINKS_PER_SLOT = 64
 # How many source links each slot payload actually serializes (the sidebar
 # renders at most this many chips). Shared with the periodic check-status
@@ -477,7 +490,15 @@ _SLOT_KEY_TITLE_RE = re.compile(r"(?:dashboard_)?chat-\d+-\d+$")
 CRON_NOTIFY_PREFIX = "[Cron notification from "
 CRON_NOTIFY_END = "[End of cron notification]"
 CRON_NOTIFY_RE = re.compile(rf'^{re.escape(CRON_NOTIFY_PREFIX)}"(.*)"\]')
-SUBAGENT_COMPLETION_PREFIX = "[Subagent completion event]"
+# Both sub-agent markers, for the checks that must treat either shape as a system
+# injection. Pass this straight to ``str.startswith`` (it accepts a tuple) instead
+# of listing the prefixes per call site: the batch marker is a SIBLING of the
+# per-agent one rather than an extension of it, so a per-prefix check written
+# against one silently misses the other, and a third shape would miss both.
+SUBAGENT_COMPLETION_PREFIXES = (
+    SUBAGENT_COMPLETION_PREFIX,
+    SUBAGENT_BATCH_COMPLETION_PREFIX,
+)
 # One-shot synthesis turn fired after ALL sub-agents in a fan-out complete and
 # each result has been processed in its own turn (see gateway._subagent_done arm
 # + chat_runner drain/idle branch). Its visible reply is the consolidated,
@@ -512,14 +533,34 @@ STALE_RECOVERY_PREFIX = "[Stalled turn — automatic recovery]"
 # partial results and continue. Rendered as an "inject" message (not a user
 # bubble) and never mirrored to a linked Slack thread as user input.
 TOOL_STALL_RECOVERY_PREFIX = "[Tool stall — automatic recovery]"
+# Prefix on the continuation injected after a reset recovers an interrupted
+# connection. The body lives in chat_utils so queue provenance and turn routing
+# share one canonical instruction.
+CONN_RECOVERY_PREFIX = "[Connection lost — automatic recovery]"
+# Prefix on the continuation injected when a reset recovers a turn the backend
+# refused because the session was still busy. Separate from
+# CONN_RECOVERY_PREFIX even though both requeue the same continuation shape:
+# nothing was disconnected, and the marker is what the transcript renders, so
+# sharing the connection marker would report a dropped connection to a user
+# whose status card reads "Session busy". Body: _BUSY_RECOVER_MSG in chat_utils.
+BUSY_RECOVERY_PREFIX = "[Session busy — automatic recovery]"
 # Prefix on the runner-injected CONTINUE that resumes a turn cut short by a
 # transient backend 5xx after tokens/tools had already streamed. The body lives
-# in chat_utils as _POSTTOKEN_RECOVER_MSG; the prefix is here so all five
+# in chat_utils as _POSTTOKEN_RECOVER_MSG; the prefix is here so all eight
 # recovery markers share one home and the frontend has one list to mirror.
 POSTTOKEN_RECOVERY_PREFIX = "[Interrupted turn — automatic recovery]"
 # Prefix on the runner-injected nudge that breaks a repeated empty-generation
 # pattern (the model returned no output twice). Body: _EMPTY_AUTO_CONTINUE_MSG.
 EMPTY_RESPONSE_RECOVERY_PREFIX = "[Empty response — automatic recovery]"
+# Prefix on the continuation injected when the USER pressed Continue on an
+# interrupted turn. Body: _MANUAL_RESUME_MSG in chat_utils. Named into the
+# *_RECOVERY_PREFIX family because test_recovery_card_prefixes.py keys the
+# cross-language drift guard on that suffix — a marker outside the family is
+# invisible to it, and the card would silently render machine prose as a bubble.
+# The VALUE is what carries the user-facing meaning, and it deliberately does NOT
+# say "automatic recovery" like the five above: a person pressed the button, and
+# the card must not claim the system recovered by itself.
+MANUAL_RESUME_RECOVERY_PREFIX = "[Continue — requested by the user]"
 
 
 def should_queue_refusal_recovery(
@@ -545,10 +586,11 @@ def build_refusal_recovery_prompt(refusals: list[tuple[str, str]]) -> str:
     """Build the body of an automatic continuation after a recoverable tool refusal.
 
     When a tool call is refused for a recoverable, system-side reason — a
-    host-gate policy deny or the read-only bash safety gate — kiro-cli ends the
-    turn early with an attribution-free "tool uses were interrupted" marker. The
-    refusal reason is otherwise surfaced only to the dashboard pill and the SEL
-    audit log, never to the model, so the agent stalls and waits for the user.
+    host-gate policy deny, the read-only bash safety gate, or a PreToolUse policy
+    hook block — kiro-cli ends the turn early with an attribution-free
+    "tool uses were interrupted" marker. The refusal reason is otherwise surfaced
+    only to the dashboard pill and the SEL audit log, never to the model, so the
+    agent stalls and waits for the user.
 
     ``refusals`` is a list of ``(tool_title, reason)`` tuples recorded during the
     turn (already redacted by the caller). The returned text hands those reasons
@@ -785,6 +827,7 @@ class _ChatSlot:
         "_trust_reads",
         "_trusted_patterns",
         "_titled",
+        "_auto_tagged",
         "_title_in_flight",
         "_title_retry_pending",
         "_artifact",
@@ -809,8 +852,10 @@ class _ChatSlot:
         "_slack_linked",
         "_slack_channel",
         "_slack_thread_ts",
+        "channel_origin",
         "folder_id",
         "_folder_changed",
+        "_folder_suggested",
         "pinned",
         "tags",
         "_pending_subagent_failures",
@@ -845,11 +890,11 @@ class _ChatSlot:
         "_channel_window_mtime",
         "_disk_older_count",
         "_disk_window_len",
+        "_disk_tail_ts",
         "_frozen_prefix_cache",
         "_pending_rewrite",
         "_file_changes",
         "linked_session_key",
-        "_browse_mode",
         "_side",
         "_acp_client",
         "_steer_segment_cut",
@@ -900,6 +945,7 @@ class _ChatSlot:
         self._trust_reads: bool = False  # auto-approve read-only bash commands
         self._trusted_patterns: set[str] = set()  # session-scoped fnmatch globs
         self._titled: bool = False  # True once a title has been assigned
+        self._auto_tagged: bool = False  # True once auto-tag has been attempted
         # Guards against concurrent LLM auto-title attempts (on-send trigger vs
         # the end-of-turn chat_done trigger racing on the same slot).
         self._title_in_flight: bool = False
@@ -970,6 +1016,11 @@ class _ChatSlot:
         self._slack_thread_ts: str = ""
         self.folder_id: str = ""  # project folder assignment
         self._folder_changed: bool = False  # re-inject [FOLDER] breadcrumb next turn after move
+        # One-shot claim for the post-titling folder suggestion (see
+        # chat_folder_suggest.maybe_suggest_folder). In-memory only: a restored
+        # slot is already titled, so the suggestion hook never re-fires for it
+        # and a reset flag cannot produce a second card.
+        self._folder_suggested: bool = False
         self.pinned: bool = False  # pinned to top of sidebar
         self.tags: list[str] = []  # assigned tag ids (see DashboardState._tags)
         self._pending_subagent_failures: list[str] = []
@@ -1062,7 +1113,20 @@ class _ChatSlot:
         # watermark is what makes the #8 trim credit safe. It is NOT a fragile
         # "what to append" counter — saves always re-serialize the WHOLE window.
         self._disk_window_len: int = 0
-        # Cached frozen-prefix bytes for the append-safe save model.
+        # The newest ``ts`` seen on disk at the last save, INCLUDING rows this
+        # slot never observed. A subagent, cron, or CLI appending to a session a
+        # live tab also has open writes rows that ``_save_slot_to_history``
+        # preserves as "foreign" without ever folding them into ``messages`` --
+        # so the window is not a superset of the file, and flooring the next
+        # append on the window tail alone can tie a foreign row's timestamp.
+        # Cached rather than read per append: consulting the file here would put
+        # a stat plus a bounded read on the event loop, which AUTOSDE's
+        # no-blocking-call-on-event-loop rule forbids. Refreshed at the save
+        # boundary, where the lock is already held and the foreign lines are
+        # already parsed.
+        self._disk_tail_ts: str | None = (
+            None  # Cached frozen-prefix bytes for the append-safe save model.
+        )
         # The session file is FROZEN-PREFIX (the first _disk_older_count on-disk
         # message lines, OLDER than the in-memory window) + a fresh re-serialize
         # of the whole window. The prefix is never rewritten, so a restart that
@@ -1084,7 +1148,14 @@ class _ChatSlot:
             []
         )  # [{path, content}] before-snapshots accumulated per turn for file-chip diffs
         self.linked_session_key: str = ""  # when set, _run_chat uses this as session key
-        self._browse_mode: bool = False  # per-turn: True when user explicitly enables browser
+        # True only when this slot was created to DISPLAY a conversation that
+        # already lives in a channel transcript (the reconciler surfacing a
+        # thread, a restore, a History resume). It is what separates such a tab
+        # from a dashboard slot that merely happens to be NAMED like one --
+        # a filename-shaped name is not provenance, and inferring it from the
+        # name would let `POST /api/chat/slots` with a colliding `slack_<ts>`
+        # name write a fresh conversation into an existing thread's transcript.
+        self.channel_origin: bool = False
         self._side: SideState | None = None
         # Live inner AcpClient for the in-flight turn, published by _run_chat at
         # turn start and cleared in its finally. Lets a concurrent request (the
@@ -1203,6 +1274,20 @@ class _ChatSlot:
             "current": current,
         }
 
+    def note_disk_tail(self, *candidates: str | None) -> None:
+        """Record the newest ``ts`` known to be ON DISK for this session.
+
+        The save boundary is the only place a slot can learn about a row it never
+        observed (see ``_disk_tail_ts``), so it calls this with whatever it just
+        wrote -- foreign rows included. Keeping the update here rather than
+        assigning the attribute from the persistence module means the **monotone**
+        rule lives with the field it guards: the floor may only ever move FORWARD.
+        A save that moved it backwards would re-open the same-``ts`` tie the floor
+        exists to prevent, and unparseable candidates are skipped rather than
+        ranked (``latest_transcript_ts``), so one corrupt row cannot capture it.
+        """
+        self._disk_tail_ts = latest_transcript_ts(self._disk_tail_ts, *candidates)
+
     def append(
         self,
         role: str,
@@ -1211,16 +1296,71 @@ class _ChatSlot:
         ts: str = "",
         *,
         broadcast: bool = True,
+        broadcast_user: bool = False,
         meta: dict | None = None,
     ) -> None:
         msg: dict[str, Any] = {
             "role": role,
             "content": content,
             "cls": cls,
-            "ts": ts or datetime.now(timezone.utc).isoformat(),
+            # This window is re-serialized into the SAME transcript file that
+            # ConversationLog.append writes, so it owes the reader the same
+            # ordering guarantee: strictly after the row before it, even when
+            # the clock does not tick between two appends. An explicit *ts*
+            # (a row replayed from a channel transcript) is preserved verbatim
+            # -- rewriting it would reorder the replay it came from.
+            #
+            # The floor is the later of the window tail and the last on-disk tail
+            # this slot was told about, because the window is NOT a superset of
+            # the file: a row written by another process is preserved as a
+            # foreign line without entering ``messages``, so flooring on the
+            # window alone leaves it un-ordered-against. Both candidates are
+            # in-process reads -- no file I/O on the event loop.
+            "ts": ts
+            or monotonic_transcript_ts(
+                latest_transcript_ts(
+                    self.messages[-1].get("ts") if self.messages else None,
+                    self._disk_tail_ts,
+                ),
+                datetime.now(timezone.utc),
+            ),
         }
         if meta:
             msg["meta"] = meta
+        # Stamp a per-row delivery identity. A client sees the SAME row through
+        # two doors — the slot-detail HTTP rebuild and the live `chat_message`
+        # broadcast — and must be able to tell "this row again" from "another row
+        # that happens to look identical". `ts` cannot answer that: a coarse OS
+        # clock stamps two rows appended in the same tick identically (the same
+        # collision mergePreservedClientTs already guards), and content cannot
+        # either, since two identical messages are legitimate. So identity is an
+        # explicit id, minted once here, carried on the message dict, and thus
+        # present on every path that ships it: persisted by _build_message_entry,
+        # restored with the rest of `meta`, broadcast as `payload["meta"]`, and
+        # returned by _prepare_messages.
+        #
+        # Random rather than a per-slot counter deliberately: a counter rebased
+        # after a restore could reissue an id a restored row already holds, and a
+        # colliding id makes a client DROP a real message. There is no such
+        # failure mode for a random id.
+        #
+        # A caller-supplied `mid` (a row replayed from disk) is preserved — the
+        # id must survive the round trip or a post-restart redelivery of that row
+        # would not be recognisable.
+        #
+        # Skipped for the wire-only roles: `chunk` is appended once per streamed
+        # token and `done`/`streaming` are internal markers. None of them is ever
+        # broadcast as a `chat_message` (the broadcast below excludes them) or
+        # persisted (`_TRANSIENT_ROLES`), so an id would buy nothing and cost a
+        # uuid4 plus a dict on the hottest path in the runner.
+        if role not in _WIRE_ONLY_ROLES and not (
+            isinstance(msg.get("meta"), dict) and msg["meta"].get("mid")
+        ):
+            existing = msg.get("meta")
+            msg["meta"] = {
+                **(existing if isinstance(existing, dict) else {}),
+                "mid": f"m-{uuid.uuid4().hex[:16]}",
+            }
         self.messages.append(msg)
         self.invalidate_source_links()
         self.total_messages += 1
@@ -1228,11 +1368,18 @@ class _ChatSlot:
         self._pending.append(msg)
         self.event.set()
         # Broadcast via global SSE when no HTTP stream reader is active
-        # Skip: chunk (too noisy), done (internal), user (frontend adds optimistically)
+        # Skip: chunk (too noisy), done (internal). A "user" row is skipped by
+        # DEFAULT because the composer that submitted it already rendered it
+        # optimistically -- but that is only true of a message typed in this
+        # dashboard. A row replayed from a CHANNEL transcript was typed in
+        # Slack, so nothing rendered it here; those callers pass
+        # ``broadcast_user=True`` or the message stays invisible until a full
+        # transcript reload, arriving AFTER the reply it came before.
         if (
             broadcast
             and self._on_message
-            and role not in ("chunk", "done", "user")
+            and role not in ("chunk", "done")
+            and (role != "user" or broadcast_user)
             and not self._has_reader
         ):
             self._on_message(self.key, msg)  # type: ignore[operator]
@@ -1319,13 +1466,16 @@ class _ChatSlot:
         self._queue.append({"id": qid, "content": content, "kind": kind})
         return qid
 
-    def queue_insert(self, index: int, content: str, kind: str = "") -> str:
+    def queue_insert(self, index: int, content: str, kind: str = "", payload: str = "") -> str:
         """Insert a message at a specific queue position. Returns the queue ID.
 
-        See :meth:`queue_append` for the ``kind`` structural origin tag.
+        See :meth:`queue_append` for the ``kind`` structural origin tag. ``payload``
+        is the orthogonal question of whether the TEXT is runner-authored, read by
+        ``is_synthetic_payload_item``; a recovery entry that replays the user's own
+        message shares the recovery kind but is not machine speech.
         """
         qid = uuid.uuid4().hex[:12]
-        self._queue.insert(index, {"id": qid, "content": content, "kind": kind})
+        self._queue.insert(index, {"id": qid, "content": content, "kind": kind, "payload": payload})
         return qid
 
     def queue_pop(self, index: int = 0) -> dict[str, str]:
@@ -1426,6 +1576,18 @@ class _ChatSlot:
         Linear scan (no regex backtracking) validated by the source-provider
         URL parser and cached behind an explicit content revision.
 
+        Ordered MOST RECENTLY MENTIONED FIRST, which is what makes the sidebar's
+        chip budget useful. Only ``_SERIALIZED_SOURCE_LINKS_PER_SLOT`` chips per
+        kind are serialized and the rest collapse into a "+N" pill, so a
+        first-mention order handed those slots to the OLDEST pull requests in the
+        session and hid the one being worked on -- the longer the session ran, the
+        more certain it was to hide the interesting chip. Scanning backwards also
+        means the ``_MAX_SOURCE_LINKS_PER_SLOT`` ceiling keeps the newest links
+        rather than the first 64 ever mentioned.
+
+        Recency is LAST mention, not first: a pull request under active work gets
+        re-mentioned as it progresses, which is exactly the signal wanted here.
+
         Each entry carries a ``kind`` discriminator (``"change"`` for a pull or
         merge request, ``"issue"`` for an issue). Readers that only handle pull
         requests -- the chip-status cache and every path that reaches ``gh pr
@@ -1450,21 +1612,56 @@ class _ChatSlot:
 
         stop_chars = set(" \t\n<>()[]{}\"'")
         found: dict[str, dict] = {}
-        for msg in self.messages:
-            if len(found) >= _MAX_SOURCE_LINKS_PER_SLOT:
+        # Hard ceiling on parse attempts for the WHOLE call, not per message and not
+        # only on success. `len(found)` advances only for a new valid url, so a
+        # message repeating one rejected candidate (or one valid one) never advanced
+        # it and every occurrence reached the parser: a 58 MB accepted body froze the
+        # event loop for ~13.6s, and this runs synchronously inside `to_dict` on
+        # `push_slots_update`. A budget bounds every flood shape at once -- rejected,
+        # repeated and distinct -- which a dedup set could not, because remembering
+        # candidates in order to skip them is itself unbounded memory.
+        #
+        # Sized far above any real transcript: 64 serialized chips come from a
+        # handful of occurrences each, so 4096 attempts is ~64x headroom while
+        # capping worst-case work in the tens of milliseconds. The walk is
+        # newest-first, so a truncated flood keeps the most recent candidates.
+        parse_budget = _MAX_SOURCE_LINKS_PER_SLOT * 64
+        # Newest message first, and newest url first WITHIN a message, so the
+        # dedup below keeps each url's LAST mention and `found` comes out in
+        # descending recency. One message mentioning several urls is ordered by
+        # position in the text, its only available proxy for "later".
+        for msg in reversed(self.messages):
+            if len(found) >= _MAX_SOURCE_LINKS_PER_SLOT or parse_budget <= 0:
                 break
             if not isinstance(msg, dict) or msg.get("role") in _NON_DURABLE_SOURCE_LINK_ROLES:
                 continue
             content = msg.get("content")
             if not isinstance(content, str) or "https://" not in content:
                 continue
-            idx = 0
-            while len(found) < _MAX_SOURCE_LINKS_PER_SLOT:
-                idx = content.find("https://", idx)
+            # Walk this message's urls from the END with `rfind`, so the newest
+            # mention is admitted first and the cap below can stop the walk. An
+            # earlier draft collected the whole message's urls and reversed the
+            # list, which allocated in proportion to the message and parsed every
+            # occurrence before the cap was consulted -- a single message carrying
+            # thousands of urls would stall slot serialization on the event loop.
+            #
+            search_end = len(content)
+            while len(found) < _MAX_SOURCE_LINKS_PER_SLOT and parse_budget > 0:
+                idx = content.rfind("https://", 0, search_end)
                 if idx == -1:
                     break
+                # A candidate ends at the first stop char OR where the NEXT
+                # occurrence begins, whichever comes first. The bound is what keeps
+                # the whole walk linear: without it, content like "https://" repeated
+                # thousands of times has no stop char until the very end, so every
+                # occurrence would rescan the entire tail -- quadratic, on a path
+                # `to_dict` runs synchronously during push_slots_update, which is
+                # enough to trip the event-loop watchdog. Bounded this way each
+                # character is examined once across the whole message.
+                token_limit = search_end
+                search_end = idx
                 end = idx
-                while end < len(content) and content[end] not in stop_chars:
+                while end < token_limit and content[end] not in stop_chars:
                     end += 1
                 # Also strip markdown emphasis (**bold**, *italic*, `code`,
                 # _underscore_, ~~strike~~): agent messages routinely wrap PR
@@ -1472,17 +1669,21 @@ class _ChatSlot:
                 # check. Valid PR/MR URLs end in a number, so these chars can
                 # never belong to a legitimate link tail.
                 candidate = content[idx:end].rstrip(".,!?;:*_~`")
-                idx = end
                 if (
                     "/pull/" not in candidate
                     and "/merge_requests/" not in candidate
                     and "/issues/" not in candidate
                 ):
                     continue
+                # Every attempt is charged, whether it parses or not -- that is
+                # what makes the bound hold on a rejected-candidate flood.
+                parse_budget -= 1
                 try:
                     ref = parse_source_url(candidate)
                 except ValueError:
                     continue
+                # First writer wins, and because the walk is backwards the first
+                # writer IS the most recent mention.
                 if ref.url not in found:
                     found[ref.url] = {
                         "provider": ref.provider,
@@ -1690,6 +1891,13 @@ class DashboardState:
     _slots_push_suspend: int = 0
     _slots_push_pending: bool = False
     restoring_open_slots: bool = False
+    # Keys the last open-tab restore could not read (not keys it proved absent).
+    # _persist_open_slots folds these back into the snapshot so a transient read
+    # failure cannot erase the reopen seed. The class-level baseline is an
+    # IMMUTABLE frozenset on purpose: a bare set() here would be one object
+    # shared by every __new__-built instance. __init__ and the restore each
+    # assign a fresh set(), so mutation only ever touches an instance attribute.
+    unrestored_slot_keys: "frozenset[str] | set[str]" = frozenset()
 
     def __init__(
         self,
@@ -1817,6 +2025,8 @@ class DashboardState:
         # being restored from with a half-populated slot set — see
         # _persist_open_slots.
         self.restoring_open_slots = False
+        # Per-instance (see the class-level frozenset baseline for why).
+        self.unrestored_slot_keys: set[str] = set()
         self._notification_log: list[dict[str, Any]] = _load_notifications()
         self._unread_count: int = 0
         # Notification bus (schema v2) — notify() adapts legacy calls onto it;
@@ -1859,8 +2069,15 @@ class DashboardState:
         # never acquires it.
         self._context_snapshots_flush_lock = threading.Lock()
         self._folders: list[dict[str, Any]] = []  # project folder definitions
+        self._cron_folders: list[dict[str, Any]] = []  # cron job folder groupings
         # Tag vocabulary: list of {id, name, color, order}. User-managed.
         self._tags: list[dict[str, Any]] = []
+        # True once load_tags() parsed tags.json successfully (or seeded a
+        # fresh install). False means the vocabulary state is UNKNOWN (parse
+        # or I/O failure) — restore-time pruning must fail open then, because
+        # a legitimately-empty vocabulary (user deleted every tag) must still
+        # prune dangling ids while an unreadable one must not wipe anything.
+        self._tags_authoritative: bool = False
         # Sidebar columns — flat list of {id, name, tag_ids, mode, order, include_untagged}
         self._tag_boards: list[dict[str, Any]] = []
         self._background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
@@ -1881,6 +2098,11 @@ class DashboardState:
         # entrypoint (faulthandler enabled) and stopped on shutdown. Annotated
         # here so the assignment in start_dashboard type-checks under mypy strict.
         self._loop_watchdog: "LoopStallWatchdog | None" = None
+        # Prevent-sleep inhibitor + its poll task. Held to prevent GC and
+        # released/cancelled on shutdown; annotated here so the assignments in
+        # start_dashboard type-check under mypy.
+        self._sleep_inhibitor: "SleepInhibitor | None" = None
+        self._prevent_sleep_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
         # Knowledge Library
         self._knowledge_store: "KnowledgeStore | None" = None  # Lazy-initialized on first access
@@ -2052,6 +2274,9 @@ class DashboardState:
         cron_jobs: int | None = None,
         lessons: int | None = None,
         update_available: bool = False,
+        update_self_updatable: bool = False,
+        update_checked: bool = False,
+        update_command: str = "",
     ) -> dict[str, Any]:
         """Core status fields shared by /api/status, SSE, and WebSocket pushes."""
         uptime = int(time.time() - self.start_time)
@@ -2065,9 +2290,34 @@ class DashboardState:
             "lessons": lessons if lessons is not None else self._count_lessons(),
             "subagents": self.subagents.count if self.subagents else 0,
             "update_available": update_available,
+            # Can THIS install replace its own code? Only a git checkout can
+            # (``POST /api/update`` is git fetch + reset). Shipped alongside the
+            # availability flag so the dashboard can offer an Update button that
+            # will actually work, instead of one that 409s on a wheel install —
+            # it must not have to run a fresh check just to learn the layout.
+            "update_self_updatable": update_self_updatable,
+            # Did a check ever reach a verdict? Without this the UI cannot tell
+            # "checked and current" from "never checked", and painting a green
+            # "Up to date" pill next to a red "couldn't check" line is the exact
+            # half-truth the update-check contract exists to prevent.
+            "update_checked": update_checked,
+            # The upgrade command for an install that cannot replace itself, so the
+            # 12-hourly BACKGROUND check can light the nav badge and still land the
+            # user on something actionable. Deriving it only from a manual check
+            # left the badge pointing at an Update button that 409s.
+            "update_command": update_command,
             "no_crons": self.no_crons,
             "branch": branch,
             "commit": commit,
+            # Which release lane these bytes came from: "nightly", "insider" or
+            # "stable". Shipped as a RESOLVED ANSWER rather than leaving the
+            # dashboard to parse `version` itself, because the rule is not
+            # obvious (the same release is stamped as SemVer for desktop and
+            # PEP 440 for wheels, and neither PEP 440 prerelease spelling
+            # contains a `-`) and a frontend mirror of it would drift silently.
+            # The dashboard uses this to give prerelease users an obvious way to
+            # report a bug; see release_channel.py for the full rule.
+            "release_channel": _release_channel_of_build(),
             # True when the gateway has wired up a live Slack client (Socket Mode
             # connected). None in pure-dashboard mode or when Slack is disabled.
             "slack_connected": self.slack_client is not None,
@@ -2504,6 +2754,25 @@ class DashboardState:
                 for name, slot in list(self._slots.items())
                 if getattr(slot, "memory_mode", "persistent") == "persistent"
             ]
+            # Re-add keys the last restore could not READ. Without this, a tab
+            # dropped by a transient metadata failure is erased from the seed by
+            # the very next flush (this snapshot is taken from live _slots), so
+            # "recoverable on a later restore pass" stops being true and the tab
+            # is gone for good. Only keys that came out of open_slots.json land
+            # here, so the persistent-only filter above still holds for them.
+            #
+            # Iterating this set is safe ONLY because the restoring_open_slots
+            # early-return above covers the one writer: the restore mutates it
+            # between tabs, and this method runs from two threads (the 5s
+            # executor flush and the shutdown thread). That guard is therefore
+            # load-bearing for thread safety here, not just for partial
+            # snapshots — do not narrow it without giving this set its own lock.
+            seen = set(keys)
+            keys.extend(
+                k
+                for k in getattr(self, "unrestored_slot_keys", frozenset())
+                if k not in seen
+            )
             payload = json.dumps({"keys": keys, "ts": time.time()})
             # Use the canonical atomic_write helper, not a deterministic
             # ".json.tmp" name — _persist_open_slots can run concurrently from
@@ -2683,6 +2952,38 @@ class DashboardState:
         """Look up a slot by name without creating it. Returns None if absent."""
         return self._slots.get(name)
 
+    def spend_slot_by_session(self) -> dict[str, str]:
+        """Map each live slot's SESSION key to the SLOT key its spend is filed under.
+
+        Per-turn usage is persisted under ``slot.key``
+        (``chat_runner.persist_token_record_async``), while a session is addressed
+        by :func:`effective_session_key`. For an ordinary dashboard slot those are
+        the same string modulo the ``dashboard:`` prefix, so a prefix rule is
+        enough. For a slot bound to a channel or cron conversation they are
+        UNRELATED: the turns run under ``linked_session_key`` while the spend rows
+        still carry the dashboard slot key, so a consumer joining spend by session
+        key finds nothing and renders "unknown" for a session that did spend.
+
+        This is the reverse index that closes that gap. It lives here because
+        DashboardState owns the slots and the identity rule; a consumer rebuilding
+        it would be a second owner of the rule, which is how the two sides drifted
+        apart in the first place.
+        """
+        # Local import: chat_utils imports FROM state at module level, so a
+        # top-level import here is a cycle. state.py already defers
+        # `dashboard_slot_key` the same way.
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        out: dict[str, str] = {}
+        for slot in list(self._slots.values()):
+            try:
+                session_key = effective_session_key(slot)
+            except Exception:  # pragma: no cover - defensive; a slot mid-teardown
+                continue
+            if session_key:
+                out[session_key] = slot.key
+        return out
+
     def native_subagent_snapshots(
         self,
         terminal_limit: int = NATIVE_SUBAGENT_TERMINAL_KEEP,
@@ -2830,9 +3131,7 @@ class DashboardState:
                 # The previous owner's slot may already be gone; fall back to
                 # deriving its key from the name in that case.
                 old_key = (
-                    effective_session_key(old_slot)
-                    if old_slot
-                    else _history_key_for(old_owner)
+                    effective_session_key(old_slot) if old_slot else _history_key_for(old_owner)
                 )
                 self.sessions.set_slack_link(old_key, "", "")
         slot._slack_linked = True
@@ -2843,9 +3142,7 @@ class DashboardState:
         if self.sessions:
             from kiro_crew.dashboard.chat_utils import effective_session_key
 
-            self.sessions.set_slack_link(
-                effective_session_key(slot), thread_ts, channel_id
-            )
+            self.sessions.set_slack_link(effective_session_key(slot), thread_ts, channel_id)
         self.push_slots_update()
 
     def get_or_create_slot(
@@ -2859,6 +3156,7 @@ class DashboardState:
         ephemeral: bool | None = None,
         app: str = "",
         linked_session_key: str = "",
+        channel_origin: bool = False,
     ) -> _ChatSlot:
         """Return existing slot or create a new one.
 
@@ -2926,6 +3224,11 @@ class DashboardState:
         # write their namespaced origin id through the legacy channel field;
         # those are projected separately via ``links`` and must never make the
         # destructive Slack actions appear.
+        if channel_origin:
+            # Additive: never cleared, because get_or_create_slot also returns
+            # EXISTING slots and a later plain call must not downgrade a tab
+            # that a channel path already claimed.
+            slot.channel_origin = True
         if linked_session_key:
             slot.linked_session_key = linked_session_key
         elif self.sessions:
@@ -2937,12 +3240,14 @@ class DashboardState:
             # dashboard-only session whose replies never reach the thread.
             #
             # Only ever adopts a key the session map actually holds, so a slot
-            # whose name merely looks channel-shaped stays unbound.
-            from kiro_crew.messaging.link import is_channel_session_key
-
+            # whose name merely looks channel-shaped stays unbound. Validated the
+            # same way ``surface_channel_session`` validates its own argument:
+            # only a real channel key may become a binding, so a malformed map
+            # answer leaves the slot unbound (a supported state) rather than
+            # routing the user's replies to a session no channel reads.
             if is_channel_session_key(name):
                 resolved = self.sessions.channel_key_for_stem(name)
-                if resolved:
+                if isinstance(resolved, str) and is_channel_session_key(resolved):
                     slot.linked_session_key = resolved
         try:
             if self.sessions:
@@ -2954,9 +3259,57 @@ class DashboardState:
                     namespaced = _split_namespaced_channel_id(_ch)
                     slot._slack_channel = namespaced[1] if namespaced else (_ch or "")
                     slot._slack_thread_ts = _ts or ""
+                    # Rebuild the thread -> slot index too, not just the fields:
+                    # inbound replies resolve through the index, so restoring
+                    # the fields alone leaves a mirrored session delivering to
+                    # Slack but not back to its tab after a restart.
+                    #
+                    # Index ONLY a genuine mirror-OUT. A channel-born session's
+                    # ``slack_thread_ts`` is a SELF-reference -- the thread the
+                    # session lives IN, not one it mirrors TO -- and indexing
+                    # that would make every inbound Slack message resolve to a
+                    # "linked" slot and run through the dashboard chat runner
+                    # instead of the Slack transport, silently changing the
+                    # execution engine and approval semantics of all Slack
+                    # traffic.
+                    #
+                    # Both tests are load-bearing and neither is a name
+                    # heuristic. A channel slot whose stem RESOLVED is caught by
+                    # ``linked_session_key``; one whose stem did NOT resolve
+                    # (leaving that field empty) is caught by comparing the link
+                    # against the slot's own filename stem, because a channel
+                    # slot is named for the very thread it lives in. A dashboard
+                    # slot that merely happens to be named ``slack_...`` matches
+                    # neither test and is still indexed.
+                    from kiro_crew.history import _safe_key
+                    from kiro_crew.messaging.link import canonical_key
+
+                    _self_ref = False
+                    if _ts:
+                        _self_ref = _safe_key(canonical_key(_ts)) == name
+                    if _ts and not slot.linked_session_key and not _self_ref:
+                        self._slack_to_slot[_ts] = name
         except Exception:
             pass
         self._slots[name] = slot
+        # Publish the updated key set to SessionManager and the surface
+        # registry NOW, not just on the HTTP slot endpoints. Slots born here
+        # programmatically (auto-research campaign workers, cron/workflow
+        # inject, task runner, spec builder) never pass through those
+        # endpoints, so ``_active_dashboard_slots`` stayed stale and the idle
+        # sweep's orphan branch reaped their live sessions as "slot gone" —
+        # killing the companion subagent runtime (and any subagent mid-prompt
+        # on it) along the way. Guarded: tests build this state without a
+        # SessionManager, and a sync failure must never break slot creation.
+        if self.sessions:
+            try:
+                from kiro_crew.dashboard.chat_utils import _sync_dashboard_slots
+
+                _sync_dashboard_slots(self)
+            except Exception:
+                logger.warning(
+                    "get_or_create_slot: active-slot sync failed for %s", name, exc_info=True
+                )
         self.push_slots_update()
         return slot
 
@@ -3028,11 +3381,19 @@ class DashboardState:
         #    other way would be a cycle.
         #
         # What makes that safe: live tool meta is redacted at source (_tool_meta),
-        # and no DISK-LOADED message is ever appended with broadcast=True — both
-        # restore loops pass broadcast=False. That invariant is what lets the load
-        # path skip meta redaction, and it is pinned by
+        # and a DISK-LOADED message reaches this path only when the caller opts
+        # in per-role. Both restore loops pass broadcast=False, and the ONE
+        # exception is refresh_channel_window, which replays a channel
+        # transcript's tail and passes broadcast_user=True so a message typed in
+        # Slack renders at all (nothing rendered it optimistically here). That
+        # exception cannot carry unredacted meta: ConversationLog.append writes
+        # only role/content/ts/source_thread/source_user for such a row -- no
+        # meta dict -- so the arm below never fires for it, and the row's
+        # content is human-typed, which is deliberately raw at every other
+        # boundary too. The invariant is pinned by
         # test_rehydrate_does_not_broadcast_replayed_messages and
-        # test_restore_recent_sessions_does_not_broadcast_either. Do not relax it.
+        # test_restore_recent_sessions_does_not_broadcast_either. Do not relax
+        # it further without re-checking that meta is still absent.
         direct_meta = msg.get("meta")
         if direct_meta and isinstance(direct_meta, dict):
             payload["meta"] = {**(payload.get("meta") or {}), **direct_meta}
@@ -3076,6 +3437,137 @@ class DashboardState:
         path = config_dir() / self._FOLDERS_FILE
         self._atomic_write_json(path, self._folders)
 
+    _CRON_FOLDERS_FILE = "cron_folders.json"
+
+    def load_cron_folders(self) -> None:
+        """Load cron folder definitions from disk.
+
+        Validates the loaded shape: the file must contain a JSON array of
+        folder objects. Anything else (a hand-edited ``{}``, a string, or
+        malformed entries) is discarded with a warning instead of being
+        assigned verbatim — a non-list value would flow to the frontend
+        and crash grouping (``folders.map is not a function``).
+        """
+        path = config_dir() / self._CRON_FOLDERS_FILE
+        try:
+            if path.exists():
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(loaded, list):
+                    logger.warning(
+                        "Ignoring %s: expected a JSON array, got %s",
+                        self._CRON_FOLDERS_FILE,
+                        type(loaded).__name__,
+                    )
+                    return
+                valid = [
+                    f
+                    for f in loaded
+                    if isinstance(f, dict)
+                    and isinstance(f.get("id"), str)
+                    and f.get("id")
+                    and isinstance(f.get("name"), str)
+                    and f.get("name")
+                    and isinstance(f.get("order"), (int, float))
+                    and not isinstance(f.get("order"), bool)
+                ]
+                if len(valid) != len(loaded):
+                    logger.warning(
+                        "Dropped %d malformed entr(ies) while loading %s",
+                        len(loaded) - len(valid),
+                        self._CRON_FOLDERS_FILE,
+                    )
+                self._cron_folders = valid
+        except Exception:
+            logger.warning("Failed to load cron folders", exc_info=True)
+
+    def save_cron_folders(self) -> None:
+        """Persist cron folder definitions to disk (atomic write).
+
+        Raises on I/O failure so callers can surface a 500 to the client
+        rather than silently losing the write.
+        """
+        path = config_dir() / self._CRON_FOLDERS_FILE
+        self._atomic_write_json_strict(path, self._cron_folders)
+
+    def create_cron_folder(self, name: str, folder_id: str) -> dict:
+        """Create a new cron folder and persist.
+
+        Returns the created folder dict. Raises on persistence failure
+        (callers should surface a 500); in-memory state is rolled back.
+        """
+        order = max((f["order"] for f in self._cron_folders), default=-1) + 1
+        folder = {"id": folder_id, "name": name, "order": order}
+        self._cron_folders.append(folder)
+        try:
+            self.save_cron_folders()
+        except Exception:
+            self._cron_folders.pop()
+            raise
+        return folder
+
+    def rename_cron_folder(self, folder_id: str, name: str) -> dict | None:
+        """Rename a cron folder and persist.
+
+        Returns the updated folder dict, or None if folder_id not found.
+        Raises on persistence failure (callers should surface a 500);
+        original name is restored on failure.
+        """
+        for folder in self._cron_folders:
+            if folder["id"] == folder_id:
+                old_name = folder["name"]
+                folder["name"] = name
+                try:
+                    self.save_cron_folders()
+                except Exception:
+                    folder["name"] = old_name
+                    raise
+                return folder
+        return None
+
+    def delete_cron_folder(self, folder_id: str) -> bool:
+        """Remove a cron folder and clear its assignment on all jobs.
+
+        Returns True if the folder existed, False otherwise.
+        Raises on persistence failure (callers should surface a 500).
+
+        Ordering: the folder removal is the single authoritative write —
+        it is removed from memory and persisted FIRST (rolled back in
+        memory if the save fails, keeping memory consistent with disk).
+        Job ``folder_id`` clears happen afterwards as best-effort cleanup:
+        a dangling ``folder_id`` is benign (grouping renders unknown ids
+        in the Ungrouped bucket, and a job's next folder move overwrites
+        it), so a crash or per-job failure between writes can never strand
+        jobs in a half-deleted state — the folder is either fully present
+        or fully gone.
+        """
+        if not any(f["id"] == folder_id for f in self._cron_folders):
+            return False
+        # Remove the folder definition and persist — the one write that
+        # decides whether the delete happened.
+        snapshot = list(self._cron_folders)
+        self._cron_folders = [f for f in self._cron_folders if f["id"] != folder_id]
+        try:
+            self.save_cron_folders()
+        except Exception:
+            self._cron_folders = snapshot
+            raise
+        # Best-effort: clear the now-dangling folder_id on affected jobs.
+        # Failures are logged and tolerated — consumers treat an unknown
+        # folder_id as ungrouped, so a leftover id has no user-visible
+        # effect and self-heals on the job's next folder assignment.
+        for job in self.crons.list_jobs(include_disabled=True):
+            if job.folder_id == folder_id:
+                try:
+                    self.crons.update_job(job.id, folder_id="")
+                except Exception:
+                    logger.warning(
+                        "Failed to clear folder_id on job %s after folder delete "
+                        "(benign: unknown ids render as ungrouped)",
+                        job.id,
+                        exc_info=True,
+                    )
+        return True
+
     def folder_breadcrumb(self, folder_id: str, sep: str = " › ") -> str:
         """Render a folder's ancestry root→leaf as a breadcrumb string.
 
@@ -3113,14 +3605,27 @@ class DashboardState:
         tags_path = config_dir() / self._TAGS_FILE
         file_existed = tags_path.exists()
         try:
+            vocab_ok = True
             if file_existed:
                 raw = json.loads(tags_path.read_text(encoding="utf-8"))
                 if isinstance(raw, list):
                     self._tags = [t for t in raw if isinstance(t, dict) and t.get("id")]
+                else:
+                    # Valid JSON but not a list (e.g. {}): the vocabulary
+                    # state is UNKNOWN, same as a parse failure — do not let
+                    # restore-time pruning wipe assignments against it.
+                    vocab_ok = False
+                    logger.warning("tags.json is not a list; treating vocabulary as unknown")
+            # Authoritative only when the file is missing (fresh install,
+            # seeded below) or parsed as a list — INCLUDING a legitimately-
+            # empty [] — so restore-time pruning of dangling ids is safe.
+            self._tags_authoritative = vocab_ok
         except Exception:
             logger.warning("Failed to load tags", exc_info=True)
             # Treat a parse error like a present file: do not re-seed.
             file_existed = True
+            # Vocabulary state unknown — restore-time pruning must fail open.
+            self._tags_authoritative = False
         # Back-fill the status flag for legacy tags saved before the field existed.
         # The 5 seed ids are canonical status tags; everything else defaults to False.
         seed_ids = {t["id"] for t in self._DEFAULT_TAGS}
@@ -3151,29 +3656,73 @@ class DashboardState:
         """Persist tag vocabulary to disk (atomic write)."""
         self._atomic_write_json(config_dir() / self._TAGS_FILE, self._tags)
 
+    def save_tags_snapshot(self, snapshot: list[dict]) -> None:
+        """Persist a pre-captured tag snapshot to disk (strict -- raises on failure).
+
+        Used by the serialized tag-write path in chat_tags.py: the snapshot is
+        captured on the event loop under the tags write lock, then this write
+        runs in a worker thread. Lives here (not in chat_tags.py) so the file
+        location resolves through this module's ``config_dir`` exactly like
+        ``save_tags`` -- keeping tests that patch it working unchanged.
+
+        Raises on I/O failure so callers can roll back in-memory state and
+        surface HTTP 5xx rather than silently losing data.
+        """
+        self._atomic_write_json_strict(config_dir() / self._TAGS_FILE, snapshot)
+
     def save_tag_boards(self) -> None:
         """Persist sidebar column layout to disk (atomic write)."""
         self._atomic_write_json(config_dir() / self._TAG_BOARDS_FILE, self._tag_boards)
 
+    def save_tag_boards_snapshot(self, snapshot: list[dict]) -> None:
+        """Persist a pre-captured boards snapshot to disk (strict -- raises on failure).
+
+        Used by the tag-delete path in chat_tags.py: the snapshot is captured
+        on the event loop under the tags write lock, then this write runs in a
+        worker thread. Lives here (not in chat_tags.py) so the file location
+        resolves through this module's ``config_dir`` exactly like
+        ``save_tag_boards`` -- keeping tests that patch it working unchanged.
+
+        Raises on I/O failure so callers can roll back in-memory state and
+        surface HTTP 5xx rather than silently losing data.
+        """
+        self._atomic_write_json_strict(config_dir() / self._TAG_BOARDS_FILE, snapshot)
+
+    @staticmethod
+    def _atomic_write_json_strict(path: Path, data: Any) -> None:
+        """Atomic JSON write that RAISES on failure (no swallowing).
+
+        Used by persistence helpers where the caller needs to know about
+        write failures (e.g. to return HTTP 500).
+        """
+        payload = json.dumps(data).encode()
+        fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            # fdopen takes ownership of fd; file-object write() guarantees
+            # the full buffer is written or an exception is raised (a bare
+            # os.write may return a short count silently, which would let
+            # os.replace() install truncated JSON).
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, str(path))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
     @staticmethod
     def _atomic_write_json(path: Path, data: Any) -> None:
-        """Atomic JSON write used by folder/tag persistence helpers."""
+        """Atomic JSON write used by folder/tag persistence helpers.
+
+        Delegates to _atomic_write_json_strict but swallows errors (logs a
+        warning instead of raising).
+        """
         try:
-            payload = json.dumps(data).encode()
-            fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-            try:
-                try:
-                    os.write(fd, payload)
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                os.replace(tmp, str(path))
-            except Exception:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
+            DashboardState._atomic_write_json_strict(path, data)
         except Exception:
             logger.warning("Failed to write %s", path.name, exc_info=True)
 

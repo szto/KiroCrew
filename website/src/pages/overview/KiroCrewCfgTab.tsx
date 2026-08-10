@@ -4,6 +4,7 @@ import { Check, Bot, FolderOpen, Brain, Settings, Lock, Flame } from 'lucide-rea
 import { api } from '../../api/client'
 import { Card, CardTitle, Badge, EmptyState } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
+import SimpleSelect from '../../components/SimpleSelect'
 import { useProvider } from '../../providers'
 
 import type { KiroCrewAgent } from '../../components/AgentSelector'
@@ -34,7 +35,7 @@ function UsedByTags({ names }: { names: string[] }) {
 }
 
 const rowCls = "flex justify-between items-center gap-3 py-1.5 border-b border-border text-sm"
-const inputCls = "h-7 min-w-[120px] bg-bg-elevated border border-border rounded px-2 py-0.5 text-[13px] font-mono text-text focus:border-accent focus:outline-none"
+const inputCls = "h-7 min-w-[120px] bg-bg-elevated border border-border rounded-md px-2 py-0.5 text-[13px] font-mono text-text focus:border-accent focus:outline-none"
 const readonlyCls = "flex justify-between items-center gap-3 py-1.5 border-b border-border text-sm bg-bg-elevated/30 rounded px-1 -mx-1"
 
 function useDirtyTrack<T>(value: T) {
@@ -63,9 +64,20 @@ function CfgSelect({ label, path, value, options, hint, labels, onSave }: { labe
   useEffect(() => { setLocal(value) }, [value])
   return (
     <CfgRow label={label} hint={hint} ok={ok}>
-      <select className={inputCls} value={local} onChange={e => { markDirty(); setLocal(e.target.value); onSave(path, e.target.value) }}>
-        {options.map(o => <option key={o} value={o}>{labels?.[o] ?? o}</option>)}
-      </select>
+      {/* The trigger is a <button>, so the row's visible label is threaded in
+          as the accessible name (matches CfgNumber's aria-label={label}).
+          `className` restores this table's compact geometry: the shared trigger
+          defaults to `px-3 py-2 text-sm`, which is ~10px taller than the `h-7
+          text-[13px]` control it replaced and would grow every row. */}
+      <SimpleSelect
+        aria-label={label}
+        className="h-7 px-2 py-0.5 text-[13px] font-mono"
+        style={{ minWidth: 120 }}
+        options={options}
+        optionLabels={options.map(o => labels?.[o] ?? o)}
+        value={local}
+        onChange={v => { markDirty(); setLocal(v); onSave(path, v) }}
+      />
     </CfgRow>
   )
 }
@@ -150,7 +162,7 @@ export default function KiroCrewCfgTab() {
     <>
       {/* Agents */}
       <Card>
-        <CardTitle><Bot className="lucide-inline" /> {i18nT('pages.overview.kiroCrewCfgTab.kirocrew_agents')} <InfoTip text={`Named agent definitions that bind a ${provider.labels.agentTemplateField.toLowerCase()}, workspace, and memory store together. Edit config.json to add or modify agents.`} /></CardTitle>
+        <CardTitle><Bot className="lucide-inline" /> {i18nT('pages.overview.kiroCrewCfgTab.kirocrew_agents')} <InfoTip text={i18nT('pages.overview.kiroCrewCfgTab.named_agent_definitions', { label: provider.labels.agentTemplateField.toLowerCase() })} /></CardTitle>
         {agents.length === 0 ? (
           <EmptyState icon={<Bot className="lucide-inline" />} title={i18nT('pages.overview.kiroCrewCfgTab.no_agents_defined')} subtitle={i18nT('pages.overview.kiroCrewCfgTab.using_legacy_mode_agent_default_agent_as_agent_t')} />
         ) : (
@@ -247,7 +259,7 @@ export default function KiroCrewCfgTab() {
       {/* Warm Pool */}
       {provider.capabilities.warmPool && (
       <Card>
-        <CardTitle><Flame className="lucide-inline" /> {i18nT('pages.overview.kiroCrewCfgTab.warm_pool')} <InfoTip text={`${provider.labels.warmPoolDescription} Restart required to apply changes.`} /></CardTitle>
+        <CardTitle><Flame className="lucide-inline" /> {i18nT('pages.overview.kiroCrewCfgTab.warm_pool')} <InfoTip text={i18nT('pages.overview.kiroCrewCfgTab.restart_required_to_apply_changes', { description: provider.labels.warmPoolDescription })} /></CardTitle>
         {saveErr && <p className="text-danger text-[13px] mb-2">{saveErr}</p>}
         <div className="grid grid-cols-2 gap-x-6 gap-y-2 max-[600px]:grid-cols-1">
           <CfgNumber key={`poolsize-${rev}`} label={i18nT('pages.overview.kiroCrewCfgTab.pool_size')} path="session.pool_size" value={cfg.session.pool_size ?? 0} min={0} max={10} hint={i18nT('pages.overview.kiroCrewCfgTab.number_of_pre_spawned_processes_0_disables_resta')} onSave={save} />
@@ -327,7 +339,7 @@ function SubagentSettings({ cfg, onSaved }: { cfg: KiroCrewCfg; onSaved: () => v
             className="w-20 px-2 py-1 rounded border border-border bg-bg-elevated text-text font-mono text-[13px] text-right" />
         </label>
         <label htmlFor="subagent-max-concurrent" className="flex justify-between items-center gap-3 py-1.5 border-b border-border text-sm">
-          <span className="text-muted inline-flex items-center gap-1">{i18nT('pages.overview.kiroCrewCfgTab.max_concurrent_subagents')} <InfoTip text={`Maximum subagents running at once. 0 = auto-size from host memory/CPU (capped at ${hardCap}). Default: 3.`} /></span>
+          <span className="text-muted inline-flex items-center gap-1">{i18nT('pages.overview.kiroCrewCfgTab.max_concurrent_subagents')} <InfoTip text={i18nT('pages.overview.kiroCrewCfgTab.maximum_subagents_running_at_once', { cap: hardCap })} /></span>
           <span className="inline-flex items-center gap-2">
             {maxSubs === 0 && <span className="text-[11px] text-muted">{i18nT('pages.overview.kiroCrewCfgTab.auto')}</span>}
             <input id="subagent-max-concurrent" aria-label={i18nT('pages.overview.kiroCrewCfgTab.max_concurrent_subagents')} type="number" min={0} max={hardCap} value={maxSubs} onChange={e => { const v = parseInt(e.target.value); setMaxSubs(Number.isNaN(v) ? 0 : Math.max(0, v)) }}

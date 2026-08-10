@@ -16,7 +16,13 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import agent_state, model_registry
-from kiro_crew.agent_discovery import clear_list_agents_cache, list_agents
+from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
+from kiro_crew.agent_discovery import (
+    clear_list_agents_cache,
+    list_agents,
+    spec_model,
+    spec_str,
+)
 from kiro_crew.config.loader import (
     PROVIDER_CLAUDE_CODE,
     ConfigReadError,
@@ -47,8 +53,14 @@ from kiro_crew.dashboard.handlers._shared import (
 from kiro_crew.dashboard.handlers.discover import _redact_external
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.executors import discovery_executor, maintenance_executor
-from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
+from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
+from kiro_crew.sandbox import (
+    SandboxUnavailableError,
+    cgroup_scope_argv,
+    configured_sandbox_mode,
+    create_subprocess_limited,
+    wrap_argv,
+)
 
 _MODEL_LIST_STDERR_TAIL_CHARS = 1000
 
@@ -664,6 +676,81 @@ def _advertised_cc_models(request: web.Request) -> list[dict]:
     return []
 
 
+def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict]:
+    """Narrow the ``--list-models`` catalog to what a live session advertises.
+
+    ``kiro chat --list-models`` is a CATALOG, not an entitlement: it returns the
+    same rows whatever the account's tier, so after a downgrade the picker kept
+    offering (and kept SHOWING as selected) a model no turn can run. The
+    per-session ``session/new`` ``availableModels`` list is the tier-aware one —
+    the same signal ``model_is_unusable`` pre-flights against before the wire —
+    so when a live session has one, it wins here too. Same rule #1549 applied to
+    the claude_code branch in :func:`_cc_models`: advertised is authoritative
+    when present.
+
+    The keep/drop decision delegates to ``model_is_unusable`` rather than
+    comparing ids here, so the picker cannot disagree with the wire about what
+    "this account can run" means. A local comparison would be a second spelling
+    of that question — the exact drift that predicate exists to prevent — and any
+    difference in how the two fold spelling variants shows up as a row the picker
+    offers and the wire then withholds.
+
+    The ``auto`` sentinel is never filtered: it means "inherit whatever the
+    session already resolved", so it stays selectable even on a backend that does
+    not advertise it by name.
+
+    Fails open in every unknowable case — no live session, a backend that
+    advertises nothing, or an advertised set that does not intersect the catalog
+    at all (a namespace mismatch rather than an entitlement, e.g. the claude
+    backend's bare ids). Filtering on any of those would empty the picker, which
+    is worse than listing one model too many.
+    """
+    try:
+        state: DashboardState = request.app["state"]
+        providers = state.sessions.active_providers()
+    except (KeyError, AttributeError):
+        return models
+    advertised: list[str] = []
+    # Newest session first. `active_providers()` walks a dict of live sessions, so
+    # forward order is creation order — and a session that started BEFORE a plan
+    # change still holds the advertised list it captured at its own session/new.
+    # Reading the oldest one would narrow the catalog to pre-downgrade
+    # entitlements, i.e. keep offering exactly the models this narrowing exists to
+    # hide. The most recently started session carries the most recent snapshot.
+    for provider in reversed(providers):
+        getter = getattr(provider, "available_models", None)
+        if not callable(getter):
+            continue
+        try:
+            ids = advertised_model_ids(getter())
+        except Exception:
+            continue
+        if ids:
+            advertised = ids
+            break
+    if not advertised:
+        return models
+    advertises_auto = any(_normalize_model_key(i) == "auto" for i in advertised)
+    kept = [
+        m
+        for m in models
+        if _normalize_model_key(m.get("model_name", "")) == "auto"
+        or not model_is_unusable(m.get("model_name", ""), advertised)
+    ]
+    # Tell "not comparable" apart from "entitled to almost nothing". A backend
+    # that advertises `auto` shares a namespace with the catalog by definition, so
+    # `auto` alone is a real answer — the most restricted tier there is — and must
+    # narrow the picker to it. Only when nothing at all lines up, `auto` included,
+    # is this a namespace mismatch (bare vs prefixed provider ids) where showing
+    # the whole catalog beats emptying the picker. `auto` is always kept, so it can
+    # never serve as the evidence that the two sides are comparable.
+    if not advertises_auto and not any(
+        _normalize_model_key(m.get("model_name", "")) != "auto" for m in kept
+    ):
+        return models
+    return kept
+
+
 def _cc_models(
     request: web.Request,
     configured_default: str = "",
@@ -783,6 +870,26 @@ def _cc_models(
     return merged
 
 
+def _wrap_list_models_argv(argv: list[str]) -> tuple[list[str], str | None]:
+    """Sandbox-wrap the ``--list-models`` argv at the configured tier.
+
+    Runs in an executor, never on the loop: :func:`configured_sandbox_mode` stats
+    (and on a cache miss re-reads and revalidates) ``config.json``, and
+    ``wrap_argv`` -> ``detect_backend`` can cold-probe the sandbox backend with a
+    synchronous ``subprocess.run(..., timeout=5)``. Resolving the mode here rather
+    than passing it in keeps BOTH blocking reads in the worker thread.
+
+    ``is_kiro_cli=True`` is explicit because ``_spawns_kiro_cli``'s basename test
+    only matches a literal ``kiro-cli``: a Windows ``kiro-cli.exe``, a wrapper
+    shim, or a ``KIROCREW_KIRO_BIN`` pointing at a nonstandard launch path all
+    read as "not kiro-cli". On macOS with ``agent.sandbox="off"`` that
+    misclassification skips the delegation branch — and with it the credential-env
+    scrub — so the child would inherit the sensitive environment. Both ACP spawn
+    paths pass this flag for the same reason.
+    """
+    return wrap_argv(argv, mode=configured_sandbox_mode(), is_kiro_cli=True)
+
+
 async def api_models(request: web.Request) -> web.Response:
     """GET /api/models — list models for the configured provider.
 
@@ -847,7 +954,29 @@ async def api_models(request: web.Request) -> web.Response:
         # Note: AcpClient._spawn() is for interactive ACP sessions (stdin/stdout
         # pipes); this is a one-shot read-only command, so we replicate the
         # sandbox setup directly.  See the security-controls rule.
-        argv, cleanup = wrap_argv(argv)
+        #
+        # The configured tier is passed EXPLICITLY rather than left to
+        # wrap_argv's "auto" parameter default, so this endpoint can never ask
+        # for stricter isolation than the chat spawn of the same binary. It
+        # matters wherever the operator set agent.sandbox="off" (deferring
+        # isolation to kiro-cli's own internal sandbox) on a host with no backend
+        # — any Windows host, macOS >= 26: chat runs, while the default-mode wrap
+        # here fail-closed and answered 503 on every 8s poll. The frontend reads
+        # that as "degraded" and serves its auto-only fallback list, so the picker
+        # showed exactly one entry. Same fix, same reason as the `_bg` session in
+        # session.py.
+        #
+        # OFF the loop: `configured_sandbox_mode()` stats (and on a cache miss
+        # re-reads + revalidates) config.json, and `wrap_argv` -> `detect_backend`
+        # can cold-probe the backend with a synchronous
+        # `subprocess.run(..., timeout=5)`. This endpoint is polled every 8s while
+        # the model list is degraded, so leaving either on the loop stalls chat,
+        # cron and the liveness heartbeat on exactly the host where the probe is
+        # slowest. Both reads run in the worker, so the mode is resolved there
+        # too rather than passed in.
+        argv, cleanup = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _wrap_list_models_argv, argv
+        )
         argv = cgroup_scope_argv(argv)  # cgroup DoS ceiling
         try:
             env = {**os.environ}
@@ -932,7 +1061,33 @@ async def api_models(request: web.Request) -> web.Response:
                 maintenance_executor(), model_registry.persist_kiro_windows
             )
         models = [m for m in models if not is_deprecated_model(m.get("model_name", ""))]
+        models = _entitled_kiro_models(request, models)
         return web.json_response(models)
+    except SandboxUnavailableError as exc:
+        # Narrower than the generic clause below, and BEFORE it: this is the one
+        # degraded cause that no amount of retrying fixes, so it must not be
+        # reported as an anonymous "model list unavailable". Reached only when the
+        # tier resolved to "auto" (the shipped default) on a host with no
+        # backend, where a configured "off" passes through
+        # configured_sandbox_mode() above and never lands here.
+        #
+        # Still a 503: the client contract for "degraded, keep the last-good list
+        # and poll" is what keeps the picker from caching an empty result, and a
+        # 4xx here would make the frontend treat a host-capability problem as a
+        # bad request. The `code` is what lets the UI tell this apart from a
+        # timeout, and the log carries the sandbox layer's own remedy text (which
+        # names the agent.sandbox_allow_unsandboxed_exec opt-in).
+        logger.warning(
+            "api_models: sandbox refused the --list-models spawn (kind=%s, detail=%s); "
+            "returning 503. Retrying will not clear this — %s",
+            exc.kind,
+            exc.detail,
+            exc,
+        )
+        return web.json_response(
+            {"error": "model list unavailable", "code": "model_list_sandbox_unavailable"},
+            status=503,
+        )
     except Exception:
         # Spawn failure, JSON parse error, etc. — degraded, not "zero models".
         # 503 so the client retries instead of caching an empty picker.
@@ -1119,7 +1274,19 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                     discovery_executor(), agent_skill_views, data, f, state
                 )
                 return web.json_response(
-                    {**data, "skills": keys, "unmanaged_skills": unmanaged_uris}
+                    {
+                        **data,
+                        # The rest of the spec is passed through verbatim, but
+                        # these two are CONSUMED as display text by the detail
+                        # panel. A foreign spec's structured value rendered as a
+                        # React child throws error #31 and blanks the whole tab,
+                        # so both are coerced on the same "non-string means
+                        # absent" rule list_agents() uses.
+                        "description": spec_str(data, "description"),
+                        "model": spec_model(data),
+                        "skills": keys,
+                        "unmanaged_skills": unmanaged_uris,
+                    }
                 )
         except (json.JSONDecodeError, OSError):
             continue

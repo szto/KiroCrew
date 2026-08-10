@@ -3,6 +3,9 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { FlaskConical, Play, Pause, Square, MessageCircle, ChevronDown, ChevronRight, Sparkles, ThumbsUp, ArrowRight, HelpCircle, XCircle, CheckCircle, AlertTriangle, Lock, X, Trash2, GitFork, Flame, BookOpen, FileText, RefreshCw, ExternalLink, Loader2 } from 'lucide-react'
 import { api } from '../../api/client'
 import Clickable from '../../components/Clickable'
+import Modal from '../../components/Modal'
+import { Btn } from '../../components/ui'
+import SimpleSelect from '../../components/SimpleSelect'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
 import GrillTree from './GrillTree'
 import { grillReducer, promotedResearch, answeredClarifiers, suggestedMaxCycles, GrillNode } from './grillTreeModel'
@@ -114,7 +117,7 @@ function StateBadge({ status }: { status: string }) {
     ? STATE_META[status]
     : { color: 'text-muted', Icon: HelpCircle, spin: undefined }
   return (
-    <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded bg-bg-elevated inline-flex items-center gap-1 shrink-0 ${color}`} title={`Status: ${status}`}>
+    <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded bg-bg-elevated inline-flex items-center gap-1 shrink-0 ${color}`} title={i18nT('apps.autoResearch.researchLabPage.status', { status })}>
       <Icon size={10} className={spin ? 'animate-spin motion-reduce:animate-none' : undefined} /> {stateLabel(status)}
     </span>
   )
@@ -266,7 +269,7 @@ function SetupWizard({ onDone, onCancel }: { onDone: () => void; onCancel: () =>
           {tree.some(n => n.status !== 'pruned') && <div className="text-xs text-muted mt-1">{i18nT('apps.autoResearch.researchLabPage.answer_clarifiers_to_refine_or_just_pick_sub_que')}</div>}
           <div className="mt-2"><GrillTree tree={tree} dispatch={dispatchTree} onExpand={onExpand} /></div>
           {grillUnavailable && <div className="text-xs text-warn mt-2">{i18nT('apps.autoResearch.researchLabPage.grill_unavailable_add_sub_questions_manually_bel')}</div>}
-          {subQs.map((sq, i) => <div key={i} className="flex items-start gap-2 mt-1"><GrowTextarea ariaLabel={`Sub-question ${i + 1}`} className="flex-1 text-sm p-1.5 rounded bg-bg border border-border" value={sq} onChange={v => { const n = [...subQs]; n[i] = v; setSubQs(n) }} /><button className="text-xs text-danger mt-1.5" onClick={() => setSubQs(subQs.filter((_, j) => j !== i))} aria-label={i18nT('apps.autoResearch.researchLabPage.remove_sub_question')}><X size={12} /></button></div>)}
+          {subQs.map((sq, i) => <div key={i} className="flex items-start gap-2 mt-1"><GrowTextarea ariaLabel={i18nT('apps.autoResearch.researchLabPage.sub_question', { n: i + 1 })} className="flex-1 text-sm p-1.5 rounded bg-bg border border-border" value={sq} onChange={v => { const n = [...subQs]; n[i] = v; setSubQs(n) }} /><button className="text-xs text-danger mt-1.5" onClick={() => setSubQs(subQs.filter((_, j) => j !== i))} aria-label={i18nT('apps.autoResearch.researchLabPage.remove_sub_question')}><X size={12} /></button></div>)}
           <GrowTextarea ariaLabel={i18nT('apps.autoResearch.researchLabPage.add_sub_question_manually')} className="w-full text-sm p-1.5 rounded bg-bg border border-border mt-2" placeholder={i18nT('apps.autoResearch.researchLabPage.add_sub_question_manually_enter_shift_enter_for')} value={newSub} onChange={setNewSub} onSubmit={() => { if (newSub.trim()) { setSubQs([...subQs, newSub.trim()]); setNewSub('') } }} />
         </div>
       </div>}
@@ -274,8 +277,10 @@ function SetupWizard({ onDone, onCancel }: { onDone: () => void; onCancel: () =>
       {step === 1 && <div className="space-y-4">
         <span className="text-sm font-medium block">{i18nT('apps.autoResearch.researchLabPage.when_should_the_agent_stop')}</span>
         <div className="text-xs text-muted">{i18nT('apps.autoResearch.researchLabPage.stops_at_the_cycle_cap_when_the_definition_of_do')}</div>
-        <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.max_cycles')}</span><input type="number" aria-label={i18nT('apps.autoResearch.researchLabPage.max_cycles_2')} min={5} max={100} value={maxCycles} className="w-20 text-sm p-1 rounded bg-bg border border-border" onChange={e => { setMaxCyclesTouched(true); setMaxCycles(Number(e.target.value)) }} />{subCount > 0 && !maxCyclesTouched && <span className="text-xs text-muted">{i18nT('apps.autoResearch.researchLabPage.suggested_from')} {subCount} {i18nT('apps.autoResearch.researchLabPage.sub_questions_2')}</span>}</div>
-        <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.idle_between_cycles')}</span><select aria-label={i18nT('apps.autoResearch.researchLabPage.idle_between_cycles_2')} value={idleSecs} onChange={e => setIdleSecs(Number(e.target.value))} className="text-sm p-1 rounded bg-bg border border-border"><option value={30}>{i18nT('apps.autoResearch.researchLabPage.30s')}</option><option value={60}>{i18nT('apps.autoResearch.researchLabPage.60s')}</option><option value={120}>{i18nT('apps.autoResearch.researchLabPage.120s')}</option></select></div>
+        <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.max_cycles')}</span><input type="number" aria-label={i18nT('apps.autoResearch.researchLabPage.max_cycles_2')} min={5} max={100} value={maxCycles} className="w-20 text-sm px-3 py-2 rounded-md bg-bg-elevated border border-border text-text outline-none focus-ring" onChange={e => { setMaxCyclesTouched(true); setMaxCycles(Number(e.target.value)) }} />{subCount > 0 && !maxCyclesTouched && <span className="text-xs text-muted">{i18nT('apps.autoResearch.researchLabPage.suggested_from')} {subCount} {i18nT('apps.autoResearch.researchLabPage.sub_questions_2')}</span>}</div>
+        {/* Values are seconds; SimpleSelect is string-only, so they round-trip through
+            String/Number. `options` and `optionLabels` are positional — keep them in step. */}
+        <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.idle_between_cycles')}</span><SimpleSelect aria-label={i18nT('apps.autoResearch.researchLabPage.idle_between_cycles_2')} options={['30', '60', '120']} optionLabels={[i18nT('apps.autoResearch.researchLabPage.30s'), i18nT('apps.autoResearch.researchLabPage.60s'), i18nT('apps.autoResearch.researchLabPage.120s')]} value={String(idleSecs)} onChange={v => setIdleSecs(Number(v))} /></div>
         <div>
           <span className="text-sm font-medium block">{i18nT('apps.autoResearch.researchLabPage.definition_of_done_optional')}</span>
           <textarea aria-label={i18nT('apps.autoResearch.researchLabPage.definition_of_done_optional')} className="w-full text-sm p-1.5 rounded bg-bg border border-border mt-1 resize-y" rows={2} placeholder={i18nT('apps.autoResearch.researchLabPage.e_g_ai_code_review_finds_no_blocking_issues_and')} value={successCriteria} onChange={e => setSuccessCriteria(e.target.value)} />
@@ -285,7 +290,7 @@ function SetupWizard({ onDone, onCancel }: { onDone: () => void; onCancel: () =>
           <input id="auto-approve" type="checkbox" aria-label={i18nT('apps.autoResearch.researchLabPage.run_unattended_skip_clarification_questions')} checked={autoApprove} onChange={e => setAutoApprove(e.target.checked)} />
           {i18nT('apps.autoResearch.researchLabPage.run_unattended_skip_clarification_questions')}
         </label>
-        <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.parallel_workers')}</span><input type="number" aria-label={i18nT('apps.autoResearch.researchLabPage.parallel_workers_2')} min={1} max={5} value={parallelWorkers} className="w-16 text-sm p-1 rounded bg-bg border border-border" onChange={e => setParallelWorkers(Math.min(5, Math.max(1, Number(e.target.value))))} /><span className="text-xs text-muted">{parallelWorkers > 1 ? `${parallelWorkers} sub-questions investigated in parallel each cycle` : 'sequential (default)'}</span></div>
+        <div className="flex items-center gap-2"><span className="text-sm">{i18nT('apps.autoResearch.researchLabPage.parallel_workers')}</span><input type="number" aria-label={i18nT('apps.autoResearch.researchLabPage.parallel_workers_2')} min={1} max={5} value={parallelWorkers} className="w-16 text-sm px-3 py-2 rounded-md bg-bg-elevated border border-border text-text outline-none focus-ring" onChange={e => setParallelWorkers(Math.min(5, Math.max(1, Number(e.target.value))))} /><span className="text-xs text-muted">{parallelWorkers > 1 ? `${parallelWorkers} sub-questions investigated in parallel each cycle` : 'sequential (default)'}</span></div>
       </div>}
 
       {step === 2 && <div className="space-y-3">
@@ -422,7 +427,7 @@ function ForkFlow({ parentId, onCancel, onDone }: { parentId: string; onCancel: 
         <div className="text-xs text-muted">{i18nT('apps.autoResearch.researchLabPage.answer_challenges_to_refine_or_just_pick_sub_que')}</div>
         <GrillTree tree={tree} dispatch={dispatchTree} onExpand={onExpand} />
         <div className="mt-3">
-          {manualSubs.map((sq, i) => <div key={i} className="flex items-start gap-2 mt-1"><GrowTextarea ariaLabel={`Sub-question ${i + 1}`} className="flex-1 text-sm p-1.5 rounded bg-bg border border-border" value={sq} onChange={v => { const n = [...manualSubs]; n[i] = v; setManualSubs(n) }} /><button className="text-xs text-danger mt-1.5" onClick={() => setManualSubs(manualSubs.filter((_, j) => j !== i))} aria-label={i18nT('apps.autoResearch.researchLabPage.remove_sub_question')}><X size={12} /></button></div>)}
+          {manualSubs.map((sq, i) => <div key={i} className="flex items-start gap-2 mt-1"><GrowTextarea ariaLabel={i18nT('apps.autoResearch.researchLabPage.sub_question', { n: i + 1 })} className="flex-1 text-sm p-1.5 rounded bg-bg border border-border" value={sq} onChange={v => { const n = [...manualSubs]; n[i] = v; setManualSubs(n) }} /><button className="text-xs text-danger mt-1.5" onClick={() => setManualSubs(manualSubs.filter((_, j) => j !== i))} aria-label={i18nT('apps.autoResearch.researchLabPage.remove_sub_question')}><X size={12} /></button></div>)}
           <GrowTextarea ariaLabel={i18nT('apps.autoResearch.researchLabPage.add_your_own_sub_question_or_guidance')} className="w-full text-sm p-1.5 rounded bg-bg border border-border mt-1" placeholder={i18nT('apps.autoResearch.researchLabPage.add_your_own_sub_question_or_guidance_enter_shif')} value={newSub} onChange={setNewSub} onSubmit={() => { if (newSub.trim()) { setManualSubs([...manualSubs, newSub.trim()]); setNewSub('') } }} />
         </div>
         <div className="flex justify-between mt-4">
@@ -591,10 +596,15 @@ function CampaignDetail({ id, onBack, onFork, onOpen }: { id: string; onBack: ()
   const [answerText, setAnswerText] = useState('')
   const [questionExpanded, setQuestionExpanded] = useState(false)
   const [showReport, setShowReport] = useState(false)
+  // In-app dialog, NOT window.confirm: the native confirm is synchronous and
+  // blocks the renderer's event loop, so a Quit event arriving while it is open
+  // queues behind it and fires the instant it dismisses — tearing the app down
+  // before the DELETE request below is ever sent.
+  const [confirmDelete, setConfirmDelete] = useState(false)
   const { data: reportData } = useQuery<{ report: string }>({ queryKey: ['research-report', id], queryFn: () => api.researchReport(id), enabled: showReport })
   const actionMut = useMutation({ mutationFn: (action: string) => api.researchAction(id, action), onSuccess: () => qc.invalidateQueries({ queryKey: ['research-campaign', id] }) })
   const nudgeMut = useMutation({ mutationFn: (text: string) => api.researchNudge(id, text), onSuccess: () => { setShowNudge(false); setNudgeText(''); setAnswerText(''); qc.invalidateQueries({ queryKey: ['research-campaign', id] }) } })
-  const deleteMut = useMutation({ mutationFn: () => api.researchDelete(id), onSuccess: () => { qc.invalidateQueries({ queryKey: ['research-campaigns'] }); onBack() } })
+  const deleteMut = useMutation({ mutationFn: () => api.researchDelete(id), onSuccess: () => { setConfirmDelete(false); qc.invalidateQueries({ queryKey: ['research-campaigns'] }); onBack() } })
 
   if (!campaign) return <div className="text-sm text-muted">{i18nT('apps.autoResearch.researchLabPage.loading')}</div>
   const findings = campaign.findings || []
@@ -606,8 +616,24 @@ function CampaignDetail({ id, onBack, onFork, onOpen }: { id: string; onBack: ()
       <button className="text-sm text-accent" onClick={onBack}>{i18nT('apps.autoResearch.researchLabPage.back')}</button>
       <h2 className="text-lg font-semibold">{campaign.name}</h2>
       <span className="text-xs px-2 py-0.5 rounded bg-bg-elevated">{campaign.status}</span>
-      <button className="text-xs px-2 py-1 rounded bg-bg-elevated text-danger ml-auto" onClick={() => { if (window.confirm(i18nT('apps.autoResearch.researchLabPage.delete_this_campaign_and_its_report_this_cannot'))) deleteMut.mutate() }}><Trash2 size={12} className="inline" /> {i18nT('apps.autoResearch.researchLabPage.delete')}</button>
+      <button className="text-xs px-2 py-1 rounded bg-bg-elevated text-danger ml-auto" onClick={() => { deleteMut.reset(); setConfirmDelete(true) }}><Trash2 size={12} className="inline" /> {i18nT('apps.autoResearch.researchLabPage.delete')}</button>
     </div>
+    <Modal
+      open={confirmDelete}
+      onClose={() => { if (!deleteMut.isPending) setConfirmDelete(false) }}
+      title={i18nT('apps.autoResearch.researchLabPage.delete_campaign')}
+      maxWidth={400}
+      footer={<>
+        <Btn disabled={deleteMut.isPending} onClick={() => setConfirmDelete(false)}>{i18nT('apps.autoResearch.researchLabPage.cancel')}</Btn>
+        {/* Close only on success (see deleteMut.onSuccess): dismissing before the
+            request resolves would make a failed DELETE silent — the campaign
+            just looks un-deleted with no message and no retry cue. */}
+        <Btn danger disabled={deleteMut.isPending} onClick={() => deleteMut.mutate()}>{deleteMut.isPending ? i18nT('apps.autoResearch.researchLabPage.deleting') : i18nT('apps.autoResearch.researchLabPage.delete_campaign_button')}</Btn>
+      </>}
+    >
+      <p className="text-sm text-muted m-0">{i18nT('apps.autoResearch.researchLabPage.delete_this_campaign_and_its_report_this_cannot')}</p>
+      {deleteMut.isError && <p className="text-danger text-[12px] mt-2 m-0">{deleteMut.error instanceof Error && deleteMut.error.message ? deleteMut.error.message : i18nT('apps.autoResearch.researchLabPage.delete_failed')}</p>}
+    </Modal>
     {campaign.question && (() => {
       const isLong = campaign.question.length > 280
       return <div className="mb-4">

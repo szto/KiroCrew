@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import stat
@@ -23,6 +24,30 @@ from kiro_crew.pod.config import (
     DEFAULT_UNIT_PREFIX,
     PodConfig,
 )
+
+# Stand-in for a version-manager node bin dir (mise/nvm/fnm/volta/asdf install
+# under $HOME). Provisioning resolves ``npm`` to an absolute path there.
+NODE_BIN = "/fake/node/bin"
+
+
+def _npm(*args: str) -> list[str]:
+    """The argv provisioning is expected to spawn for an npm step."""
+    return [f"{NODE_BIN}/npm", *args]
+
+
+@pytest.fixture(autouse=True)
+def _fake_node_toolchain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin node-toolchain resolution so provisioning tests are host-independent.
+
+    ``provision`` now resolves ``npm`` to an absolute path and hands the child a
+    PATH carrying the node bin dir (npm run-scripts are ``#!/usr/bin/env node``).
+    Without this fixture the tests below would pass or fail according to whether
+    the host running them happens to have a version manager installed.
+    """
+    monkeypatch.setattr(prov, "find_node_tool", lambda name: f"{NODE_BIN}/{name}")
+    monkeypatch.setattr(
+        prov, "node_augmented_path", lambda base="": f"{NODE_BIN}{os.pathsep}{base}"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -350,7 +375,7 @@ class TestProvisionBuildPaths:
         co.mkdir()
         monkeypatch.setattr(prov, "_find_python", lambda version="3.12": "/usr/bin/python3.12")
 
-        def fake_run(cmd: list[str], cwd: Path) -> int:
+        def fake_run(cmd: list[str], cwd: Path, env: dict | None = None) -> int:
             if cmd[1:3] == ["-m", "venv"]:
                 b = prov.venv_bin(co)
                 b.parent.mkdir(parents=True, exist_ok=True)
@@ -371,7 +396,7 @@ class TestProvisionBuildPaths:
         co = tmp_path / "wt"
         (co / "website").mkdir(parents=True)
 
-        def fake_run(cmd: list[str], cwd: Path) -> int:
+        def fake_run(cmd: list[str], cwd: Path, env: dict | None = None) -> int:
             (co / "website" / "dist").mkdir(parents=True, exist_ok=True)
             (co / "website" / "dist" / "index.html").write_text("<html>")
             return 0
@@ -390,7 +415,7 @@ class TestProvisionBuildPaths:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         co = _ready_worktree(tmp_path, "wt", venv=False, dist=True)
-        monkeypatch.setattr(prov, "_run", lambda cmd, cwd: 99)  # must not be called
+        monkeypatch.setattr(prov, "_run", lambda cmd, cwd, env=None: 99)  # must not be called
         assert prov.build_dist(co) is True
 
     def test_provision_full_chain(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -414,7 +439,7 @@ class TestProvisionDependencyInstall:
         """Return a fake _run that records calls and materializes the venv bin on
         `python -m venv`, so has_venv() passes. Optionally fail `--group` cmds."""
 
-        def fake_run(cmd: list[str], cwd: Path) -> int:
+        def fake_run(cmd: list[str], cwd: Path, env: dict | None = None) -> int:
             calls.append(cmd)
             if cmd[1:3] == ["-m", "venv"]:
                 # Materialize the venv entry point at the layout THIS platform
@@ -437,11 +462,11 @@ class TestProvisionDependencyInstall:
         website = tmp_path / "wt" / "website"
         website.mkdir(parents=True)
         calls: list[list[str]] = []
-        monkeypatch.setattr(prov, "_run", lambda cmd, cwd: calls.append(cmd) or 0)
+        monkeypatch.setattr(prov, "_run", lambda cmd, cwd, env=None: calls.append(cmd) or 0)
         assert prov.ensure_node_modules(website) is True
-        assert ["npm", "ci"] in calls
+        assert _npm("ci") in calls
         # ci succeeded → no fallback (non-mutating install never runs)
-        assert ["npm", "install", "--no-package-lock"] not in calls
+        assert _npm("install", "--no-package-lock") not in calls
 
     def test_node_modules_skipped_when_present(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -450,7 +475,7 @@ class TestProvisionDependencyInstall:
         (website / "node_modules" / ".bin").mkdir(parents=True)
         (website / "node_modules" / ".bin" / "tsc").write_text("#!/bin/sh\n")
 
-        def boom(cmd: list[str], cwd: Path) -> int:
+        def boom(cmd: list[str], cwd: Path, env: dict | None = None) -> int:
             raise AssertionError(f"must not run npm when node_modules present: {cmd}")
 
         monkeypatch.setattr(prov, "_run", boom)
@@ -463,17 +488,17 @@ class TestProvisionDependencyInstall:
         website.mkdir(parents=True)
         calls: list[list[str]] = []
 
-        def fake_run(cmd: list[str], cwd: Path) -> int:
+        def fake_run(cmd: list[str], cwd: Path, env: dict | None = None) -> int:
             calls.append(cmd)
-            return 1 if cmd == ["npm", "ci"] else 0  # ci fails, install succeeds
+            return 1 if cmd == _npm("ci") else 0  # ci fails, install succeeds
 
         monkeypatch.setattr(prov, "_run", fake_run)
         assert prov.ensure_node_modules(website) is True
         # Fallback must be NON-MUTATING: --no-package-lock so the tracked
         # website/package-lock.json is never rewritten (would dirty the worktree).
-        assert ["npm", "ci"] in calls
-        assert ["npm", "install", "--no-package-lock"] in calls
-        assert ["npm", "install"] not in calls  # plain (mutating) install never runs
+        assert _npm("ci") in calls
+        assert _npm("install", "--no-package-lock") in calls
+        assert _npm("install") not in calls  # plain (mutating) install never runs
 
     def test_build_dist_installs_node_modules_before_build(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -483,16 +508,16 @@ class TestProvisionDependencyInstall:
         website.mkdir(parents=True)
         calls: list[list[str]] = []
 
-        def fake_run(cmd: list[str], cwd: Path) -> int:
+        def fake_run(cmd: list[str], cwd: Path, env: dict | None = None) -> int:
             calls.append(cmd)
-            if cmd == ["npm", "run", "build"]:
+            if cmd == _npm("run", "build"):
                 (website / "dist").mkdir(parents=True, exist_ok=True)
                 (website / "dist" / "index.html").write_text("<html>")
             return 0
 
         monkeypatch.setattr(prov, "_run", fake_run)
         assert prov.build_dist(co) is True
-        assert calls.index(["npm", "ci"]) < calls.index(["npm", "run", "build"])
+        assert calls.index(_npm("ci")) < calls.index(_npm("run", "build"))
 
     # ---- #230: venv dev extras ----
 
@@ -628,19 +653,19 @@ class TestRuntimeHelpers:
             def __exit__(self, *a: object) -> bool:
                 return False
 
-        monkeypatch.setattr(rt.urllib.request, "urlopen", lambda *a, **k: _Resp())
+        monkeypatch.setattr(rt, "loopback_urlopen", lambda *a, **k: _Resp())
         assert rt.health(7999) == 200
 
         def _raise_http(*a: object, **k: object) -> None:
             raise urllib.error.HTTPError("u", 403, "f", {}, None)  # type: ignore[arg-type]
 
-        monkeypatch.setattr(rt.urllib.request, "urlopen", _raise_http)
+        monkeypatch.setattr(rt, "loopback_urlopen", _raise_http)
         assert rt.health(7999) == 403
 
         def _raise_url(*a: object, **k: object) -> None:
             raise urllib.error.URLError("down")
 
-        monkeypatch.setattr(rt.urllib.request, "urlopen", _raise_url)
+        monkeypatch.setattr(rt, "loopback_urlopen", _raise_url)
         assert rt.health(7999) == 0
 
     def test_mint_token_reads_secret_and_posts(
@@ -662,7 +687,7 @@ class TestRuntimeHelpers:
             def read(self) -> bytes:
                 return b'{"token":"tok-xyz"}'
 
-        monkeypatch.setattr(rt.urllib.request, "urlopen", lambda *a, **k: _Resp())
+        monkeypatch.setattr(rt, "loopback_urlopen", lambda *a, **k: _Resp())
         assert rt.mint_token(c, "demo", "1h") == "tok-xyz"
 
     def test_mint_token_no_secret_raises(
@@ -924,7 +949,7 @@ class TestReviewRound1Fixes:
             captured["url"] = req.full_url  # type: ignore[attr-defined]
             return _Resp()
 
-        monkeypatch.setattr(rt.urllib.request, "urlopen", _urlopen)
+        monkeypatch.setattr(rt, "loopback_urlopen", _urlopen)
         rt.mint_token(c, "demo", "1 h")
         assert "ttl=1%20h" in captured["url"]
 
@@ -1237,3 +1262,304 @@ class TestSessionBus:
             for n in ast.walk(chokepoint)
             if isinstance(n, ast.Call)
         ), "_run no longer passes env=_systemctl_env()"
+
+
+class TestBootTimeSettings:
+    """``pod up --approval`` / ``--crons`` are persisted per pod and applied at boot.
+
+    Neither can ride the unit file: both backends re-enter the pod as
+    ``kirocrew pod _run <name>`` with no flags. On systemd one template unit is
+    shared by every instance, so it cannot carry per-pod flags; launchd writes a
+    per-pod plist but still execs that same flagless argv. So they travel through
+    the per-pod env file, exactly as ``SEED`` does.
+    """
+
+    def _booted_argv(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
+    ) -> list[str]:
+        """Boot a ready pod with *env* merged into its env file; return the exec argv."""
+        monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(root / "env"))
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(root / "pods"))
+        c = PodConfig.load()
+        rt.pin_checkout(c, "x", _ready_worktree(root, "x"))
+        if env:
+            rt.write_env_file(c, "x", env)
+        seen: list[list[str]] = []
+        monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
+        monkeypatch.setattr(os, "execve", lambda path, argv, e: seen.append(argv))
+        rt.boot(c, "x")
+        assert len(seen) == 1, "boot did not exec exactly once"
+        return seen[0][1:]  # drop argv[0], the venv binary path
+
+    def test_boot_forwards_the_recorded_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        argv = self._booted_argv(tmp_path, monkeypatch, {"APPROVAL": "reads"})
+        assert argv == ["gateway", "--no-crons", "--approval", "reads"]
+
+    def test_boot_argv_unchanged_when_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The no-regression pin: a pod created before this flag existed, or
+        # created without it, must boot byte-identically to before.
+        argv = self._booted_argv(tmp_path, monkeypatch, {})
+        assert argv == ["gateway", "--no-crons"]
+
+    def test_boot_forces_interactive_on_an_unknown_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        # The env file is hand-editable, so boot re-validates. It must NOT merely
+        # drop the value: omitting --approval leaves approval_mode unset, and the
+        # gateway then falls through to cfg.agent.approval_mode, which
+        # config/loader.py defaults to "auto" -- auto-approve every tool.
+        # Dropping would be the LEAST restrictive outcome, so boot pins
+        # interactive explicitly.
+        argv = self._booted_argv(tmp_path, monkeypatch, {"APPROVAL": "--not-a-mode"})
+        assert argv == ["gateway", "--no-crons", "--approval", "interactive"]
+        assert "ignoring unknown APPROVAL" in capsys.readouterr().out
+
+    def test_every_declared_mode_survives_boot(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Behavioural pin only: each mode in the enforcement tuple round-trips
+        # through the env file into argv. This does NOT guard parser drift --
+        # a mode present in cli.py but absent from APPROVAL_MODES is never
+        # iterated here. test_cli_approval_choices_match_the_enforcement_tuple
+        # covers that.
+        for mode in rt.APPROVAL_MODES:
+            argv = self._booted_argv(tmp_path / mode, monkeypatch, {"APPROVAL": mode})
+            assert argv[-2:] == ["--approval", mode]
+
+    @staticmethod
+    def _top_level_cli_ast() -> ast.Module:
+        # rt.__file__ is pod/runtime.py, so parent.parent is the package root.
+        # encoding is explicit: cli.py contains non-ASCII (emoji in guard
+        # messages), and read_text() defaults to the platform locale codec,
+        # which is cp1252 on Windows CI and raises UnicodeDecodeError there.
+        src = (Path(rt.__file__).parent.parent / "cli.py").read_text(encoding="utf-8")
+        return ast.parse(src)
+
+    def test_cli_approval_choices_match_the_enforcement_tuple(self) -> None:
+        # cli.py repeats the choices literal instead of importing pod.runtime
+        # (the top-level parser must not import pod modules at startup), so the
+        # duplication is real. Read the literal argparse actually registers, so a
+        # mode added on one side only fails HERE rather than being accepted by
+        # argparse and then dropped at boot. Iterating APPROVAL_MODES alone
+        # cannot catch that, because the missing mode is not in it.
+        choices: list[list[str]] = []
+        for node in ast.walk(self._top_level_cli_ast()):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not (isinstance(fn, ast.Attribute) and fn.attr == "add_argument"):
+                continue
+            if not (isinstance(fn.value, ast.Name) and fn.value.id == "pod_up"):
+                continue
+            if not any(isinstance(a, ast.Constant) and a.value == "--approval" for a in node.args):
+                continue
+            for kw in node.keywords:
+                if kw.arg == "choices" and isinstance(kw.value, ast.List):
+                    choices.append([e.value for e in kw.value.elts if isinstance(e, ast.Constant)])
+        assert choices == [list(rt.APPROVAL_MODES)], (
+            "pod up --approval choices must match runtime.APPROVAL_MODES exactly; parser "
+            f"declares {choices}, enforcement tuple is {list(rt.APPROVAL_MODES)}"
+        )
+
+    def test_every_pod_subparser_name_is_assigned(self) -> None:
+        # A `--crons` edit deleted `pod_down = pod_sub.add_parser(...)`, leaving
+        # pod_down undefined: a NameError at parser build. That is invisible to
+        # py_compile AND to every test in this file, which imports pod.cli and
+        # never the top-level parser. Pin the structure so it cannot recur.
+        tree = self._top_level_cli_ast()
+        assigned = {
+            t.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for t in node.targets
+            if isinstance(t, ast.Name) and t.id.startswith("pod_")
+        }
+        used = {
+            n.value.id
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute)
+            and isinstance(n.value, ast.Name)
+            and n.value.id.startswith("pod_")
+        }
+        assert used <= assigned, f"pod_* names used but never assigned: {sorted(used - assigned)}"
+
+    def _prep_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, active: bool
+    ) -> PodConfig:
+        monkeypatch.setenv("KIROCREW_POD_WORKTREES_ROOT", str(tmp_path / "wts"))
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "env"))
+        monkeypatch.setattr(rt, "_git_worktrees", lambda ref: {})
+        _ready_worktree(tmp_path / "wts", "demo")
+        monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: active)
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: 403)
+        monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+        return PodConfig.load()
+
+    def test_up_records_the_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo", json=False, seed="", ttl="2h", provision=False, approval="yolo"
+            ),
+        )
+        assert rt.read_env_file(c, "demo").get("APPROVAL") == "yolo"
+
+    def test_up_on_a_running_pod_notes_the_restart(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        c = self._prep_up(tmp_path, monkeypatch, active=True)
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo", json=False, seed="", ttl="2h", provision=False, approval="reads"
+            ),
+        )
+        err = capsys.readouterr().err
+        assert "already running" in err and "pod down demo" in err
+        # Recorded either way, so the next boot picks it up.
+        assert rt.read_env_file(c, "demo").get("APPROVAL") == "reads"
+
+    def test_up_tolerates_a_namespace_without_the_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ``provision`` is read the same defensive way, and hand-built Namespaces
+        # (here and in TestUpVerb) must not have to carry every optional key.
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        pod_cli._up(
+            c, argparse.Namespace(name="demo", json=False, seed="", ttl="2h", provision=False)
+        )
+        assert "APPROVAL" not in rt.read_env_file(c, "demo")
+
+    def test_up_audits_the_mode(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # `yolo` auto-approves every tool, so the SEL trail must name the mode
+        # rather than recording only that a pod came up.
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        seen: list[tuple] = []
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: seen.append(a))
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo", json=False, seed="", ttl="2h", provision=False, approval="yolo"
+            ),
+        )
+        allowed = [a for a in seen if a[:2] == ("pod.up", "allowed")]
+        assert allowed, "pod.up allowed was never audited"
+        assert "approval=yolo" in allowed[0][2]
+
+    # --- crons -------------------------------------------------------------
+
+    def test_boot_enables_the_scheduler(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # --no-crons is dropped, which is how the gateway turns the scheduler on.
+        argv = self._booted_argv(tmp_path, monkeypatch, {"CRONS": "1"})
+        assert argv == ["gateway"]
+
+    def test_boot_accepts_alternative_truthy_spellings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The env file is hand-editable, so the obvious spellings are honoured.
+        for i, raw in enumerate(("true", "YES", " on ")):
+            argv = self._booted_argv(tmp_path / f"t{i}", monkeypatch, {"CRONS": raw})
+            assert argv == ["gateway"], raw
+
+    def test_boot_ignores_an_unrecognised_crons_value(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        # Falls back to the safer setting (scheduler off, the pre-existing
+        # behavior) rather than guessing, and the pod still boots.
+        argv = self._booted_argv(tmp_path, monkeypatch, {"CRONS": "maybe"})
+        assert argv == ["gateway", "--no-crons"]
+        assert "ignoring unrecognised CRONS" in capsys.readouterr().out
+
+    def test_boot_combines_crons_and_approval(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        argv = self._booted_argv(
+            tmp_path, monkeypatch, {"CRONS": "1", "APPROVAL": "reads"}
+        )
+        assert argv == ["gateway", "--approval", "reads"]
+
+    def test_up_records_crons(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo", json=False, seed="", ttl="2h", provision=False, crons=True
+            ),
+        )
+        assert rt.read_env_file(c, "demo").get("CRONS") == "1"
+
+    def test_up_audits_crons(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A pod with the scheduler on runs work unattended; the trail must say so.
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        seen: list[tuple] = []
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: seen.append(a))
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo", json=False, seed="", ttl="2h", provision=False, crons=True
+            ),
+        )
+        allowed = [a for a in seen if a[:2] == ("pod.up", "allowed")]
+        assert allowed, "pod.up allowed was never audited"
+        assert "crons=on" in allowed[0][2]
+
+    def test_up_notes_every_deferred_flag_on_a_running_pod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        # One note covers both settings; a per-flag note would be two messages
+        # and the repeated `pod down` instruction would read as two restarts.
+        c = self._prep_up(tmp_path, monkeypatch, active=True)
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo",
+                json=False,
+                seed="",
+                ttl="2h",
+                provision=False,
+                approval="yolo",
+                crons=True,
+            ),
+        )
+        err = capsys.readouterr().err
+        assert err.count("pod: note:") == 1
+        assert "--approval yolo --crons" in err
+
+    def test_up_merges_all_boot_settings_into_one_env_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # SEED / APPROVAL / CRONS share one write; the pinned CHECKOUT survives it.
+        c = self._prep_up(tmp_path, monkeypatch, active=False)
+        pod_cli._up(
+            c,
+            argparse.Namespace(
+                name="demo",
+                json=False,
+                seed="/tmp/fixture",
+                ttl="2h",
+                provision=False,
+                approval="reads",
+                crons=True,
+            ),
+        )
+        env = rt.read_env_file(c, "demo")
+        assert env.get("SEED") == "/tmp/fixture"
+        assert env.get("APPROVAL") == "reads"
+        assert env.get("CRONS") == "1"
+        # Compare path components, not a "/"-joined suffix: str(Path) uses "\"
+        # on Windows, so endswith("wts/demo") fails there.
+        checkout = Path(env.get("CHECKOUT", ""))
+        assert (checkout.parent.name, checkout.name) == ("wts", "demo")

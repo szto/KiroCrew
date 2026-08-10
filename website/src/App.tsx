@@ -11,6 +11,7 @@ import { getBuiltinSurfaces, getBuiltinSurface, selectSurfaceBadgeCount, selectS
 import { createSlot, appendMessage, setSlotRunning, switchSlot } from './store/chatSlice'
 import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/artifactPopout'
 import { applyNavIntentInMain } from './utils/navIntent'
+import { installSoftNavigate } from './utils/errorReport'
 import { fetchNotifications, ackNotification } from './store/notificationsSlice'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useDashboardHealthProbe } from './hooks/useDashboardHealthProbe'
@@ -26,7 +27,7 @@ import { ZoomProvider } from './hooks/ZoomProvider'
 import { api, isAuthBannerShown } from './api/client'
 import { safeSetItem } from './utils/safeStorage'
 import { gcOrphanedStorage } from './utils/storageGc'
-import { Rocket, Menu, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, LayoutGrid, Lightbulb, ExternalLink, SquareTerminal, Bot } from 'lucide-react'
+import { Rocket, Menu, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, LayoutGrid, ExternalLink, SquareTerminal, Bot } from 'lucide-react'
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
@@ -36,13 +37,14 @@ import { OnboardingShellHost } from './components/OnboardingChapterShell'
 import { PREVIEW_FOCUS_EVENT } from './components/WebPreviewPanel'
 import { motion, AnimatePresence } from 'framer-motion'
 import { usePersistedBool } from './hooks/usePersistedBool'
-import { isMacElectron } from './lib/electron'
+import { isMacElectron, isWinElectron } from './lib/electron'
 import { DndContext, closestCenter, MouseSensor, TouchSensor, useSensor, useSensors, DragOverlay, type DragStartEvent, type DragEndEvent } from '@dnd-kit/core'
 import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import ChatPage from './pages/ChatPage'
 import PopoutFrame from './pages/PopoutFrame'
 import ArtifactPopoutFrame from './pages/ArtifactPopoutFrame'
+import TerminalPopoutFrame from './pages/TerminalPopoutFrame'
 
 import ErrorBoundary from './components/ErrorBoundary'
 import AppIcon from './components/AppIcon'
@@ -53,6 +55,7 @@ import NotificationDetailPanel from './components/notifications/NotificationDeta
 import NotificationFeed from './components/notifications/NotificationFeed'
 import LogsPage from './pages/LogsPage'
 import HooksPage from './pages/HooksPage'
+import WebhooksPage from './pages/WebhooksPage'
 import CapabilitiesPage from './pages/CapabilitiesPage'
 import KnowledgePage from './pages/KnowledgePage'
 import ArtifactsPage from './pages/ArtifactsPage'
@@ -72,8 +75,9 @@ import { useUpdateSubscription } from './hooks/useUpdateSubscription'
 import UpdateModal from './components/UpdateModal'
 
 import ComputerUseLiveView from './components/ComputerUseLiveView'
-import BottomTerminalPanel from './components/BottomTerminalPanel'
-import { toggleBottomTerminal } from './hooks/useBottomTerminal'
+import BottomTerminalPanel, { TerminalDetachedBar } from './components/BottomTerminalPanel'
+import { toggleBottomTerminal, useBottomTerminalOpen } from './hooks/useBottomTerminal'
+import { useTerminalPoppedOut, focusPopout as focusTerminalPopout } from './utils/terminalPopout'
 import { setTerminalEnabledFlag } from './utils/terminalRegistry'
 import AppsPage from './pages/AppsPage'
 import AppPage from './pages/AppPage'
@@ -85,7 +89,7 @@ import { getBuiltinIcon } from './apps/builtinIcons'
 import { getThemeBranding } from './themeBranding'
 import { getTopBarWidgets } from './apps/topBarWidgets'
 import { getCapsuleSegments } from './apps/capsuleSegments'
-import { FEATURE_REQUEST_PROMPT } from './prompts/featureRequest'
+import { FEATURE_REQUEST_PROMPT_WITH_SKILL, FEATURE_REQUEST_PROMPT_FALLBACK } from './prompts/featureRequest'
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
 import { useInstanceShortcuts } from './hooks/useInstanceShortcuts'
 import { useCommandPalette } from './hooks/useCommandPalette'
@@ -94,8 +98,11 @@ import { useAgents } from './hooks/useAgents'
 import ShortcutsModal from './components/ShortcutsModal'
 import CommandPalette from './components/CommandPalette'
 import Modal from './components/Modal'
+import ReportProblemModal from './components/ReportProblemModal'
+import FeedbackPill from './components/FeedbackPill'
 
 import { i18nT } from './i18n/t'
+import { appNavTarget } from './appNav'
 import { fmtCompact, fmtNumber, fmtPercent } from './i18n/format'
 type LogSubscribeFn = (cb: ((data: { level: string; msg: string }) => void) | null) => void
 
@@ -423,8 +430,12 @@ function useNavTip<T extends HTMLElement>(enabled: boolean) {
   return { tip, tipOn, rowRef, showTip, hideTip, dismissTip }
 }
 
-function NavItem({ path, label, icon, active, collapsed, badge, onClickOverride, onClick, navId }: {
+function NavItem({ path, label, icon, active, collapsed, badge, onClickOverride, onClick, navId, pressed }: {
   path: string; label: string; icon: React.ReactNode; active: boolean; collapsed: boolean; badge?: React.ReactNode; onClickOverride?: () => void; onClick?: () => void; navId?: string
+  /** Set on rows that TOGGLE a surface rather than navigate (e.g. the docked
+   *  terminal). `active` only paints the row; without aria-pressed a screen
+   *  reader announces an identical button whether the panel is open or shut. */
+  pressed?: boolean
 }) {
   const navigate = useNavigate()
   const iconEl = <span className={`app-icon-nav w-4 h-4 flex items-center justify-center shrink-0 transition-opacity ${active ? 'opacity-100 text-accent is-lit' : 'opacity-70'}`}>{icon}</span>
@@ -453,10 +464,26 @@ function NavItem({ path, label, icon, active, collapsed, badge, onClickOverride,
       onFocus={showTip}
       onBlur={hideTip}
       aria-label={collapsed ? label : undefined}
+      aria-pressed={pressed}
     >
       {badge}
       {iconEl}
-      {!collapsed && <span className="whitespace-nowrap overflow-hidden">{label}</span>}
+      {/* `aria-label` carries the FULL label: this span is `whitespace-nowrap overflow-hidden`, so
+          a translation longer than the rail is silently cut off with no way to read it. Surfaced by
+          the render gate under the en-XA pseudolocale at 2.2x once a new app entry narrowed the
+          row (`layout/clipped-without-title`), which accepts `title` OR `aria-label`. Deliberately
+          `aria-label`, NOT `title`: a page-wide `getByTitle('Settings'/'Board'/…)` in another app's
+          Playwright specs (ops-mission-control) matches on `title`, and a sidebar nav item titled
+          the same as one of those segment names would be clicked instead of the segment. `label`
+          is already the resolved, translated string. */}
+      {!collapsed && (
+        <span
+          aria-label={typeof label === 'string' ? label : undefined}
+          className="whitespace-nowrap overflow-hidden"
+        >
+          {label}
+        </span>
+      )}
       {collapsed && tip && createPortal(
         <div
           className={`fixed flex items-center gap-2.5 pl-3 pr-3 rounded-md bg-card border border-border shadow-lg text-text text-sm font-medium z-[9999] pointer-events-none whitespace-nowrap transition-opacity duration-150 ${tipOn ? 'opacity-100' : 'opacity-0'}`}
@@ -539,7 +566,14 @@ function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
       onBlur={hideTip}
     >
       <span className="w-4 h-4 flex items-center justify-center shrink-0 opacity-70"><Icon size={16} /></span>
-      {!collapsed && <span className="whitespace-nowrap overflow-hidden">{labelText}</span>}
+      {/* Same reason as the nav-item label above: clipped by `whitespace-nowrap
+          overflow-hidden`, so the full string lives on `aria-label` (not `title` — see the
+          getByTitle collision note on the NavItem span above). */}
+      {!collapsed && (
+        <span aria-label={labelText} className="whitespace-nowrap overflow-hidden">
+          {labelText}
+        </span>
+      )}
       {collapsed && tip && createPortal(
         <div
           className={`fixed flex items-center gap-2.5 pl-3 pr-3 rounded-md bg-card border border-border shadow-lg text-text text-sm font-medium z-[9999] pointer-events-none whitespace-nowrap transition-opacity duration-150 ${tipOn ? 'opacity-100' : 'opacity-0'}`}
@@ -849,6 +883,14 @@ export default function App() {
   // so there is no hidden-until-fetch-resolves flash.
   const terminalEnabled = terminalConfig?.enabled !== false
   useEffect(() => { setTerminalEnabledFlag(terminalEnabled) }, [terminalEnabled])
+  // True while the terminal panel lives in its own popped-out window: the
+  // docked panel is suppressed here and the sidebar toggle focuses that
+  // window instead of opening an (empty-handed) panel.
+  const terminalPoppedOut = useTerminalPoppedOut()
+  // Only the `open` flag, not the whole store — the panel's height changes on
+  // every mousemove during a grip-drag, and a primitive snapshot lets
+  // useSyncExternalStore's Object.is check skip those re-renders of App.
+  const bottomTerminalOpen = useBottomTerminalOpen()
   const navigate = useNavigate()
 
   // Main-dashboard role for the artifact popout nav-intent handshake: perform
@@ -865,6 +907,21 @@ export default function App() {
       }),
     )
   }, [isPopout, isEmbed, navigate, dispatch])
+
+  // Publish the router navigator for the error → agent hand-off. AskAgentButton
+  // is deliberately hook-free (its callers include ErrorBoundary fallbacks, where
+  // router context may be what threw), so it navigates through this seam and
+  // falls back to a full page load when nothing is installed.
+  //
+  // Popout and embed windows never register, for the same reason the nav-intent
+  // handler above skips them: routing THAT window to /chat would replace the
+  // surface the user deliberately popped out (an artifact editor renders error
+  // banners of its own). They fall through to the hard-nav path instead.
+  useEffect(() => {
+    if (isPopout || isEmbed) return
+    installSoftNavigate(navigate)
+    return () => installSoftNavigate(null)
+  }, [isPopout, isEmbed, navigate])
 
   const {
     colorTheme,
@@ -996,6 +1053,27 @@ export default function App() {
   // (the native dashboard); a non-null id means a remote instance's embedded
   // dashboard is shown instead, so the Local pane is hidden (not unmounted).
   const activeInstanceId = useAppSelector(s => s.instances.activeId)
+  // Whether the shell's one-shot entrance animation has already played.
+  //
+  // The local pane is HIDDEN, not unmounted, while a remote instance tab is
+  // active (`display:none` below) so its state and websocket survive the
+  // switch. But a CSS *animation* restarts when an element goes from
+  // `display:none` back to displayed — unlike a transition, and unlike
+  // framer-motion's JS-driven animations. Left unguarded, `animate-rise`
+  // therefore replays its 350ms opacity-0 -> 1 + 8px lift over the WHOLE
+  // dashboard every time the user returns to the Local tab, which reads as the
+  // entire UI (side panel included) flashing in again.
+  const [shellEntered, setShellEntered] = useState(false)
+  // Backstop for the latch below. `animationend` does NOT fire when a running
+  // animation is INTERRUPTED — the browser fires `animationcancel`, which React
+  // 18 has no synthetic handler for. Hiding the pane inside the entrance's
+  // 350ms window would therefore leave the class applied and replay it once on
+  // the next return. A timer comfortably past the duration closes that without
+  // a ref + native listener, and cannot cut the entrance short.
+  useEffect(() => {
+    const t = window.setTimeout(() => setShellEntered(true), 600)
+    return () => window.clearTimeout(t)
+  }, [])
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
 
   // Dynamic app nav items — all apps (builtin + installed) with UI pages
@@ -1054,44 +1132,38 @@ export default function App() {
     api.listApps()
       .then((apps: AppListEntry[]) => {
         const items = apps
-          .filter(a => a.enabled && (a.manifest?.ui?.pages?.length ?? 0) > 0)
           .flatMap(a => {
-            const page = a.manifest!.ui!.pages![0]
-            const isBuiltin = a.origin === 'builtin'
-            const isOrphaned = !!a.orphaned
-            // A builtin that ships a dynamic UI bundle (manifest.ui.entry) has no
-            // native compiled surface — route it through AppHost like an installed
-            // app. Native builtins (no ui.entry) use their registered surface route.
-            const hasDynamicUI = !!a.manifest?.ui?.entry
-            const dynamicApp = !isBuiltin || hasDynamicUI
-            // Orphaned apps route to migration page; native builtins use their
-            // surface route; dynamic-UI builtins + installed apps use /apps/{name}.
-            const path = isOrphaned
-              ? `/apps/migrate/${a.name}`
-              : dynamicApp ? `/apps/${a.name}` : page.route
-            const iconName = page.icon || ''
+            // Eligibility, route, id and label come from the shared derivation in
+            // `appNav.ts` — the palette's Apps provider resolves destinations
+            // through the same functions, so the rail and the palette cannot send
+            // a user to different places for the same app. Only the icon is built
+            // here, because the rail tints orphaned apps and sizes its glyph for a
+            // 16px row.
+            const target = appNavTarget(a)
+            if (!target) return []
+            const iconName = target.iconName
             // Prefer the app's custom top-level iconUrl (an absolute
             // /app-assets/... path — the same source the App Store card renders
             // via AppIcon) so builtin colorful SVG icons also show in the left
             // nav. Fall back to a page-relative ui/ icon (installed apps), then
             // the builtin lucide glyph, then the generic package icon.
-            const customIconUrl = a.manifest?.iconUrl || ''
-            const builtinIcon = isBuiltin ? getBuiltinIcon(iconName) : undefined
+            const customIconUrl = target.iconUrl
+            const builtinIcon = target.builtin ? getBuiltinIcon(iconName) : undefined
             const baseIcon = customIconUrl
               ? <AppIcon iconUrl={customIconUrl} icon={iconName} size={16} />
-              : page.iconUrl
-                ? <img src={'/apps/' + a.name + '/ui/' + page.iconUrl} alt="" className="w-4 h-4 rounded-sm object-contain" />
+              : target.pageIconUrl
+                ? <img src={'/apps/' + a.name + '/ui/' + target.pageIconUrl} alt="" className="w-4 h-4 rounded-sm object-contain" />
                 : builtinIcon
                   ? builtinIcon
                   : <Package size={16} />
             // Orphaned apps get a warn-colored icon to signal migration needed
-            const icon = isOrphaned
+            const icon = target.orphaned
               ? <span className="text-warn">{baseIcon}</span>
               : baseIcon
             return [{
-              path,
-              id: dynamicApp ? `app-${a.name}` : a.name,
-              label: page.label || a.displayName || a.name,
+              path: target.route,
+              id: target.id,
+              label: target.label,
               group: 'Apps',
               icon,
             }]
@@ -1438,6 +1510,9 @@ export default function App() {
   useNativeNotification(botName, avatar)
 
   const [updateError, setUpdateError] = useState('')
+  // Nav-rail "Report issue" → the shared diagnostics flow. Held at shell level
+  // (not in the rail) so the modal is not unmounted when the rail collapses.
+  const [reportProblemOpen, setReportProblemOpen] = useState(false)
 
   const handleUpdate = useCallback(async () => {
     setShowChangelog(false)
@@ -1458,10 +1533,18 @@ export default function App() {
   }, [])
 
   const requestFeature = useCallback(async () => {
+    // Resolve skill availability in the dashboard so the agent never needs
+    // to probe the filesystem (which would trigger a tool-approval prompt).
+    let msg = FEATURE_REQUEST_PROMPT_FALLBACK
+    try {
+      const skills: { name: string }[] = await api.skills()
+      if (skills.some(s => s.name === 'feature-request')) {
+        msg = FEATURE_REQUEST_PROMPT_WITH_SKILL
+      }
+    } catch { /* skill list unavailable — use the self-contained fallback */ }
     const result = await dispatch(createSlot(undefined)).unwrap()
     const slot = result.key
     navigate('/chat')
-    const msg = FEATURE_REQUEST_PROMPT
     dispatch(appendMessage({ role: 'user', content: i18nT('app.i_d_like_to_request_a_feature'), cls: '', ts: new Date().toISOString() }))
     dispatch(setSlotRunning(true))
     try {
@@ -1515,7 +1598,9 @@ export default function App() {
   const closeMobileNav = isMobile ? () => setMobileNavOpen(false) : undefined
   const activePath = location.pathname
   const isChat = activePath === '/chat' || activePath.startsWith('/chat/') || activePath === '/'
-  const needsFixedHeight = isChat || activePath === '/settings' || activePath === '/developer' || activePath === '/capabilities'
+  // /webhooks is a full-height rail-and-detail shell (like /capabilities), so it
+  // owns its own scrolling and must not sit inside <main>'s scroll container.
+  const needsFixedHeight = isChat || activePath === '/settings' || activePath === '/developer' || activePath === '/capabilities' || activePath === '/webhooks'
 
   // Render one standard nav row (used by the top-fixed mains, the Apps list,
   // and the bottom-fixed section). Active-state, mobile close, chat pin
@@ -1545,6 +1630,7 @@ export default function App() {
       <Routes>
         <Route path="/popout/chat/:slug?" element={<ErrorBoundary><PopoutFrame /></ErrorBoundary>} />
         <Route path="/popout/artifact/:slug" element={<ErrorBoundary><ArtifactPopoutFrame /></ErrorBoundary>} />
+        <Route path="/popout/terminal" element={<ErrorBoundary><TerminalPopoutFrame /></ErrorBoundary>} />
         {/* Belt-and-braces: any stray in-window navigation re-pins to the
             frame this window loaded as (isPopout is sticky, so the dashboard
             branch is unreachable — without this the wildcard would bounce a
@@ -1575,7 +1661,15 @@ export default function App() {
       <div className="absolute inset-0" style={{ display: activeInstanceId === null ? 'block' : 'none' }}>
     <div
       data-testid="dashboard-shell"
-      className={`relative z-[1] h-full grid animate-rise overflow-hidden bg-bg ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
+      className={`relative z-[1] h-full grid ${shellEntered ? '' : 'animate-rise'} overflow-hidden bg-bg ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isWinElectron ? 'win-electron' : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
+      // Retire the entrance animation once it has played, so re-showing this
+      // pane cannot replay it. Guarded on BOTH the keyframe name and the event
+      // target: `animationend` bubbles, and descendants (banners, cards) use
+      // `animate-rise` too, so an unguarded handler would retire the shell's
+      // entrance from an unrelated child's animation.
+      onAnimationEnd={e => {
+        if (e.target === e.currentTarget && e.animationName === 'rise') setShellEntered(true)
+      }}
       style={{
         gridTemplateAreas: isMobile ? '"topbar" "content"' : '"topbar topbar topbar" "nav content actbar"',
         ...(!isMobile && {
@@ -1699,7 +1793,7 @@ export default function App() {
                 const memValid = m.memTotal > 0
                 const dskValid = m.diskTotal > 0
                 const cpuValid = typeof m.cpuPct === 'number' && Number.isFinite(m.cpuPct)
-                const staleTitle = sysMetricsStale ? ' (stale: fetch failing)' : ''
+                const staleTitle = sysMetricsStale ? ` ${i18nT('app.stale_fetch_failing')}` : ''
                 segments.push(<button key="metrics" className={`${seg} gap-2 text-[11px] font-mono ${sysMetricsStale ? 'opacity-60' : ''}`} title={sysMetricsStale ? i18nT('app.metrics_are_stale_latest_fetch_failed') : i18nT('app.click_to_hide')} onClick={() => { setMetricsOpen(false); safeSetItem('mc-topbar-metrics', '0') }}>
                   <span className={cpuValid ? metricColor(m.cpuPct / 100) : 'text-muted'} title={cpuValid ? `CPU: ${m.cpuPct.toFixed(0)}%${staleTitle}` : i18nT('app.cpu_unavailable')}>{i18nT('app.cpu')} {cpuValid ? `${m.cpuPct.toFixed(0)}%` : '—'}</span>
                   <span className={memValid ? metricColor(memPct) : 'text-muted'} title={memValid ? `Memory: ${m.memUsed.toFixed(1)}/${m.memTotal.toFixed(1)} GB${staleTitle}` : i18nT('app.memory_unavailable')}>{i18nT('app.mem')} {memValid ? `${(memPct * 100).toFixed(0)}%` : '—'}</span>
@@ -1798,16 +1892,15 @@ export default function App() {
               <w.component />
             </ErrorBoundary>
           ))}
-          {/* Request a Feature — its own bordered pill (28px tall, 12px radius),
-              separated from the readout capsule (item 2.3). */}
+          {/* Feedback — "Request a Feature" plus, on a prerelease build, a
+              channel chip that opens the same Report a Problem flow. Its own
+              bordered pill (28px tall, 12px radius), separated from the readout
+              capsule (item 2.3). */}
           {!isMobile && (
-            <button
-              className="flex items-center gap-1.5 h-7 px-2.5 rounded-xl bg-card text-muted hover:text-text transition-colors cursor-pointer text-[12px] whitespace-nowrap shrink-0"
-              onClick={requestFeature}
-              title={i18nT('app.request_a_feature')}
-            >
-              <Lightbulb size={13} /> {i18nT('app.request_a_feature_2')}
-            </button>
+            <FeedbackPill
+              onRequestFeature={requestFeature}
+              onReportProblem={() => setReportProblemOpen(true)}
+            />
           )}
           {/* Notifications bell — borderless icon button, rightmost control.
               (The activity-panel open toggle now lives in the session header,
@@ -1816,6 +1909,9 @@ export default function App() {
           <NotificationsBellButton />
         </div>
       </header>
+
+      {/* Report a Problem — mounted by the nav rail's "Report issue" link. */}
+      <ReportProblemModal open={reportProblemOpen} onClose={() => setReportProblemOpen(false)} />
 
       {/* Update error modal */}
       {updateError && (
@@ -2211,10 +2307,18 @@ export default function App() {
                   path="#"
                   label={i18nT('app.terminal')}
                   icon={<SquareTerminal size={16} />}
-                  active={false}
+                  /* This row TOGGLES the docked panel instead of navigating, so
+                     "active" tracks the panel's open flag rather than the route.
+                     Without it the row only lit on hover, leaving no indication
+                     the panel below was open once the pointer moved away. */
+                  active={bottomTerminalOpen || terminalPoppedOut}
+                  pressed={bottomTerminalOpen || terminalPoppedOut}
                   collapsed={effectiveCollapsed}
                   onClick={closeMobileNav}
-                  onClickOverride={() => toggleBottomTerminal()}
+                  /* While popped out: focus only (a refused programmatic
+                     focus is a harmless no-op). Explicit re-dock lives in the
+                     TerminalDetachedBar below -- never a timing heuristic. */
+                  onClickOverride={() => { if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal() }}
                 />
               )}
               <div>{renderNavRow(cap)}</div>
@@ -2288,7 +2392,16 @@ export default function App() {
                   <div className="rail-community-links flex items-center gap-[5px] flex-1 min-w-0 ml-1.5 text-[12px]">
                     <a href="https://github.com/kirodotdev/KiroCrew" target="_blank" rel="noopener noreferrer" title={i18nT('app.star_kirocrew_on_github')} aria-label={i18nT('app.star_kirocrew_on_github')} className="shrink-0 rounded text-muted hover:text-text transition-colors">{i18nT('app.star_us')}</a>
                     <span aria-hidden="true" className="shrink-0 opacity-40">·</span>
-                    <a href="https://github.com/kirodotdev/KiroCrew/issues" target="_blank" rel="noopener noreferrer" title={i18nT('app.report_an_issue_on_github')} aria-label={i18nT('app.report_an_issue_on_github')} className="min-w-0 overflow-hidden text-ellipsis rounded text-muted hover:text-text transition-colors">{i18nT('app.report_issue')}</a>
+                    {/* "Report issue" opens the SAME diagnostics flow as Settings ›
+                        About › Support rather than linking to the bare issue list.
+                        A user who reaches for this link is reporting a failure, and
+                        an empty issue form loses exactly what triage needs (logs +
+                        crash reports); the collector scrubs secrets, zips them, and
+                        still ends at a pre-filled GitHub issue, so the old
+                        destination is reachable WITH evidence attached. A <button>
+                        (not an <a>) because it no longer navigates — styled to match
+                        its sibling link so the row's width budget above is unchanged. */}
+                    <button type="button" onClick={() => setReportProblemOpen(true)} title={i18nT('app.report_a_problem_with_diagnostics')} aria-label={i18nT('app.report_a_problem_with_diagnostics')} className="min-w-0 overflow-hidden text-ellipsis rounded text-muted hover:text-text transition-colors cursor-pointer bg-transparent border-0 p-0 text-[12px]">{i18nT('app.report_issue')}</button>
                   </div>
                   <a href="https://kiro.dev/discord/" target="_blank" rel="noopener noreferrer" title={i18nT('app.discord_community')} aria-label={i18nT('app.kiro_discord_community')} className="flex items-center justify-center ml-1 w-6 h-6 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors shrink-0"><DiscordIcon size={15} /></a>
                 </div>
@@ -2344,6 +2457,7 @@ export default function App() {
             <Route path="/tasks" element={<TasksRedirect />} />
             <Route path="/logs" element={<LogsPage />} />
             <Route path="/hooks" element={<HooksPage />} />
+            <Route path="/webhooks" element={<ErrorBoundary><WebhooksPage /></ErrorBoundary>} />
             <Route path="/capabilities" element={<CapabilitiesPage />} />
             {/* Instances setup moved into Settings; switching happens via the header tab strip. */}
             <Route path="/instances" element={<Navigate to="/settings?tab=instances" replace />} />
@@ -2368,7 +2482,7 @@ export default function App() {
         {/* App-wide docked terminal panel — spans every route, below <main>.
             Toggled from the sidebar Terminal icon; hosts app-wide
             shells. Distinct from the chat-scoped activity-bar terminal tabs. */}
-        {terminalEnabled && <BottomTerminalPanel />}
+        {terminalEnabled && (terminalPoppedOut ? <TerminalDetachedBar /> : <BottomTerminalPanel />)}
 
         {/* Self-managed floating panels: lifecycle-driven (hidden → small → chip),
             not motion.* children, so they live outside AnimatePresence. The browse

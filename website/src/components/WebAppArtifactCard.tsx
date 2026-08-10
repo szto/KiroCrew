@@ -15,6 +15,7 @@ import {
 } from 'lucide-react'
 import { api } from '../api/client'
 import { Badge } from '../components/ui'
+import SimpleSelect from '../components/SimpleSelect'
 import { framablePreviewUrl, safeHttpUrl } from '../lib/safeUrl'
 import type { Artifact, WebAppMetadata } from '../types'
 
@@ -196,7 +197,7 @@ function LiveSiteFrame({ url, slug }: { url: string; slug: string }) {
         sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
         referrerPolicy="no-referrer"
         loading="lazy"
-        title={`Live preview: ${slug}`}
+        title={i18nT('components.webAppArtifactCard.live_preview', { slug })}
         tabIndex={-1}
         className="border-none bg-card block"
         style={{ width: BASE_W, height: BASE_H, transform: `scale(${scale})`, transformOrigin: 'top left' }}
@@ -265,7 +266,7 @@ function LocalAppFrame({ base, slug }: { base: string; slug: string }) {
         sandbox="allow-scripts"
         referrerPolicy="no-referrer"
         loading="lazy"
-        title={`App preview: ${slug}`}
+        title={i18nT('components.webAppArtifactCard.app_preview', { slug })}
         tabIndex={-1}
         className="border-none bg-card block"
         style={{ width: BASE_W, height: BASE_H, transform: `scale(${scale})`, transformOrigin: 'top left' }}
@@ -358,6 +359,8 @@ export default function WebAppArtifactCard({
   })
   const registeredProfiles = profilesResp?.profiles ?? []
   const defaultProfile = profilesResp?.default ?? ''
+  // Derived once so the picker's value array and label array stay in lockstep.
+  const pickableProfiles = registeredProfiles.filter((p) => p.name !== defaultProfile)
   // Local-first preview: the app's local copy (like html/widget artifacts)
   // beats iframing the remote deployment — no dependency on remote frame
   // headers, CDN propagation, or the deployment even existing.
@@ -394,14 +397,14 @@ export default function WebAppArtifactCard({
   const notDeployed = !deploy_target.public_url && !isExpired && !isDeploying
   const frameUrl = !isExpired && !isDeploying && remoteFramable ? framablePreviewUrl(deploy_target.public_url) : null
   const costLabel = cost.model === 'ttl-window'
-    ? `Estimated cost \u2014 over ${cost.window_hours}h TTL window`
+    ? i18nT('components.webAppArtifactCard.estimated_cost_over_ttl_window', { hours: cost.window_hours })
     : i18nT('components.webAppArtifactCard.estimated_monthly_cost')
 
   const handleTeardown = () => {
     const resourceList = architecture.resources
       .map((r: { type: string; id: string }) => `  ${r.type}: ${r.id}`)
       .join('\n')
-    const msg = `This will tear down the deployed application and delete these resources:\n\n${resourceList}\n\nThis action is not reversible. Continue?`
+    const msg = i18nT('components.webAppArtifactCard.tear_down_confirm', { resources: resourceList })
     if (!window.confirm(msg)) return
     teardownMut.mutate()
   }
@@ -429,19 +432,17 @@ export default function WebAppArtifactCard({
           </p>
           <div className="flex items-center gap-2 flex-wrap">
             {registeredProfiles.length > 0 && (
-              <select
+              <SimpleSelect
                 value={deployProfile}
-                onChange={(e) => setDeployProfile(e.target.value)}
+                onChange={setDeployProfile}
+                // '' is a REAL choice here ("deploy with the registry default"),
+                // not a placeholder header — `clearLabel` is SimpleSelect's
+                // channel for a selectable empty row.
+                clearLabel={defaultProfile ? `profile: ${defaultProfile} (default)` : 'profile: default'}
+                options={pickableProfiles.map((p) => p.name)}
+                optionLabels={pickableProfiles.map((p) => `${i18nT('components.webAppArtifactCard.profile_2')} ${p.name}`)}
                 aria-label={i18nT('components.webAppArtifactCard.aws_profile_to_deploy_with')}
-                className="px-2 py-1.5 rounded-md text-[12px] bg-bg-elevated border border-border text-text cursor-pointer"
-              >
-                <option value="">
-                  {defaultProfile ? `profile: ${defaultProfile} (default)` : 'profile: default'}
-                </option>
-                {registeredProfiles.filter((p) => p.name !== defaultProfile).map((p) => (
-                  <option key={p.name} value={p.name}>{i18nT('components.webAppArtifactCard.profile_2')} {p.name}</option>
-                ))}
-              </select>
+              />
             )}
             <button
               type="button"
@@ -483,7 +484,9 @@ export default function WebAppArtifactCard({
           <div className="rounded-xl border border-border bg-card p-4">
             <CostPills
               cost={cost}
-              label={`Estimated cost once deployed ${cost.model === 'ttl-window' ? `(over ${cost.window_hours}h)` : '(monthly)'}`}
+              label={cost.model === 'ttl-window'
+                ? i18nT('components.webAppArtifactCard.estimated_cost_once_deployed_over', { hours: cost.window_hours })
+                : i18nT('components.webAppArtifactCard.estimated_cost_once_deployed_monthly')}
             />
           </div>
         )}

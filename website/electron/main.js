@@ -10,6 +10,8 @@ const { findKirocrewBin } = require("./find-bin");
 const { findConfiguredDashboardPort } = require("./data-home");
 const { createTokenRetryHandler } = require("./token-retry");
 const { classifyAuthBlock, defaultedPort } = require("./gateway-auth-hint");
+const { exitImmersiveModes } = require("./blocking-prompt");
+const { shouldRetryLocalTokenMint, tokenMintRetryDelayMs, TOKEN_MINT_MAX_RETRIES } = require("./token-acquire");
 const { createDisplayMediaHandler } = require("./display-media");
 const {
   createPermissionRequestHandler,
@@ -26,6 +28,7 @@ const {
 } = require("./bundle-location");
 const { stopGatewayGracefully: _stopGatewayGracefully, forceStopPort, classifyPortOwner } = require("./gateway-stop");
 const { waitForGateway, describeGatewayFailure, tailLines, isPortInUse } = require("./gateway-wait");
+const { describeSandboxProfileNeed } = require("./sandbox-profile");
 const { sanitizeWindowState, captureWindowState } = require("./window-state");
 const { createLivenessMonitor } = require("./gateway-liveness");
 const { chooseRecoveryStrategy } = require("./gateway-recovery");
@@ -33,6 +36,7 @@ const { capturePySpyDump } = require("./pyspy-dump");
 const { createMetricsRecorder } = require("./perf-metrics");
 const { identityFamily, decideGatewayAction, FAMILY_META, HEALTH_IDENTITY_PATH } = require("./instance-guard");
 const { initMochi, shutdownMochi } = require("./mochi/index");
+const { initCrewCompanion, shutdownCrewCompanion } = require("./crew-companion/index");
 const { clampZoomFactor, stepZoomFactor } = require("./zoom");
 const { createBrowserViewManager, isUntrustedContents } = require("./browser-view");
 // chooseControlTransport is exercised by the routing layer (see Stage 6 notes),
@@ -291,10 +295,10 @@ function quitOtherApp(appName) {
 // Function declarations are hoisted, so the helpers defined further down this
 // file are available here.
 //
-// Platforms without lsof//bin/ps (Windows) resolve to "unknown", which reuses.
-// That is the safe direction: reuse can never produce two gateways on one data
-// home, so the cross-app mutex still holds — only the eviction prompt is lost,
-// and eviction was already darwin-only (canTakeover below).
+// On Windows there is no lsof/ps, so classifyPortOwner returns "unknown" and
+// the caller reuses the port rather than force-killing an owner it cannot
+// identify. A Windows-native netstat/taskkill owner probe is a follow-up
+// (tracked separately) — it needs runtime verification on real Windows.
 function probeGatewayPortOwner(port) {
   return classifyPortOwner(port, {
     getListenPids: _lsofListenPids,
@@ -515,6 +519,29 @@ function spawnGateway(resolve) {
         glog(`no gateway on :${PORT} — spawning bundled backend: bin=${bin} bundled=${bundled} ${execState}`);
         sendStatus("Starting gateway…");
 
+        // Linux AppImage only: this process is about to exec the backend with no
+        // AppArmor profile applied to either of them, because nothing attaches
+        // one to a directly launched binary (see sandbox-profile.js for why the
+        // app cannot fix that itself). Record the exact remedy command here —
+        // this log is what a bug report pastes, and without it the failure looks
+        // like a generic "no sandbox backend" verdict on a host that has one.
+        try {
+          const need = describeSandboxProfileNeed({
+            platform: process.platform,
+            env: process.env,
+            readSysctl: (p) => fs.readFileSync(p, "utf8"),
+            // The bundled CLI's absolute path: this persona installed no CLI, so
+            // `kirocrew` is not on their PATH and a bare command would fail.
+            cliBin: bin,
+          });
+          if (need) {
+            glog(`WARN agent sandbox will fail closed: ${need.reason}`);
+            glog(`HINT run this in a terminal (needs sudo), then restart the app: ${need.command}`);
+          }
+        } catch (e) {
+          glog(`WARN sandbox profile check failed: ${e.message}`);
+        }
+
         // Strip KIROCREW_PORT and pass the port EXPLICITLY instead (below).
         // Inheriting it would leave the child free to re-derive its own port
         // from env/config; the explicit flag makes the shell's resolvePort()
@@ -556,6 +583,17 @@ function spawnGateway(resolve) {
           if (fs.existsSync(pyExe)) {
             spawnBin = pyExe;
             spawnArgs = ["-s", "-m", "kiro_crew", ...spawnArgs];
+          } else {
+            // Bundled layout is present but python.exe is missing/corrupted.
+            // Surface this as a clear error instead of letting spawn() hang or
+            // emit a cryptic ENOENT for the .cmd shim.
+            const errMsg = `Bundled Python interpreter not found at ${pyExe}. `
+              + `The installation may be corrupted — reinstall the app.`;
+            glog(`spawn ERROR: ${errMsg}`);
+            gatewayStartFailure = { error: errMsg };
+            sendStatus(`Gateway failed: ${errMsg}`);
+            resolve(false);
+            return;
           }
         }
         const child = spawn(spawnBin, spawnArgs, {
@@ -622,14 +660,37 @@ function spawnGateway(resolve) {
  * Gracefully stop the embedded gateway and await its exit (POST /api/shutdown
  * -> SIGTERM -> SIGKILL). Core logic lives in gateway-stop.js for testability;
  * this thin wrapper binds the module-level child process + config.
+ *
+ * Uses call-time home resolution (secretCandidates) rather than the boot-time
+ * KIROCREW_HOME pin, because on the migration launch the boot-time dir may
+ * have been deleted by the backend — the secret lives in whichever candidate
+ * still exists at shutdown time.
  */
 async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
   const proc = gatewayProcess;
   if (!proc || proc.exitCode !== null) { gatewayProcess = null; return; }
   console.log("Stopping gateway gracefully...");
+  // Resolve the secret location at call time: try each candidate in order
+  // (canonical first, legacy second) so graceful stop works even when the
+  // boot-time home was moved/deleted during migration.
+  // Resolve the secret location at call time: a migration may have moved or
+  // deleted the boot-time home, and a partial migration can leave BOTH a
+  // canonical and a legacy `.local_secret`. Collect every readable candidate
+  // value and let gateway-stop POST each one — the gateway answers 200 only to
+  // the secret it actually loaded, so a stale copy can't force a hard SIGTERM.
+  const candidates = secretCandidates();
+  const kirocrewHome = path.dirname(candidates[0]); // canonical dir (for logs/SIGTERM path)
+  const secrets = [];
+  for (const candidate of candidates) {
+    try {
+      const value = fs.readFileSync(candidate, "utf8").trim();
+      if (value) secrets.push(value);
+    } catch { /* candidate absent/unreadable */ }
+  }
   await _stopGatewayGracefully(proc, {
     backendUrl: BACKEND_URL,
-    kirocrewHome: KIROCREW_HOME,
+    kirocrewHome,
+    secrets,
     timeoutMs,
   });
   gatewayProcess = null;
@@ -1150,15 +1211,17 @@ function setupWindowContents(win, backendUrl) {
   view.webContents.on("page-title-updated", (e) => { e.preventDefault(); applyTitle(); });
 
   view.webContents.on("did-finish-load", () => {
-    // macOS + Linux only: the frameless window needs an injected drag region so
-    // the dashboard header can move the window. Windows uses a native title bar,
-    // which already provides dragging — injecting an app-region bar over the
-    // header would only risk swallowing clicks, so skip it there.
-    if (!IS_WIN) {
+    // macOS + Windows + Linux (non-native-frame): the frameless window needs
+    // an injected drag region so the dashboard header can move the window.
+    // On macOS titleBarStyle:"hidden" makes the whole window frameless; on
+    // Windows titleBarOverlay provides caption controls but no drag area.
+    // The drag bar is pointer-events:none so clicks pass through to the SPA;
+    // interactive controls are marked no-drag so they remain clickable.
+    if (IS_MAC || IS_WIN) {
       view.webContents.insertCSS(`
         #electron-drag-bar {
           position: fixed;
-          top: 0; left: 0; right: 0;
+          top: 0; left: 0; right: ${IS_WIN ? '138px' : '0'};
           height: 42px;
           -webkit-app-region: drag;
           z-index: 99999;
@@ -1276,14 +1339,20 @@ function createWindow() {
     minHeight: 600,
     backgroundColor: "#0f1117",
   };
-  // Frameless chrome is macOS-only: the dashboard's 42px header doubles as
-  // the title bar with the native traffic lights inset into it. Windows has
-  // no equivalent inset controls -- hiding the title bar there would ship
-  // windows with no minimize/maximize/close at all -- so it keeps the native
-  // frame, exactly like the shipped Linux AppImage (Electron ignores
-  // titleBarStyle on Linux). A Windows title-bar overlay with inset controls
-  // is the tracked follow-up.
+  // Frameless chrome: the dashboard's 42px header doubles as the title bar.
+  // macOS: titleBarStyle:"hidden" + native traffic lights inset into it.
+  // Windows: titleBarStyle:"hidden" + titleBarOverlay puts native caption
+  //   controls (minimize/maximize/close) in an overlay strip synced to theme.
+  // Linux: Electron ignores titleBarStyle, so it keeps the native frame.
   if (IS_MAC) opts.titleBarStyle = "hidden";
+  if (IS_WIN) {
+    opts.titleBarStyle = "hidden";
+    opts.titleBarOverlay = {
+      color: nativeTheme.shouldUseDarkColors ? "#0f1117" : "#f8fafc",
+      symbolColor: nativeTheme.shouldUseDarkColors ? "#e2e8f0" : "#1e293b",
+      height: 42,
+    };
+  }
   // Window + taskbar icon (Windows only): running unpackaged (`electron .`)
   // otherwise shows the default Electron icon. macOS takes its icon from the
   // .app bundle and Linux from the .desktop/AppImage, so leave those untouched.
@@ -1806,19 +1875,30 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
   try {
     await waitForBackend(win, healthUrl, { watchSpawn: backendUrl === BACKEND_URL });
     if (win.isDestroyed()) return;
-    let token = await fetchLocalToken(backendUrl);
-    if (!token) ({ token } = await fetchRemoteToken(new URL(backendUrl).port));
-    if (win.isDestroyed()) return;
 
-    if (token) {
-      // Hold the boot reveal until it has both finished its animation and the
-      // gateway is ready, then fade out and hand off to the dashboard.
-      await fadeLoadingScreen(wc);
+    // Acquire a dashboard token, retrying a transient warmup 403 on our OWN
+    // gateway. A gateway we just (re)started regenerates its .local_secret at
+    // boot, so right after /api/status answers the local mint can 403 briefly
+    // while the secret settles. For a foreign gateway (SSH forward / external)
+    // the secret is on the remote host and the local mint can never succeed, so
+    // that case falls straight through to the prompt (see shouldRetryLocalTokenMint).
+    // The healthy path mints on attempt 0 and returns immediately — no added latency.
+    for (let attempt = 0; ; attempt++) {
+      let token = await fetchLocalToken(backendUrl);
+      if (!token) ({ token } = await fetchRemoteToken(new URL(backendUrl).port));
       if (win.isDestroyed()) return;
-      wc.loadURL(`${backendUrl}?token=${token}`);
-      if (backendUrl === BACKEND_URL) startLivenessMonitor(win);
-    } else {
-      // Fallback — check if gateway allows unauthenticated access
+
+      if (token) {
+        // Hold the boot reveal until it has both finished its animation and the
+        // gateway is ready, then fade out and hand off to the dashboard.
+        await fadeLoadingScreen(wc);
+        if (win.isDestroyed()) return;
+        wc.loadURL(`${backendUrl}?token=${token}`);
+        if (backendUrl === BACKEND_URL) startLivenessMonitor(win);
+        return;
+      }
+
+      // No token — check if the gateway allows unauthenticated access.
       const status = await new Promise((resolve) => {
         http.get(backendUrl, (res) => {
           res.resume();
@@ -1826,30 +1906,56 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
         }).on("error", () => resolve(0));
       });
       if (win.isDestroyed()) return;
-      if (status === 403) {
-        // The page has to say WHICH machine to mint on. A gateway we did not
-        // spawn (an `ssh -L` forward, or an externally-started one) has its own
-        // .local_secret, so our CLI can only mint against it FROM that machine;
-        // pointing the user at this one would send them where the gateway is
-        // not. Reuse the boot-time port-owner probe rather than guessing.
-        //
-        // NOTE `URL.port` is "" for a default-port URL (http://host/ on :80).
-        // Left empty it would look up the wrong remote-host entry, probe no
-        // port at all, and let the page fall back to :5476 — i.e. describe and
-        // submit to a gateway that isn't the one we just got a 403 from.
-        const promptPort = defaultedPort(backendUrl);
-        const remoteHost = getRemoteHostConfig(store, promptPort)?.host || "";
-        const localOwner = remoteHost ? "foreign" : await probeGatewayPortOwner(promptPort);
-        const kind = classifyAuthBlock({ localOwner, remoteHost });
-        glog(`token prompt: kind=${kind} owner=${localOwner} port=${promptPort} host=${remoteHost || "(none)"}`);
-        if (win.isDestroyed()) return;
-        wc.loadFile(path.join(__dirname, "token-prompt.html"), {
-          query: { port: promptPort, kind, host: remoteHost },
-        });
-      } else {
+
+      if (status !== 403) {
+        // Not an auth block — the gateway serves without a token.
         wc.loadURL(backendUrl);
         if (backendUrl === BACKEND_URL) startLivenessMonitor(win);
+        return;
       }
+
+      // 403: classify WHICH machine to mint on. A gateway we did not spawn (an
+      // `ssh -L` forward, or an externally-started one) has its own
+      // .local_secret, so our CLI can only mint against it FROM that machine;
+      // pointing the user at this one would send them where the gateway is not.
+      // Reuse the boot-time port-owner probe rather than guessing.
+      //
+      // NOTE `URL.port` is "" for a default-port URL (http://host/ on :80).
+      // Left empty it would look up the wrong remote-host entry, probe no port
+      // at all, and let the page fall back to :5476 — i.e. describe and submit
+      // to a gateway that isn't the one we just got a 403 from.
+      const promptPort = defaultedPort(backendUrl);
+      const remoteHost = getRemoteHostConfig(store, promptPort)?.host || "";
+      const localOwner = remoteHost ? "foreign" : await probeGatewayPortOwner(promptPort);
+      const kind = classifyAuthBlock({ localOwner, remoteHost });
+
+      // Our own gateway may still be warming up its regenerated secret — retry
+      // the mint with backoff before giving up. A foreign gateway can't be
+      // minted against locally, so never spin on it: fall through to the prompt.
+      if (shouldRetryLocalTokenMint({ kind, attempt })) {
+        glog(`token mint: transient 403 on own gateway (kind=${kind}, attempt=${attempt + 1}/${TOKEN_MINT_MAX_RETRIES + 1}) — retrying after backoff`);
+        await new Promise((r) => setTimeout(r, tokenMintRetryDelayMs(attempt)));
+        if (win.isDestroyed()) return;
+        continue;
+      }
+
+      glog(`token prompt: kind=${kind} owner=${localOwner} port=${promptPort} host=${remoteHost || "(none)"}`);
+      if (win.isDestroyed()) return;
+      // token-prompt.html replaces the dashboard inside THIS window's
+      // WebContentsView (win.webContents is the view's, see setupWindowContents).
+      // In fullscreen/kiosk the traffic lights + app menu are hidden, so the
+      // user was trapped with no way out but force-kill. Drop immersive modes
+      // first, which restores Close / Cmd-Q as the exit.
+      //
+      // Deliberately NO in-page exit: the window is a BaseWindow, so a
+      // `window.close()` in the page would destroy the VIEW and leave a blank
+      // shell behind. A keyboard exit has to go through the main process
+      // (windowForWebContents) to close the host window.
+      exitImmersiveModes(win);
+      wc.loadFile(path.join(__dirname, "token-prompt.html"), {
+        query: { port: promptPort, kind, host: remoteHost },
+      });
+      return;
     }
   } catch (err) {
     if (win.isDestroyed()) return;
@@ -1977,8 +2083,17 @@ async function openNewConnectionWindow() {
       backgroundColor: "#0f1117",
     };
     // Same platform-conditional chrome as the main window (see createWindow):
-    // frameless + inset traffic lights on macOS, native frame elsewhere.
+    // frameless + inset traffic lights on macOS, titleBarOverlay on Windows,
+    // native frame elsewhere (Linux).
     if (IS_MAC) connOpts.titleBarStyle = "hidden";
+    if (IS_WIN) {
+      connOpts.titleBarStyle = "hidden";
+      connOpts.titleBarOverlay = {
+        color: nativeTheme.shouldUseDarkColors ? "#0f1117" : "#f8fafc",
+        symbolColor: nativeTheme.shouldUseDarkColors ? "#e2e8f0" : "#1e293b",
+        height: 42,
+      };
+    }
     if (IS_MAC) connOpts.trafficLightPosition = trafficLightPositionForZoom(1);
     const connWin = new BaseWindow(connOpts);
 
@@ -2257,6 +2372,23 @@ app.whenReady().then(async () => {
   ipcMain.on("theme-mode-changed", (_event, pref) => {
     if (pref === "system" || pref === "dark" || pref === "light") {
       nativeTheme.themeSource = resolveThemeSource(pref, "");
+    }
+  });
+
+  // Windows titleBarOverlay color sync: when the resolved dark/light mode
+  // changes, update the overlay background and symbol colors to match. The
+  // renderer sends the resolved mode ("dark" | "light") after any theme change.
+  ipcMain.on("titlebar-overlay-theme", (_event, mode) => {
+    if (!IS_WIN) return;
+    const dark = mode === "dark";
+    const color = dark ? "#0f1117" : "#f8fafc";
+    const symbolColor = dark ? "#e2e8f0" : "#1e293b";
+    for (const win of BaseWindow.getAllWindows()) {
+      try {
+        if (typeof win.setTitleBarOverlay === "function") {
+          win.setTitleBarOverlay({ color, symbolColor, height: 42 });
+        }
+      } catch { /* window mid-teardown */ }
     }
   });
 
@@ -2602,6 +2734,13 @@ app.whenReady().then(async () => {
   // loaded from the gateway origin. Best-effort -- a failure here must never
   // block the dashboard, so everything is inside a catch that only logs.
   initMochi({ backendUrl: BACKEND_URL, fetchLocalToken, glog });
+  // Same shape and the same best-effort contract: the companion's windows follow
+  // the app's enabled state, and a failure here must never block the dashboard.
+  try {
+    initCrewCompanion({ backendUrl: BACKEND_URL, fetchLocalToken, glog });
+  } catch (err) {
+    glog(`crew-companion: init failed — ${err && err.message}`);
+  }
 
   app.on("activate", () => {
     if (!mainWindow?.isVisible()) mainWindow?.show();
@@ -2613,6 +2752,7 @@ app.on("before-quit", () => {
   // Flush the final metrics window before the gateway teardown begins.
   try { if (desktopMetricsRecorder) desktopMetricsRecorder.stop(); } catch { /* best effort */ }
   shutdownMochi();
+  try { shutdownCrewCompanion(); } catch { /* best effort */ }
   stopGateway();
 });
 

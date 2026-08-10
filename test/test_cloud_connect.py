@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from kiro_crew import platform_compat as pc
 from kiro_crew.cloud import aws, connect, ssm
 
 
@@ -254,15 +255,18 @@ class TestConnect:
 class TestKillProcessTree:
     def test_kills_whole_group_not_just_parent(self, tmp_path):
         # The SSM tunnel is spawned with start_new_session=True, so the parent
-        # `aws` process is a group leader and the plugin child is in the same
-        # group. _kill_process_tree must reap the WHOLE group — a plain
-        # proc.terminate() would leave the child (holding the local port) alive.
+        # `aws` process leads its own group and the plugin child is in that group.
+        # _kill_process_tree must reap the WHOLE tree — a plain proc.terminate()
+        # would leave the child (holding the local port) alive. The reap mechanism
+        # differs per platform (POSIX killpg vs. Windows `taskkill /T`, since
+        # start_new_session is silently ignored there) but the invariant asserted
+        # here — no descendant survives teardown — is identical on both.
         import subprocess
         import sys
         import time
 
         # Parent spawns a grandchild `sleep`, writes its pid, then waits — so the
-        # group has two members. Start it in its own session (mirrors
+        # tree has two members. Start it in its own session (mirrors
         # open_port_forward's start_new_session=True).
         pidfile = tmp_path / "child.pid"
         script = (
@@ -284,12 +288,12 @@ class TestKillProcessTree:
 
         # Both the parent and the grandchild must be gone.
         assert proc.poll() is not None, "parent should be reaped"
-        # Give the group signal a moment to propagate to the grandchild.
+        # Poll: the tree kill is asynchronous w.r.t. the grandchild exiting.
         for _ in range(50):
             if not _pid_alive(child_pid):
                 break
             time.sleep(0.1)
-        assert not _pid_alive(child_pid), "grandchild (same group) must also be killed"
+        assert not _pid_alive(child_pid), "grandchild (same tree) must also be killed"
 
     def test_windows_uses_a_tree_kill_not_a_parent_only_terminate(self, monkeypatch):
         """On Windows the group signal can never work, so the tree kill must run.
@@ -380,13 +384,16 @@ class TestKillProcessTree:
 
 
 def _pid_alive(pid: int) -> bool:
-    import os
+    """Liveness probe that is correct on both platforms.
 
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    NOT ``os.kill(pid, 0)``: signal 0 is ``signal.CTRL_C_EVENT`` on Windows, so
+    CPython routes it to ``GenerateConsoleCtrlEvent`` — a console-group signal
+    whose return value is unrelated to whether ``pid`` exists. It reports "alive"
+    for every already-dead pid, so a teardown assertion built on it can never
+    observe the reap. ``platform_compat.pid_exists`` uses ``OpenProcess`` +
+    ``GetExitCodeProcess`` there and ``os.kill(pid, 0)`` on POSIX.
+    """
+    return pc.pid_exists(pid)
 
 
 class TestRegistryIntegration:
@@ -401,15 +408,76 @@ class TestRegistryIntegration:
 
         monkeypatch.setattr(regmod, "InstancesRegistry", lambda *a, **k: reg)
 
-        rid = connect.register_instance("i-0abc", name="KiroCrew Cloud")
+        rid = connect.register_instance(
+            "i-0abc1234", name="Kiro Crew Cloud", profile="dev", region="us-west-2"
+        )
         assert rid is not None
-        assert any(i.ssh_host == "i-0abc" for i in reg.list())
+        # Registers over the native SSM transport, not the legacy ssh_host path.
+        inst = next(i for i in reg.list() if i.id == rid)
+        assert inst.connection_method == "ssm"
+        assert inst.ssm_target == "i-0abc1234"
+        assert inst.aws_profile == "dev"
+        assert inst.aws_region == "us-west-2"
+        assert inst.ssh_host == ""
 
-    def test_unregister_instance(self, monkeypatch, tmp_path):
+    def test_register_instance_is_idempotent_on_relaunch(self, monkeypatch, tmp_path):
         from kiro_crew.instances.registry import InstancesRegistry
 
         reg = InstancesRegistry(path=tmp_path / "instances.json")
-        reg.add(name="KiroCrew Cloud", ssh_host="i-0abc")
+        import kiro_crew.instances.registry as regmod
+
+        monkeypatch.setattr(regmod, "InstancesRegistry", lambda *a, **k: reg)
+
+        first = connect.register_instance("i-0abc1234", name="Kiro Crew Cloud")
+        assert first is not None
+        # Simulate persisted per-instance state a re-launch must NOT wipe:
+        # customized TTL, an allocated local port, and sticky connect intent.
+        reg.update(first, ttl="30m", local_port=5599, was_connected=True)
+
+        second = connect.register_instance("i-0abc1234", name="Kiro Crew Cloud")
+        # Re-launch updates in place: same id, no duplicate, state preserved.
+        assert second == first
+        matches = [i for i in reg.list() if i.ssm_target == "i-0abc1234"]
+        assert len(matches) == 1
+        rec = matches[0]
+        assert rec.ttl == "30m"
+        assert rec.local_port == 5599
+        assert rec.was_connected is True
+
+    def test_unregister_instance_empty_arg_is_noop(self, monkeypatch, tmp_path):
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+        import kiro_crew.instances.registry as regmod
+
+        monkeypatch.setattr(regmod, "InstancesRegistry", lambda *a, **k: reg)
+        # An SSM record (ssh_host="") and an SSH record (ssm_target="") coexist.
+        connect.register_instance("i-0abc1234", name="Kiro Crew Cloud")
+        reg.add(name="dev-box", ssh_host="dev-box")
+
+        # An empty needle must NOT match an empty transport field of either record.
+        assert connect.unregister_instance("") is False
+        assert len(reg.list()) == 2
+
+    def test_unregister_instance_ssm(self, monkeypatch, tmp_path):
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+        import kiro_crew.instances.registry as regmod
+
+        monkeypatch.setattr(regmod, "InstancesRegistry", lambda *a, **k: reg)
+
+        connect.register_instance("i-0abc1234", name="Kiro Crew Cloud")
+        # Removal matches on ssm_target (the native registration).
+        assert connect.unregister_instance("i-0abc1234") is True
+        assert not any(i.ssm_target == "i-0abc1234" for i in reg.list())
+
+    def test_unregister_instance_legacy_ssh_host(self, monkeypatch, tmp_path):
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+        # A box registered the old way (ssh_host = instance id) still unregisters.
+        reg.add(name="Kiro Crew Cloud", ssh_host="i-0abc")
         import kiro_crew.instances.registry as regmod
 
         monkeypatch.setattr(regmod, "InstancesRegistry", lambda *a, **k: reg)

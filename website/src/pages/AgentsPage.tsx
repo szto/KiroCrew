@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
-import { modelListRefetchInterval } from '../providers/modelListHealth'
 import { Star, StarOff, Brain, Plug, X, Pin, Package, Lock, Hourglass, Bot, ChevronDown } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { useAppSelector } from '../store'
@@ -14,6 +13,7 @@ import { LAYOUT } from '../components/layout'
 import InfoTip from '../components/InfoTip'
 import { useProvider } from '../providers'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
+import { useAvailableModels } from '../hooks/useAvailableModels'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { formatCost } from '../utils/formatCost'
 
@@ -35,6 +35,22 @@ function barGlow(pct: number): string {
 }
 
 interface CtxSession { key: string; name: string; model: string; agent?: string; context_pct: number; context_window_tokens?: number; prompts: number }
+
+/**
+ * A safe display string for an agent's `model`.
+ *
+ * The backend now coerces `model` to a string on both the installed-list and
+ * detail endpoints, but `api.agentDetail` is otherwise a pass-through of a
+ * user-editable JSON spec from a SHARED directory that other tools write into.
+ * A non-string that slips through (e.g. an ACP-style `{"id": "..."}`) rendered
+ * as a JSX child throws React error #31 and puts the whole Agent Templates tab
+ * into the error boundary — one bad file hiding every other agent. Belt and
+ * braces: anything that is not a string degrades to `auto` for that one row.
+ */
+function modelLabel(model: unknown): string {
+  return typeof model === 'string' && model ? model : 'auto'
+}
+
 
 /** Shape of an installed-agent list item (also the `api.agentsInstalled` element). */
 interface InstalledAgent {
@@ -119,15 +135,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
   const defaultAgent = defaultAgentData ?? ''
 
   const [selectedAgent, setSelectedAgent] = useState<AgentDetail | null>(null)
-  const { data: modelOptionsData } = useQuery({
-    queryKey: ['available-models', provider.id],
-    queryFn: async () => {
-      const models = await provider.fetchAvailableModels()
-      return [{ name: 'auto', description: 'Default' }, ...models.filter(x => x.name && x.name !== 'auto')]
-    },
-    refetchInterval: modelListRefetchInterval,
-  })
-  const modelOptions = modelOptionsData ?? []
+  const modelOptions = useAvailableModels()
   const { open: modelDropOpen, setOpen: setModelDropOpen, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(modelOptions)
   // Roving-focus keyboard nav for the model dropdown (shared with StyledSelect/AgentSelector).
   const { onListKeyDown: onModelListKeyDown } = useListboxKeyboard({
@@ -212,7 +220,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
                         <div className="flex items-center gap-2 min-w-0">
                           {a.skills.length > 0 && <span className="text-[11px] text-muted shrink-0"><Brain className="lucide-inline" />{a.skills.length}</span>}
                           {a.mcp_servers.length > 0 && <span className="text-[11px] text-muted shrink-0"><Plug className="lucide-inline" />{a.mcp_servers.length}</span>}
-                          <span className="text-[11px] text-muted font-mono truncate min-w-0" title={a.model}>{a.model}</span>
+                          <span className="text-[11px] text-muted font-mono truncate min-w-0" title={modelLabel(a.model)}>{modelLabel(a.model)}</span>
                         </div>
                         {/* The word carries the state: a bare star glyph gives a first-time
                             user nothing to read, so the default-agent control is labeled. */}
@@ -256,7 +264,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
                       <span className="text-sm font-mono font-bold text-text-strong">{selectedAgent.name}</span>
                       <div className="relative">
                         <Btn ref={modelBtnRef} className="flex items-center gap-1 px-2 py-0.5 text-[12px] font-mono font-medium" onClick={() => setModelDropOpen(!modelDropOpen)}>
-                          <span><Brain className="lucide-inline" /></span> {selectedAgent.model || 'auto'} <span className="text-muted text-[10px]"><ChevronDown className="lucide-inline" /></span>
+                          <span><Brain className="lucide-inline" /></span> {modelLabel(selectedAgent.model)} <span className="text-muted text-[10px]"><ChevronDown className="lucide-inline" /></span>
                         </Btn>
                         {modelDropOpen && modelBtnRef.current && createPortal(
                           // Presentational positioning wrapper: the interactive semantics live
@@ -269,7 +277,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
                               <Input ref={modelInputRef} type="text" aria-label={i18nT('pages.agentsPage.filter_models')} placeholder={i18nT('pages.agentsPage.type_to_filter')} value={modelFilter} onChange={e => setModelFilter(e.target.value)} className="w-full px-2 py-1 text-[13px] font-mono" />
                             </div>
                             <div role="listbox" aria-label={i18nT('pages.agentsPage.model_list')} className="overflow-y-auto flex-1 min-h-0">
-                            <ModelDropdownList models={filteredModels} activeModel={selectedAgent.model || 'auto'} onSelect={name => { const val = name === 'auto' ? '' : name; patchModelMut.mutate({ name: selectedAgent.name, model: val }); setModelDropOpen(false) }} />
+                            <ModelDropdownList models={filteredModels} activeModel={modelLabel(selectedAgent.model)} onSelect={name => { const val = name === 'auto' ? '' : name; patchModelMut.mutate({ name: selectedAgent.name, model: val }); setModelDropOpen(false) }} />
                             </div>
                           </div>,
                           document.body
@@ -278,7 +286,11 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
                       {(() => { const a = installed.find(a => a.name === selectedAgent.name); return a?.package ? <span className="text-[11px] text-aim bg-aim/10 px-2 py-0.5 rounded-md border border-aim/30">{a.filename?.startsWith('local-') ? <Pin className="lucide-inline" /> : <Package className="lucide-inline" />} {a.package}</span> : null })()}
                     </div>
                   </div>
-                  {selectedAgent.description && <div className="text-[13px] text-muted mb-3 leading-relaxed">{selectedAgent.description}</div>}
+                  {/* `typeof` guard, not a bare truthiness check: an object is
+                      truthy, so a foreign spec's structured `description` would
+                      pass `&&` and then throw React error #31 as a JSX child —
+                      the same whole-tab crash `modelLabel` guards on `model`. */}
+                  {typeof selectedAgent.description === 'string' && selectedAgent.description && <div className="text-[13px] text-muted mb-3 leading-relaxed">{selectedAgent.description}</div>}
                   {selectedAgent.skills === undefined ? (
                     /* The agent-detail fetch failed, so the real mapping is
                      * UNKNOWN. An empty-but-enabled editor here is destructive:
@@ -331,7 +343,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
         )}
         {/* Context Window Usage */}
         <div className="card-glow border border-border bg-card rounded-lg p-5 mb-4 animate-rise shadow-sm transition-all">
-          <h3 className="text-sm font-semibold text-text-strong mb-3.5 flex items-center gap-1.5">{i18nT('pages.agentsPage.context_window_usage')} <InfoTip text={`Live context window utilization per active ${provider.labels.sessionProcess} session. Custom agents show their configured model. Compaction triggers at 90%.`} /></h3>
+          <h3 className="text-sm font-semibold text-text-strong mb-3.5 flex items-center gap-1.5">{i18nT('pages.agentsPage.context_window_usage')} <InfoTip text={i18nT('pages.agentsPage.context_window_usage_tip', { label: provider.labels.sessionProcess })} /></h3>
           {ctx.length === 0 ? <p className="text-muted italic text-sm">{i18nT('pages.agentsPage.no_active_sessions')}</p> : (
             <div className="space-y-4">
               {ctx.map(s => {
@@ -382,7 +394,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
         {usage && (
           <div className="card-glow border border-border bg-card rounded-lg p-5 mb-4 animate-rise shadow-sm transition-all">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-sm font-semibold text-text-strong flex items-center gap-1.5">{provider.displayName} {i18nT('pages.agentsPage.usage')} <InfoTip text={`${provider.displayName} consumption for the current billing period. Cached 10 min.`} /></h3>
+              <h3 className="text-sm font-semibold text-text-strong flex items-center gap-1.5">{provider.displayName} {i18nT('pages.agentsPage.usage')} <InfoTip text={i18nT('pages.agentsPage.consumption_for_current_billing_period', { provider: provider.displayName })} /></h3>
               <div className="flex items-center gap-2">
                 {usage.plan && <span className="px-2 py-0.5 rounded-full text-[12px] font-bold font-mono bg-accent/15 text-accent border border-accent/30">{usage.plan}</span>}
                 {usage.resets && <span className="text-[12px] text-muted">{i18nT('pages.agentsPage.resets')} {usage.resets}</span>}
@@ -427,7 +439,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
             <tbody>{agents.length === 0 ? <tr><td colSpan={4}><EmptyState icon={<Bot className="lucide-inline" />} title={i18nT('pages.agentsPage.no_subagents')} subtitle={i18nT('pages.agentsPage.spawn_tasks_from_chat_or_cli')} /></td></tr> : agents.map(a => (
               <tr key={a.id} className="hover:bg-bg-hover transition-colors"><td className="px-2.5 py-2 border-b border-border text-sm"><code>{a.id}</code></td><td className="px-2.5 py-2 border-b border-border text-sm">{a.task}</td>
                 <td className="px-2.5 py-2 border-b border-border text-sm">{a.done ? (a.error ? <span className="inline-flex items-center gap-1 px-2 py-[2px] rounded-full text-[13px] font-medium font-mono bg-danger-subtle text-danger">{i18nT('pages.agentsPage.failed')}</span> : <span className="inline-flex items-center gap-1 px-2 py-[2px] rounded-full text-[13px] font-medium font-mono bg-ok-subtle text-ok">{i18nT('pages.agentsPage.done')}</span>) : <span className="inline-flex items-center gap-1 px-2 py-[2px] rounded-full text-[13px] font-medium font-mono bg-warn-subtle text-warn">{i18nT('pages.agentsPage.running')}</span>}</td>
-                <td className="px-2.5 py-2 border-b border-border text-sm text-right"><button className="px-1.5 py-0.5 rounded border border-border bg-transparent text-muted text-[13px] cursor-pointer hover:text-danger hover:border-danger transition-all" aria-label={`Delete subagent ${a.id}`} onClick={() => spawnDeleteMut.mutate(a.id)}><X className="lucide-inline" /></button></td></tr>
+                <td className="px-2.5 py-2 border-b border-border text-sm text-right"><button className="px-1.5 py-0.5 rounded border border-border bg-transparent text-muted text-[13px] cursor-pointer hover:text-danger hover:border-danger transition-all" aria-label={i18nT('pages.agentsPage.delete_subagent', { id: a.id })} onClick={() => spawnDeleteMut.mutate(a.id)}><X className="lucide-inline" /></button></td></tr>
             ))}</tbody></table>
         </div>
       </div>

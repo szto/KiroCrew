@@ -32,6 +32,7 @@
 import { describe, it, expect, afterEach } from 'vitest'
 
 import { i18next } from './index'
+import { SUPPORTED_LANGUAGES } from './languages'
 import {
   activeLocale,
   collator,
@@ -150,10 +151,9 @@ describe('fmtCurrency', () => {
 
 describe('fmtUnit', () => {
   it('formats durations and sizes without Intl.DurationFormat', () => {
-    // DurationFormat is undefined on the Node 20 baseline; this is the
-    // replacement path, and this assertion is what would catch a future
-    // refactor reaching for the unavailable API.
-    expect(typeof (Intl as { DurationFormat?: unknown }).DurationFormat).toBe('undefined')
+    // DurationFormat may or may not exist depending on the Node version;
+    // fmtUnit uses NumberFormat's `unit` style regardless, so the golden
+    // outputs must hold either way.
     expect(fmtUnit(1.5, 'second', { maximumFractionDigits: 1 })).toBe('1.5s') // golden (en)
     expect(fmtUnit(90, 'minute')).toBe('90m') // golden (en)
     expect(fmtUnit(512, 'megabyte')).toBe('512MB') // golden (en)
@@ -205,7 +205,7 @@ describe('fmtDate / fmtTime / fmtDateTime / the numeric widths', () => {
     //
     // Asserted against the platform call itself rather than a golden literal, so
     // a CLDR data change moves both sides together instead of turning this red.
-    for (const code of ['en', 'zh-CN', 'de', 'es', 'fr', 'it', 'pt', 'ru', 'hi', 'bn']) {
+    for (const code of SUPPORTED_LANGUAGES.filter(l => !l.devOnly).map(l => l.code)) {
       await withLanguage(code, () => {
         const tag = activeLocale()
         expect(fmtDateNumeric(INSTANT), `${code} date`)

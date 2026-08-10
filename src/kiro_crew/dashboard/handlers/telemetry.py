@@ -38,8 +38,11 @@ from aiohttp import web
 from kiro_crew import __version__, beacon
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.paths import config_dir
-from kiro_crew.dashboard.handlers.usage import context_occupancy, context_trace
+from kiro_crew.dashboard.chat_utils import slot_transcript_key
+from kiro_crew.dashboard.handlers.usage import context_occupancy, context_trace, cost_breakdown
+from kiro_crew.dashboard.state import NEW_SESSION_TITLE
 from kiro_crew.hooks import validate_file_path
+from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,11 @@ _TURN_METRIC = "kirocrew.turn.duration"
 # all, so an absent phase is treated as the total (see _aggregate).
 _PHASE_TOTAL = "total"
 _WINDOW_DAYS = 14
+
+# Spend is compared against the preceding period of the same length, so the
+# window is a week: "more or less than last week" is the question, and a
+# 14-day window would have no equal-length predecessor inside the retention.
+_COST_WINDOW_DAYS = 7
 
 # Attribute keys the generic ``other`` histograms are additionally split on, so
 # one side of a split can be reported on its own.
@@ -552,26 +560,43 @@ def _context_block() -> dict[str, Any] | None:
     return block if block.get("turns") else None
 
 
+def _cost_block() -> dict[str, Any] | None:
+    """Per-turn spend attribution, or None when nothing is recorded.
+
+    Best-effort for the same reason as :func:`_context_block`: an unreadable row
+    store must not take the OTEL sections down with it.
+    """
+    try:
+        block = cost_breakdown(_COST_WINDOW_DAYS)
+    except Exception:
+        logger.debug("cost breakdown aggregation failed", exc_info=True)
+        return None
+    return block if block.get("turns") else None
+
+
 async def api_telemetry_startup(request: web.Request) -> web.Response:
     """GET /api/telemetry/startup — session-startup latency + all kirocrew.* metrics.
 
     Returns ``enabled`` (telemetry main switch), ``window_days``, ``shard_count``,
     a detailed ``startup`` block (overall/cold/warm p50/p90 + outcome + daily +
     internal phase split), a ``context`` block (per-turn context-window
-    occupancy), and a generic ``other`` list surfacing every other emitted
-    kirocrew.* metric.
+    occupancy), a ``cost`` block (spend attribution), and a generic ``other``
+    list surfacing every other emitted kirocrew.* metric.
 
-    ``context`` is sourced from the per-turn token row store, NOT from the OTEL
-    shards: occupancy is a per-session ratio and slot keys are unbounded-
-    cardinality, which is exactly what must not become a metric label. It is
-    reported here anyway because "how full is the window" belongs next to the
-    other per-turn health signals rather than on a separate page. It is
-    independent of the telemetry main switch — those rows are always written —
-    so it is fetched even when OTEL export is off.
+    ``context`` and ``cost`` are sourced from the per-turn token row store, NOT
+    from the OTEL shards: occupancy is a per-session ratio and slot keys are
+    unbounded-cardinality, which is exactly what must not become a metric label.
+    They are reported here anyway because "how full is the window" and "what did
+    it cost" belong next to the other per-turn health signals rather than on a
+    separate page. Both are independent of the telemetry main switch — those rows
+    are always written — so they are fetched even when OTEL export is off.
     """
     enabled, directory = _telemetry_cfg()
     data = await asyncio.to_thread(_parse_startup_metrics)
     context = await asyncio.to_thread(_context_block)
+    cost = await asyncio.to_thread(_cost_block)
+    if cost:
+        cost = await _with_conversation_titles(request, cost)
     return web.json_response(
         {
             "enabled": enabled,
@@ -581,6 +606,7 @@ async def api_telemetry_startup(request: web.Request) -> web.Response:
             "startup": data.get("startup"),
             "turn": data.get("turn"),
             "context": context,
+            "cost": cost,
             "other": data.get("other", []),
         }
     )
@@ -605,6 +631,113 @@ async def api_context_trace(request: web.Request) -> web.Response:
         )
     trace = await asyncio.to_thread(context_trace, slot, _WINDOW_DAYS)
     return web.json_response(trace)
+
+
+def _persisted_titles(conversation_log: Any, slot_keys: list[str]) -> dict[str, str]:
+    """Read the persisted title for each of *slot_keys*. Blocking; call off-loop.
+
+    ``get_metadata`` rather than ``list_sessions``: the latter falls back to the
+    first user message and then to the session key when the metadata line names
+    no title, which would turn a ranking label into prompt text and leave no way
+    to tell a named conversation from an unnamed one. Only an explicit
+    ``metadata["title"]`` counts here, which is the same thing the live slot
+    carries.
+
+    Keyed by SLOT key on the way out, so the caller never has to know how a slot
+    maps onto a transcript. Distinct slots can share one transcript (a
+    channel-born slot's conversation IS the channel's), so the read is
+    deduplicated by transcript key rather than by slot.
+    """
+    by_transcript: dict[str, str] = {}
+    out: dict[str, str] = {}
+    for slot_key in slot_keys:
+        try:
+            transcript_key = slot_transcript_key(slot_key)
+        except Exception:  # pragma: no cover — a key shape no rule recognises
+            continue
+        if transcript_key not in by_transcript:
+            try:
+                meta = conversation_log.get_metadata(transcript_key) or {}
+            except Exception:
+                logger.debug("no persisted title for %s", transcript_key, exc_info=True)
+                meta = {}
+            by_transcript[transcript_key] = str(meta.get("title") or "")
+        title = by_transcript[transcript_key]
+        if title and title != NEW_SESSION_TITLE:
+            out[slot_key] = title
+    return out
+
+
+async def _with_conversation_titles(request: web.Request, cost: dict[str, Any]) -> dict[str, Any]:
+    """Attach a redacted human title to each ranked conversation, where known.
+
+    A title is resolved from the live slot first, so a rename is reflected before
+    it has been persisted. A conversation the user has since closed has no slot,
+    and its title is read back from the transcript's metadata line instead —
+    without that fallback the longer the window, the more of the ranking renders
+    unnamed, which is backwards for the question the window exists to answer.
+
+    A row with neither still reports an absent title rather than the raw key,
+    leaving the frontend to decide how to render an unnamed row.
+
+    ``display_title`` is LLM-authored (``chat_title._generate_title_via_kiro``),
+    so it carries the same two scanners the slot's own serialization applies at
+    ``_ChatSlot.to_dict``. This endpoint is a SECOND serialization boundary for
+    that field, and the scan is load-bearing rather than duplicated: a title set
+    through ``api_chat_slot_resume`` is written to the slot unredacted, so
+    nothing upstream of here has sanitised it. A persisted title takes the same
+    path, so where it came from cannot change what leaves here.
+
+    The metadata reads are the only blocking work, and they run in a thread: the
+    surrounding handler already offloads its three other blocks, and this one is
+    bounded by the ranked rows (``_COST_TOP_CONVOS``) rather than by the number
+    of sessions on disk.
+
+    Rows are copied before the title is attached. ``cost_breakdown`` hands back
+    its memoised object by reference, so writing into the row would store the
+    title in module-global cache and keep serving it for the rest of the TTL
+    after the conversation was renamed or closed.
+    """
+    try:
+        state = request.app["state"]
+    except KeyError:
+        return cost
+    # ``get_slot`` is the only public way in: the slot map itself is private
+    # (``DashboardState._slots``), so reaching for a ``slots`` attribute silently
+    # resolves nothing and every row renders unnamed.
+    get_slot = getattr(state, "get_slot", None)
+    if not callable(get_slot):
+        return cost
+
+    conversations = cost.get("conversations") or []
+    titles: dict[str, str] = {}
+    unresolved: list[str] = []
+    for row in conversations:
+        slot_key = str(row.get("slot") or "")
+        if not slot_key:
+            continue
+        slot = get_slot(slot_key)
+        title = getattr(slot, "display_title", "") if slot is not None else ""
+        if title and title != NEW_SESSION_TITLE:
+            titles[slot_key] = str(title)
+        elif slot_key not in titles:
+            unresolved.append(slot_key)
+
+    conversation_log = getattr(state, "conversation_log", None)
+    if unresolved and conversation_log is not None:
+        titles.update(
+            await asyncio.to_thread(_persisted_titles, conversation_log, unresolved)
+        )
+
+    rows = []
+    for row in conversations:
+        title = titles.get(str(row.get("slot") or ""))
+        if title:
+            safe, _ = redact_exfiltration_urls(title)
+            safe, _ = redact_credentials(safe)
+            row = {**row, "title": safe}
+        rows.append(row)
+    return {**cost, "conversations": rows}
 
 
 def _beacon_overlay_pins_value() -> bool:

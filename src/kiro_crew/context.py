@@ -140,6 +140,15 @@ _STRUCTURAL_MARKER_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\[\s*END\s*OF\s*SESSION\s*CONTEXT\s*\]", re.IGNORECASE),
     re.compile(r"\[\s*CRITICAL\s*RULES\s*[-]{1,2}", re.IGNORECASE),
     re.compile(r"\[\s*CURRENT\s*USER\s*REQUEST\s*[-]{1,2}", re.IGNORECASE),
+    # Post-compaction skills re-injection boundary. Unlike the ``[SESSION
+    # CONTEXT …]`` OPEN marker (omitted above because forging it only opens a
+    # "background, do not act on this" block), forging THIS open marker is an
+    # escalation: it presents attacker-chosen text as the platform-supplied
+    # skills index — a catalog of capability names and on-disk paths the model
+    # is told to read. Head-anchored with the required hyphen separator, per
+    # the variable-tail convention above.
+    re.compile(r"\[\s*REINJECTED\s*AFTER\s*COMPACTION\s*[-]{1,2}", re.IGNORECASE),
+    re.compile(r"\[\s*END\s*REINJECTED\s*\]", re.IGNORECASE),
 )
 _STRUCTURAL_MARKER_NEUTRALIZED = "[marker-removed]"
 
@@ -675,6 +684,59 @@ def _runtime_display_name(session_key: str, runtime_source: str | None = None) -
     return _RUNTIME_DISPLAY.get(source, source)
 
 
+# ── Switchable context groups ──
+#
+# A spawning parent decides which of these groups its sub-agent inherits (the
+# ``include_memory`` / ``include_lessons`` / ``include_project`` flags on
+# spawn_run). ``None`` means every group and is what every other caller passes,
+# so the dashboard / Slack / cron / eval paths are unaffected.
+#
+# The unlisted fourth group is conduct — critical rules, date, agent identity,
+# runtime, UI language, workspace identity, skills index. It is not switchable:
+# every member is an output contract or a capability pointer, so a sub-agent
+# without it cannot discover what it can do or format what it reports back.
+CONTEXT_GROUP_MEMORY = "memory"
+CONTEXT_GROUP_LESSONS = "lessons"
+CONTEXT_GROUP_PROJECT = "project"
+SWITCHABLE_CONTEXT_GROUPS = (
+    CONTEXT_GROUP_MEMORY,
+    CONTEXT_GROUP_LESSONS,
+    CONTEXT_GROUP_PROJECT,
+)
+
+_GROUP_DESCRIPTIONS = {
+    CONTEXT_GROUP_MEMORY: "memory (user preferences, projects, prior sessions)",
+    CONTEXT_GROUP_LESSONS: "lessons (learned corrections, user profile)",
+    CONTEXT_GROUP_PROJECT: "project (docs pointer, steering files, project directory)",
+}
+
+
+def _group_included(groups: frozenset[str] | None, group: str) -> bool:
+    """True when *group* is in scope; ``None`` ⇒ every group."""
+    return groups is None or group in groups
+
+
+def _build_context_scope_section(groups: frozenset[str] | None) -> str:
+    """Name the groups a parent withheld, or ``""`` when nothing was withheld.
+
+    A sub-agent that silently lacks a group guesses at what it cannot see —
+    inventing user preferences is the specific failure. Naming the gap converts
+    that into an honest "not provided", which is what makes an aggressive
+    opt-out cheap to recover from.
+    """
+    if groups is None:
+        return ""
+    missing = [g for g in SWITCHABLE_CONTEXT_GROUPS if g not in groups]
+    if not missing:
+        return ""
+    return (
+        "[CONTEXT SCOPE] Your parent withheld: "
+        + "; ".join(_GROUP_DESCRIPTIONS[g] for g in missing)
+        + ".\nIf the task needs any of it, say it was not provided and ask the "
+        "parent — do not guess.\n[End of context scope]\n\n"
+    )
+
+
 def _build_docs_section() -> str:
     """Build a lightweight docs pointer for session context.
 
@@ -729,20 +791,43 @@ def _sanitize_free_text_role(raw: str) -> str:
     [USER PROFILE] block — every other value is a slug the UI picks — so it is
     the only one that could carry newlines and bracket markers shaped like the
     block delimiters the model is taught to trust. Whitespace (including
-    newlines and tabs) is collapsed to single spaces, C0/C1 control characters
-    and square brackets are dropped, and the result is length-capped. A value
-    that sanitizes to nothing is treated as unset rather than rendered empty.
+    newlines and tabs) is collapsed to single spaces, every character outside
+    :func:`_is_allowed_role_char` is dropped, and the result is length-capped. A
+    value that sanitizes to nothing is treated as unset rather than rendered
+    empty.
     """
     if not raw:
         return ""
-    cleaned = "".join(" " if ch.isspace() else "" if _is_unsafe_role_char(ch) else ch for ch in raw)
+    cleaned = "".join(ch if not ch.isspace() and _is_allowed_role_char(ch) else " " for ch in raw)
     cleaned = " ".join(cleaned.split())
     return cleaned[:_ROLE_OTHER_MAX_LEN].strip()
 
 
-def _is_unsafe_role_char(ch: str) -> bool:
-    """True for characters that must never reach the prompt from free text."""
-    return ch in "[]" or unicodedata.category(ch) in ("Cc", "Cf", "Co", "Cs")
+#: Punctuation a job title legitimately needs. ``#`` earns its place from real
+#: titles ("C# Developer"), as ``+`` does for "C++". Deliberately excludes ``:`` —
+#: ``LABEL:`` is the shape the protocol markers themselves use — and every
+#: bracket form.
+_ROLE_PUNCT_ALLOWED = "-'.,/&()+_#"
+
+
+def _is_allowed_role_char(ch: str) -> bool:
+    """True for the only characters free text may contribute to the prompt.
+
+    An ALLOWLIST, per BSC1 Input Validation: a denylist of known-bad characters
+    is always incomplete, and this one was. The previous version dropped ASCII
+    ``[`` and ``]`` but passed every Unicode lookalike — ``】`` U+3011, ``］``
+    U+FF3D, ``〕`` U+3015 and others — each of which renders as a bracket and so
+    could still impersonate a ``[BLOCK]`` delimiter in the assembled prompt.
+    Inverting the test closes that whole tail instead of three codepoints.
+
+    Letters and combining marks are admitted by Unicode category rather than an
+    ASCII range, so a non-Latin job title survives; the product ships ten UI
+    locales and a Latin-only filter would silently blank those users' input.
+    """
+    if ch in _ROLE_PUNCT_ALLOWED:
+        return True
+    category = unicodedata.category(ch)
+    return category.startswith("L") or category.startswith("M") or category == "Nd"
 
 
 def _role_description(cfg: "KiroCrewConfig") -> str:
@@ -1245,6 +1330,24 @@ def build_session_replay(
     return replay.translate(_MULTIBYTE_TABLE)
 
 
+def _skills_injection_plan(agent: str | None, *, is_cc: bool) -> tuple[bool, list[str]]:
+    """Whether to inject skills for *agent*, plus the glob restriction to apply.
+
+    THE single source of truth for the agent-scoping rule, shared by the
+    session-start injection and the post-compaction re-injection. Mapped agents
+    (a ``skill://`` resource in their agent JSON) are Claude-Code-only, since
+    kiro loads those natively; an unmapped agent gets skills only when it is the
+    default one.
+
+    Deliberately one function rather than the same expression written twice: a
+    hand-copied second gate is exactly what let the re-injection path ship
+    without scoping, handing a mapped agent the catalog its mapping excludes.
+    """
+    globs = agent_skill_globs(agent) if agent else []
+    is_custom = bool(agent) and agent != "kirocrew"
+    return (is_cc if globs else not is_custom), globs
+
+
 class ContextBuilder:
     """Builds context for injection into ACP prompts.
 
@@ -1347,7 +1450,46 @@ class ContextBuilder:
         # Resolved before the dashboard-only widget branch below so it reaches
         # every session. When "default", nothing is injected (zero prompt bloat).
         verbosity = getattr(cfg.dashboard, "verbosity", "default")
-        if verbosity == "concise":
+        if verbosity == "ultra":
+            verbosity_block = (
+                "## Response Verbosity: Ultra-Brief (ADHD reader)\n\n"
+                "Before responding, simulate the reader: they will read the "
+                "first 2 sentences, scan for bold text and code blocks, then "
+                "close the tab. Anything they won't reach is wasted tokens. "
+                "Structure for THAT reader, not an attentive one.\n\n"
+                "You have a strong bias toward completeness. Override it. The "
+                "reader's time costs more than your thoroughness. An answer "
+                "that's 80% complete in 2 lines beats 100% complete in 20 "
+                "lines. Missing a caveat is acceptable. Missing an edge case "
+                "is acceptable.\n\n"
+                "Rules:\n"
+                "- Open with THE answer in 1–2 sentences. Bold the single most "
+                "critical point.\n"
+                "- Supporting bullets only if the reader would be STUCK without "
+                "them. Max 3. Each bullet is one short sentence.\n"
+                "- Take a position. Name your pick. Resolve \"it depends\" "
+                "immediately.\n"
+                "- Do NOT add: tables, headers, numbered lists > 3 items, "
+                "\"common pitfalls\", \"also consider\", multi-section layouts, "
+                "or any content that fails the test: \"would the reader be "
+                "stuck without this line?\"\n"
+                "- Code blocks and commands are the answer — never cut them.\n"
+                "- Never compress for brevity: security warnings, "
+                "irreversible-action confirmations, and ordered multi-step "
+                "instructions where a dropped step causes a mistake. Those "
+                "stay complete, and code, commands, paths, identifiers and "
+                "error strings stay verbatim.\n"
+                "- When the user ASKS for something long (design doc, tutorial, "
+                "full implementation), ignore these constraints and deliver "
+                "what was asked.\n"
+                "- Required output formats are sacred and never cut: "
+                "[OPTIONS:] lines, diff blocks for file changes, full PR/MR "
+                "URLs, security warnings, and any format the rendering surface "
+                "needs. These go in their required position regardless of "
+                "brevity.\n"
+                "- Preserve the user's language."
+            )
+        elif verbosity == "concise":
             verbosity_block = (
                 "## Response Verbosity: Concise\n\n"
                 "Concise mode is on. Reduce length without losing substance:\n"
@@ -1465,6 +1607,7 @@ class ContextBuilder:
         runtime_source: str | None = None,
         exclude_last_n: int = 0,
         model_window: int | None = None,
+        context_groups: frozenset[str] | None = None,
     ) -> str:
         """Build context for a new session (memory + skills + history).
 
@@ -1496,6 +1639,15 @@ class ContextBuilder:
         duplicate what kiro already loaded; the CC backend (claude-agent-acp)
         does NOT read agent ``resources`` and still needs the explicit load.
         Everything else stays at CC/ACP parity.
+
+        *context_groups* selects which switchable groups are injected (see
+        ``SWITCHABLE_CONTEXT_GROUPS``). ``None`` — every caller except a
+        sub-agent whose parent opted a group out — injects all of them, so the
+        output is unchanged. Omitting a group skips its sections entirely rather
+        than capping them to zero: a zero cap yields a truncation marker, not an
+        empty string. A sub-agent that had a group withheld is told so by name
+        (``_build_context_scope_section``) so it reports the gap instead of
+        guessing.
 
         For custom agents (non-kirocrew), skills and workspace identity
         are skipped — the agent loads its own via kiro-cli. Memory,
@@ -1589,9 +1741,14 @@ class ContextBuilder:
         # never picked a language explicitly.
         parts.append(_build_ui_language_section(_cfg))
 
-        profile_ctx = _build_user_profile_section(_cfg)
-        if profile_ctx:
-            parts.append(profile_ctx)
+        # Name any group the parent withheld, before the sections themselves, so
+        # the sub-agent reads the scope as framing rather than discovering a gap.
+        parts.append(_build_context_scope_section(context_groups))
+
+        if _group_included(context_groups, CONTEXT_GROUP_LESSONS):
+            profile_ctx = _build_user_profile_section(_cfg)
+            if profile_ctx:
+                parts.append(profile_ctx)
 
         # Workspace identity — kirocrew-only (custom agents don't use workspaces)
         if not is_custom:
@@ -1614,7 +1771,7 @@ class ContextBuilder:
             )
 
         # Documentation pointer — kirocrew-only, lightweight reference
-        if not is_custom:
+        if not is_custom and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
             docs_ctx = _build_docs_section()
             if docs_ctx:
                 parts.append(docs_ctx)
@@ -1634,7 +1791,7 @@ class ContextBuilder:
         # (claude-agent-acp) does NOT read agent ``resources``, so only it needs
         # the explicit load. Injecting on the ACP/kiro backend would duplicate
         # what kiro-cli already loaded.
-        if not is_custom and is_cc:
+        if not is_custom and is_cc and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
             steering_ctx = _load_steering_resources()
             if steering_ctx:
                 if lazy_skills and len(steering_ctx) > caps.steering:
@@ -1724,7 +1881,7 @@ class ContextBuilder:
         # Temporary sessions skip all memory reads.
         mem_key = memory_store or workspace
         memory = self.get_memory_for(mem_key)
-        if not blocks_reads:
+        if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_MEMORY):
             memory_ctx = memory.get_context(
                 prefs_cap=caps.prefs,
                 projects_cap=caps.projects,
@@ -1752,9 +1909,9 @@ class ContextBuilder:
         # on-demand skills (plus always:true pinned) and leave the tail to
         # skill_search, keeping the block bounded instead of dumping every
         # skill's summary. The slice below is a defensive backstop only.
-        skill_globs = agent_skill_globs(agent) if agent else []
         # Mapped: CC only (kiro loads them natively). Unmapped: kirocrew only.
-        inject_skills = is_cc if skill_globs else not is_custom
+        # Shared with the post-compaction re-injection in build_message.
+        inject_skills, skill_globs = _skills_injection_plan(agent, is_cc=is_cc)
         if inject_skills:
             # ON: usage-ranked top-K bounded by the skills section cap.
             # OFF (budget=None): legacy full skills dump, unchanged behavior.
@@ -1770,7 +1927,7 @@ class ContextBuilder:
         # Lessons: merge global + workspace-scoped — inject for ALL agents
         # (skipped for temporary sessions)
         lessons_ctx = ""
-        if not blocks_reads:
+        if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_LESSONS):
             # One query, not two: get_lessons_context() already returns "" when the
             # store holds no lessons, so a separate get_lessons() existence probe
             # would be a duplicate SELECT * over the same rows (embedding blobs
@@ -1819,7 +1976,12 @@ class ContextBuilder:
                 parts.append(lessons_ctx)
 
         # Provenance-tagged entries from recent sessions (skipped for temporary)
-        if session_key and self.conversation_log and not blocks_reads:
+        if (
+            session_key
+            and self.conversation_log
+            and not blocks_reads
+            and _group_included(context_groups, CONTEXT_GROUP_MEMORY)
+        ):
             provenance = self.conversation_log.recent_with_provenance(
                 session_key, exclude_last_n=exclude_last_n
             )
@@ -1881,6 +2043,8 @@ class ContextBuilder:
         model_window: int | None = None,
         user_text_range: tuple[int, int] | None = None,
         user_span_out: list[int] | None = None,
+        needs_reinjection: bool = False,
+        context_groups: frozenset[str] | None = None,
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
 
@@ -1964,6 +2128,7 @@ class ContextBuilder:
                 runtime_source=runtime_source,
                 exclude_last_n=exclude_last_n,
                 model_window=model_window,
+                context_groups=context_groups,
             )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in
@@ -2014,6 +2179,40 @@ class ContextBuilder:
                 "authoritative for this turn, even if the session originated on "
                 "another interface.\n\n"
             )
+
+        # Post-compaction re-injection: the skills index was lost when the
+        # session-start context was compacted. Re-inject it so the model can
+        # still discover skills by name/$token/skill_search.
+        #
+        # Gate and glob restriction come from the SAME helper the session-start
+        # path uses, so a mapped agent cannot receive the catalog its `skill://`
+        # mapping excludes and an unmapped custom agent cannot receive a block
+        # its session-start context never contained.
+        if not is_new_session and needs_reinjection:
+            _inject, _globs = _skills_injection_plan(agent, is_cc=is_cc)
+            if _inject:
+                _cfg = KiroCrewConfig.load()
+                lazy_skills = bool(getattr(_cfg.skills, "lazy_load", False))
+                caps = _resolve_caps(model_window)
+                skills_ctx = self.skills.get_context(
+                    budget=caps.skills if lazy_skills else None,
+                    only=_globs or None,
+                )
+                if skills_ctx:
+                    if lazy_skills and len(skills_ctx) > caps.skills:
+                        skills_ctx = skills_ctx[: caps.skills] + "\n...[skills truncated]\n"
+                    # Scrub the PAYLOAD, keep the trusted wrapper outside it —
+                    # the same split the session-start path uses for this exact
+                    # content. A pinned (`always: true`) skill has its full body
+                    # emitted verbatim, and skills install from the public
+                    # registry, so a body carrying a forged `[END REINJECTED]` +
+                    # `[CURRENT USER REQUEST …]` pair would otherwise break out
+                    # of this block and read as an authoritative user request.
+                    parts.append(
+                        "[REINJECTED AFTER COMPACTION — skills index for discovery]\n"
+                        + _neutralize_structural_markers(skills_ctx)
+                        + "\n[END REINJECTED]\n\n"
+                    )
 
         # Channel history — inject on every message for group channel context
         ch_ctx: str | None = None
@@ -2126,6 +2325,8 @@ class ContextBuilder:
             logger.info("🔍 Minimal context — episodic memory skipped")
         elif blocks_reads:
             logger.info("🔍 Temporary session — episodic memory skipped")
+        elif not _group_included(context_groups, CONTEXT_GROUP_MEMORY):
+            logger.info("🔍 Memory group withheld by parent — episodic memory skipped")
         elif is_new_session:
             memory = self.get_memory_for(memory_store or workspace)
             if memory.vector_store:
@@ -2150,7 +2351,7 @@ class ContextBuilder:
 
         # Project context — inject on every message so the LLM always knows
         # the active project, even when set/changed after session start.
-        if project:
+        if project and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
             parts.append(
                 f"[PROJECT] Active project directory: {project}\n"
                 "This is the codebase you are working in for this session. "
@@ -2192,16 +2393,41 @@ class ContextBuilder:
                 "the same folder are likely about the same work.\n\n"
             )
 
-        # Triggered skills (on-demand, any message) — skip for custom agents
+        # Triggered skills (on-demand, any message) — skip for custom agents.
+        # A match injects the skill's full body by DEFAULT, unchanged. A skill
+        # that declares itself an offer rather than a mandate opts out with
+        # `inject_on_trigger: false` and contributes a pointer line instead:
+        # word-overlap matching pulls in large unrelated skills often enough
+        # that body price per match is the largest single block of assembled
+        # context, and ACP replays native history so a body already sent earlier
+        # in the conversation is still in the window.
         if not is_custom and not minimal_context:
             triggered = self.skills.get_triggered_skills(text)
             if triggered:
-                logger.info("Triggered skills: %s", ", ".join(triggered))
-            for name in triggered:
-                content = self.skills.load_skill(name)
-                if content:
-                    stripped = self.skills.strip_frontmatter(content)
-                    parts.append(f"[Skill: {name}]\n{stripped}\n[End of skill]\n\n")
+                enforced, pointer_only = self.skills.split_triggered(triggered)
+                # Log the split, not just the match: a pointed-at skill the
+                # agent declines to read leaves no other trace, so without this
+                # "the skill stopped being followed" is indistinguishable from
+                # "the skill never matched".
+                logger.info(
+                    "Triggered skills: %s (bodies=%s pointers=%s)",
+                    ", ".join(triggered),
+                    ", ".join(enforced) or "-",
+                    ", ".join(pointer_only) or "-",
+                )
+                for name in enforced:
+                    content = self.skills.load_skill(name)
+                    if content:
+                        stripped = self.skills.strip_frontmatter(content)
+                        parts.append(f"[Skill: {name}]\n{stripped}\n[End of skill]\n\n")
+                        # Record use only when the body is actually delivered --
+                        # a trigger match that never reaches the prompt (false
+                        # positive, pointer-only, or undelivered) must not earn
+                        # ranking weight in the lazy-load hotness ledger.
+                        self.skills._record_use(name)
+                hint = self.skills.trigger_hint(pointer_only)
+                if hint:
+                    parts.append(hint)
 
         # Hook-injected context — apply to all agents
         if hook_result.action == HOOK_INJECT_CONTEXT:

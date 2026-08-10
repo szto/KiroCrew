@@ -52,8 +52,10 @@ from kiro_crew.autonudge import (
 from kiro_crew.autonudge import enabled as autonudge_enabled
 from kiro_crew.autonudge import (
     is_channel_key,
+    runtime_budget_exceeded,
 )
 from kiro_crew.channel_history import ChannelHistory
+from kiro_crew.channels import builtin_channel_descriptors
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     CRED_DISCORD_BOT_TOKEN,
@@ -82,8 +84,11 @@ from kiro_crew.cron_script import resolve_script_path, run_command_sandboxed, ru
 from kiro_crew.dashboard import start_dashboard
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_runner import _run_chat
-from kiro_crew.dashboard.chat_utils import dashboard_slot_key
-from kiro_crew.dashboard.cron_inject import inject_cron_result_to_dashboard
+from kiro_crew.dashboard.chat_utils import dashboard_slot_key, subagent_event_slot
+from kiro_crew.dashboard.cron_inject import (
+    context_meter_reading,
+    inject_cron_result_to_dashboard,
+)
 from kiro_crew.dashboard.handlers import MAX_PROMPT_BYTES
 from kiro_crew.dashboard.handlers.autonudge import render_nudge_message
 from kiro_crew.dashboard.handlers.messaging import _rehydrate_slot_from_history
@@ -100,10 +105,13 @@ from kiro_crew.dashboard.origin import (
     resolve_dashboard_host,
 )
 from kiro_crew.dashboard.stale_asset_watchdog import run_stale_asset_watchdog
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.state import (
+    SUBAGENT_BATCH_COMPLETION_PREFIX,
+    SUBAGENT_COMPLETION_PREFIX,
+    DashboardState,
+)
 from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token
 from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
-from kiro_crew.discord.gateway import maybe_start_discord
 from kiro_crew.embeddings import (
     embedding_model_is_custom,
     get_shared_embedder,
@@ -119,6 +127,7 @@ from kiro_crew.executors import (
     subprocess_executor,
 )
 from kiro_crew.frontend import build_frontend_async
+from kiro_crew.gateway_shutdown_budget import GRACEFUL_SHUTDOWN_SECS
 from kiro_crew.heartbeat import (
     HEARTBEAT_TASK_TIMEOUT_SECS,
     HeartbeatService,
@@ -132,7 +141,7 @@ from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
     ToolApprovalPolicy,
     provider_last_turn_usage,
-    save_conversation_turn,
+    save_conversation_turn_off_loop,
     stream_and_collect,
 )
 from kiro_crew.mcp_gateway import is_gateway_supported
@@ -146,6 +155,8 @@ from kiro_crew.mcp_gateway.rewriter import (
     rewrite_agents,
 )
 from kiro_crew.memory import MemoryStore
+from kiro_crew.messaging import registry
+from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.platform import boot_platform
 from kiro_crew.platform.context import (
@@ -160,7 +171,7 @@ from kiro_crew.platform.governance_profiles import (
 )
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.safety_override import safety_override
-from kiro_crew.sandbox import prewarm_backend
+from kiro_crew.sandbox import warm_backend
 from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.service.common import restart_command_hint
@@ -171,8 +182,7 @@ from kiro_crew.slack.format import (
     build_cron_ack_block,
     build_options_blocks,
     extract_options,
-    split_message,
-    to_slack_mrkdwn,
+    render_for_slack,
 )
 from kiro_crew.slack.handler import (
     _get_agent_for_session,
@@ -182,6 +192,7 @@ from kiro_crew.slack.handler import (
 )
 from kiro_crew.slack.retry import open_dm_with_retry
 from kiro_crew.subagent import (
+    DIGEST_HOLD_SECS,
     INJECTION_TIMEOUT,
     SubagentInfo,
     SubagentManager,
@@ -189,15 +200,11 @@ from kiro_crew.subagent import (
     resolve_max_subagents,
 )
 from kiro_crew.taskrunner import TaskRunner
-from kiro_crew.teams.gateway import maybe_start_teams
-from kiro_crew.telegram.gateway import maybe_start_telegram
-from kiro_crew.webex.gateway import maybe_start_webex
-from kiro_crew.wecom.gateway import maybe_start_wecom
-from kiro_crew.weixin.gateway import maybe_start_weixin
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import _ChatSlot
     from kiro_crew.discord.client import DiscordClient
+    from kiro_crew.messaging.registry import ChannelDescriptor
     from kiro_crew.providers.base import LLMProvider
     from kiro_crew.subagent_scale import SubagentEventCoalescer
     from kiro_crew.task_models import Task
@@ -300,6 +307,27 @@ _BACKGROUND_APPROVAL_SOURCES = frozenset({"cron", "heartbeat", "taskrunner", "au
 # Slack Block Kit section.text hard limit is 3000 chars.
 # We split cron output at this boundary so each chunk fits in a section block.
 _CRON_MSG_LIMIT = 3000
+
+
+def _heartbeat_slack_parts(title: str, result_text: str) -> list[str]:
+    """Render a heartbeat completion into postable Slack parts.
+
+    Shared by all four heartbeat delivery branches so they cannot drift. Two
+    things it fixes relative to the per-branch f-string it replaces:
+
+    - **It splits.** Those branches posted one unsplit message, and Slack
+      rejects anything past ~40,000 characters outright -- so a long heartbeat
+      result was silently lost rather than truncated.
+    - **It redacts around the transform.** ``_deliver_result`` redacts
+      ``result_text`` at its head, but ``to_slack_mrkdwn`` strips ANSI escapes
+      and that strip can reassemble a credential the escapes had broken up.
+      Redacting again after conversion is what closes that.
+
+    The ``💓 *title*`` caption goes through ``header=``, which redacts it without
+    converting (it is already Slack mrkdwn) and charges it against the limit.
+    """
+    return render_for_slack(result_text, header=f"💓 *{title}*\n\n")
+
 
 # Volatile patterns stripped before hashing cron results for dedup.
 _VOLATILE_RE = re.compile(
@@ -917,6 +945,11 @@ class GatewayOrchestrator:
         self._pending_queue: dict[str, list] = {}
         self._socket_client: WSSocketModeClient | None = None
         self._wecom_client: "WeComClient | None" = None  # set by maybe_start_wecom
+        # Registry-owned live channel handles ({channel_type: client}). The
+        # per-channel _<type>_client attributes are legacy mirrors kept in sync
+        # by messaging.registry.start_channels until the config-schema PR
+        # retires them; shutdown closes through THIS dict.
+        self._channel_handles: dict[str, object] = {}
         self._model_download_task: "asyncio.Task[bool] | None" = None
         self._auto_migrate_task: "asyncio.Task[None] | None" = None
         # Boot-time update check, started fire-and-forget after the signal
@@ -1457,7 +1490,46 @@ class GatewayOrchestrator:
                 log_message="agent_runtime.run_first_run_setup failed",
             )
         except Exception:
-            logger.warning("Agent config install failed", exc_info=True)
+            # Boot deliberately continues: a gateway with no agent spec still
+            # serves the dashboard, and one command repairs it. But this is NOT a
+            # warning-level event — without a spec on disk kiro-cli answers every
+            # session/set_mode with "Mode '<name>' not found", so EVERY chat turn
+            # and every background turn fails for the life of the install. Log at
+            # ERROR and print the remedy, mirroring _check_missing_deps: the
+            # desktop app launches the gateway with no terminal in sight, so the
+            # log is the only durable record and the print is what a
+            # console-launched operator actually sees.
+            logger.error("Agent config install failed", exc_info=True)
+            print(
+                "ERROR: agent config install failed — chat sessions cannot start. "
+                "Repair with: kirocrew setup --agent-only --clean"
+            )
+
+        # Verify what actually landed on disk, whether or not the block above
+        # raised. An exception is only one of the ways to end up with no spec (see
+        # missing_required_agent_specs for the two silent ones), and the failure
+        # mode is identical in all of them: every turn dies at session/set_mode.
+        # Deliberately outside the try above so a raising install still gets
+        # verified, and best-effort itself so a stat error cannot break boot.
+        try:
+            from kiro_crew.agent import missing_required_agent_specs  # circular import
+
+            missing = missing_required_agent_specs()
+            if missing:
+                logger.error(
+                    "Agent specs missing after install: %s (in %s) — every chat turn "
+                    "will fail at session/set_mode with \"Mode '<name>' not found\". "
+                    "Repair with: kirocrew setup --agent-only --clean",
+                    ", ".join(missing),
+                    kiro_agents_dir(),
+                )
+                print(
+                    f"ERROR: agent specs missing after install: {', '.join(missing)} — "
+                    "chat sessions cannot start. "
+                    "Repair with: kirocrew setup --agent-only --clean"
+                )
+        except Exception:
+            logger.debug("Agent spec verification failed", exc_info=True)
 
         self.slack = RealSlackClient(self._bot_token) if self._slack_enabled else None
         factory = build_provider_factory(self._cfg)
@@ -1582,14 +1654,16 @@ class GatewayOrchestrator:
         if not channel:
             logger.warning("Cron %s: no channel resolved for subagent response", parent_key)
             return False
-        # Defense-in-depth: redact at the Slack boundary so this helper is safe
-        # even if a future caller forgets to pre-redact (security-controls).
-        text, _ = redact_exfiltration_urls(text)
-        text, _ = redact_credentials(text)
         # render [OPTIONS: ...] tags as interactive buttons, matching
         # the interactive-handler / subagent-completion / dashboard-mirror paths.
+        # Extracted from the raw text: the tag is a plain-text marker, so pulling
+        # it off before conversion is what makes the controls independent of what
+        # conversion (and its 39,000-char self-truncation) does to the tail.
         text, options = extract_options(text)
-        for part in split_message(to_slack_mrkdwn(text), limit=_CRON_MSG_LIMIT):
+        # render_for_slack IS the redaction boundary here -- it normalises ANSI
+        # first so a credential broken up by escapes cannot be reassembled by the
+        # strip inside to_slack_mrkdwn, and redacts again after conversion.
+        for part in render_for_slack(text, limit=_CRON_MSG_LIMIT):
             await self.slack.post_message(channel, part, thread_ts)
         if options:
             try:
@@ -1706,6 +1780,38 @@ class GatewayOrchestrator:
                         logger.debug(
                             "SEL logging failed in cron command invoked path", exc_info=True
                         )
+                    # Re-run governance at fire time, not just at cron_add authoring
+                    # time. A job vetted when it was scheduled can outlive a later
+                    # policy tightening: mcp_cron._vet_cron_capability_governance and
+                    # _vet_command_governance only run once, at authoring, so a
+                    # ceiling change has no effect on an already-scheduled job until
+                    # someone notices and re-authors it. Denial here does not delete
+                    # the job, so a later policy loosening lets it resume on its own.
+                    from kiro_crew.mcp_cron import (
+                        _vet_command_governance,
+                        _vet_cron_capability_governance,
+                    )
+
+                    gate_reason = _vet_cron_capability_governance() or _vet_command_governance(
+                        job.command
+                    )
+                    if gate_reason:
+                        job.last_status = "error"
+                        job.last_error = redact(gate_reason)
+                        job.record_failure()
+                        try:
+                            sel().log_tool_invocation(
+                                session_key=f"cron:{job.id}",
+                                tool_name="cron_command_exec",
+                                tool_kind="cron_command",
+                                outcome="denied",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "SEL logging failed in cron command fire-time deny path",
+                                exc_info=True,
+                            )
+                        return None
                     cmd_timeout = job.timeout or 300
                     result = await asyncio.wait_for(
                         asyncio.get_running_loop().run_in_executor(
@@ -1773,12 +1879,8 @@ class GatewayOrchestrator:
                     return None
                 except Exception as exc:
                     logger.exception("Command cron '%s' failed: %s", job.name, exc)
-                    # Store the full message (matching the script-cron sibling
-                    # below): the 200-char cap chopped the SandboxUnavailableError
-                    # mid-word, discarding the one sentence naming the fix, so a
-                    # Windows user saw "…Probe detail: not Linux. I" and no remedy.
                     err_str = redact(str(exc))
-                    job.last_error = err_str
+                    job.last_error = err_str[:200]
                     job.last_status = "error"
                     job.record_failure()
                     try:
@@ -2048,6 +2150,18 @@ class GatewayOrchestrator:
                         )
                         _seq_downgraded = _seq_downgraded or _downgraded
                         _acq = True
+                        # Publish this turn's session identity so managed MCP
+                        # tools resolve their parent session. The cron path was
+                        # the ONE turn-running surface that skipped this (every
+                        # other surface publishes — see messaging.identity), and
+                        # under session sharing the runtime env carries no
+                        # KIROCREW_SESSION_KEY and macOS sets no
+                        # KIROCREW_HOST_PID, so the ancestor PID-walk over the
+                        # per-turn pidfile mapping is the only identity source
+                        # left. Without the publish, spawn_run resolved an
+                        # empty parent ("notification only (parent=)") unless an
+                        # unrelated surface happened to be mid-turn.
+                        await publish_turn_identity(self.sessions, agent_session_key)
                         # Off-loop: build_message embeds the episodic query.
                         full_message, _ = await run_in_embed_pool(
                             self.ctx_builder.build_message,
@@ -2108,9 +2222,33 @@ class GatewayOrchestrator:
                     finally:
                         if _acq:
                             self.sessions.release(agent_session_key)
-                            await self.sessions.reset(agent_session_key)
-                            if self.cron_svc is not None:
-                                self.cron_svc.clear_active_session_key(job.id)
+                            # Mirror the single-agent finally below: defer the
+                            # reset when this agent's sub-agents are still
+                            # running, QUEUED behind the concurrency/stagger
+                            # gate, or mid-injection — _subagent_done resets
+                            # after the last one. Now that this path publishes
+                            # turn identity, a non-final agent's spawn_run
+                            # resolves a REAL parent key, so an unconditional
+                            # reset here would tear down the session a pending
+                            # completion is about to inject into (cold-starting
+                            # a context-free replacement) and the completion's
+                            # own cleanup would clear the reaper registration
+                            # for the NEXT agent's still-in-flight turn.
+                            _has_pending = bool(
+                                self.subagent_mgr
+                                and self.subagent_mgr.has_pending_work_for(agent_session_key)
+                            )
+                            _has_injecting = self._cron_injecting.get(agent_session_key, 0) > 0
+                            if _has_pending or _has_injecting:
+                                logger.info(
+                                    "Cron '%s': deferring reset of %s, subagents pending",
+                                    job.name,
+                                    agent_session_key,
+                                )
+                            else:
+                                await self.sessions.reset(agent_session_key)
+                                if self.cron_svc is not None:
+                                    self.cron_svc.clear_active_session_key(job.id)
                 if _seq_downgraded:
                     result_text = _annotate_model_downgrade(result_text)
                 job.last_result = result_text
@@ -2130,6 +2268,10 @@ class GatewayOrchestrator:
                     session_key, job.agent_id or None
                 )
                 _acquired = True
+                # Same identity publish as the sequential site above — the
+                # single-agent cron turn must publish its pidfile mapping or
+                # spawn_run's parent resolution has no source to walk to.
+                await publish_turn_identity(self.sessions, session_key)
                 if job.acked_items:
                     msg += (
                         "\n\n[User has seen and acknowledged ALL of the following — "
@@ -2172,6 +2314,12 @@ class GatewayOrchestrator:
                     result_text = _annotate_model_downgrade(result_text)
 
                 job.last_result = result_text
+
+                # Context-meter reading for the dashboard slot, captured NOW:
+                # the finally block below resets this session, so the open
+                # path can never read the provider live. Routed through
+                # broadcast_context_usage by inject_cron_result_to_dashboard.
+                _ctx_reading = context_meter_reading(client)
 
                 # ── Per-turn usage row: attribute background spend. ──
                 # Best-effort; must never fail the cron turn.
@@ -2248,7 +2396,10 @@ class GatewayOrchestrator:
                             and not job.hide_in_chat
                             and self.dashboard_state.has_slot(f"cron-{job.id}")
                         ):
-                            inject_cron_result_to_dashboard(self.dashboard_state, job, result_text)
+                            inject_cron_result_to_dashboard(
+                                self.dashboard_state, job, result_text,
+                                context_reading=_ctx_reading,
+                            )
                         return result_text
 
                 if job.silent:
@@ -2267,7 +2418,10 @@ class GatewayOrchestrator:
                         and not job.hide_in_chat
                         and self.dashboard_state.has_slot(f"cron-{job.id}")
                     ):
-                        inject_cron_result_to_dashboard(self.dashboard_state, job, result_text)
+                        inject_cron_result_to_dashboard(
+                            self.dashboard_state, job, result_text,
+                            context_reading=_ctx_reading,
+                        )
                     return result_text
 
                 if self.dashboard_state:
@@ -2294,7 +2448,8 @@ class GatewayOrchestrator:
                             else []
                         )
                         inject_cron_result_to_dashboard(
-                            self.dashboard_state, job, result_text, history=history
+                            self.dashboard_state, job, result_text, history=history,
+                            context_reading=_ctx_reading,
                         )
                     redacted_for_dash, _ = redact_exfiltration_urls(result_text)
                     redacted_for_dash, _ = redact_credentials(redacted_for_dash)
@@ -2330,10 +2485,18 @@ class GatewayOrchestrator:
                                 job.created_by or self._owner_id, job.name
                             )
                         if channel:
-                            redacted, _ = redact_exfiltration_urls(result_text)
-                            redacted, _ = redact_credentials(redacted)
-                            post_text = f"⏰ *Cron: {job.name}*\n\n{to_slack_mrkdwn(redacted)}"
-                            parts = split_message(post_text, limit=_CRON_MSG_LIMIT)
+                            # The caption is redacted-but-not-converted by
+                            # render_for_slack's header= seam, which also charges
+                            # it against the limit. Doing it there rather than
+                            # here is the point: a cron name is LLM-authored (the
+                            # agent can create crons via cron_add), and the
+                            # hand-rolled version of this had already forgotten to
+                            # redact it once.
+                            parts = render_for_slack(
+                                result_text,
+                                limit=_CRON_MSG_LIMIT,
+                                header=f"⏰ *Cron: {job.name}*\n\n",
+                            )
                             # First part as Block Kit message with ack button
                             blocks: list[dict] = [
                                 {
@@ -2550,10 +2713,12 @@ class GatewayOrchestrator:
                 assert self.sessions is not None
                 if _acquired:
                     self.sessions.release(session_key)
-                    # Defer session reset if subagents are still running or
+                    # Defer session reset if subagents are still running,
+                    # queued behind the concurrency/stagger gate, or
                     # mid-injection — _subagent_done will reset after the last one.
-                    has_pending = self.subagent_mgr and any(
-                        a.parent_session_key == session_key for a in self.subagent_mgr.running
+                    has_pending = bool(
+                        self.subagent_mgr
+                        and self.subagent_mgr.has_pending_work_for(session_key)
                     )
                     has_injecting = self._cron_injecting.get(session_key, 0) > 0
                     if has_pending or has_injecting:
@@ -2894,9 +3059,7 @@ class GatewayOrchestrator:
         # turn itself already ran, so failures here don't fail the cycle).
         try:
             if response:
-                reply_text, _ = redact_exfiltration_urls(to_slack_mrkdwn(response))
-                reply_text, _ = redact_credentials(reply_text)
-                for part in split_message(reply_text):
+                for part in render_for_slack(response):
                     await self.slack.post_message(channel, part, thread_ts)
         except Exception:
             logger.exception("AutoNudge: slack posting failed for %s (turn ran)", key)
@@ -2907,7 +3070,7 @@ class GatewayOrchestrator:
                 safe_nudge, _ = redact_credentials(safe_nudge)
                 safe_response, _ = redact_exfiltration_urls(response or "")
                 safe_response, _ = redact_credentials(safe_response)
-                save_conversation_turn(
+                await save_conversation_turn_off_loop(
                     self.conv_log,
                     key,
                     safe_nudge,
@@ -3158,6 +3321,7 @@ class GatewayOrchestrator:
                             "message": loop.message,
                             "idle_secs": loop.idle_secs,
                             "max_cycles": loop.max_cycles,
+                            "max_runtime_secs": loop.max_runtime_secs,
                             "cycle_count": loop.cycle_count,
                             "active": loop.active,
                             "last_fire_ts": loop.last_fire_ts,
@@ -3170,14 +3334,17 @@ class GatewayOrchestrator:
         await self.autonudge_svc.start()
 
     def _notify_nudge_expired(self, loop: NudgeLoop) -> None:
-        """Notify the user that a monitoring loop stopped at its cycle cap.
+        """Notify the user that a monitoring loop stopped at a terminal bound.
 
-        Reaching ``max_cycles`` is a runaway backstop, not a finish line: the
-        loop stopped with its goal possibly unmet. Without this the only
-        signals were a log line and an ``active=False`` state change that looks
-        identical to a manual Stop, so a loop that ran out of cycles was
-        indistinguishable from the agent stopping on its own — the most
-        confusing failure mode of the babysit feature.
+        Reaching ``max_cycles`` or spending ``max_runtime_secs`` is a runaway
+        backstop, not a finish line: the loop stopped with its goal possibly
+        unmet. Without this the only signals were a log line and an
+        ``active=False`` state change that looks identical to a manual Stop, so
+        a loop that ran out of cycles was indistinguishable from the agent
+        stopping on its own — the most confusing failure mode of the babysit
+        feature. The wording distinguishes WHICH bound fired via the same
+        ``runtime_budget_exceeded`` predicate ``_timer`` enforces with; when
+        both are exhausted the cycle cap wins, matching the enforcement order.
 
         Best-effort by construction: ``notify()`` never raises (it swallows
         validation errors and logs), and the whole call is wrapped anyway
@@ -3195,17 +3362,25 @@ class GatewayOrchestrator:
             # Dashboard loops bind on the BARE slot key, so re-qualify those to
             # get a working jump-to-source slot link.
             meta = None if is_channel_key(key) else self._notif_meta(f"dashboard:{key}")
-            self.dashboard_state.notify(
-                "agent",
-                "Monitoring loop hit its cycle cap",
-                (
+            capped_out = loop.max_cycles and loop.cycle_count >= loop.max_cycles
+            if not capped_out and runtime_budget_exceeded(loop):
+                title = "Monitoring loop spent its time budget"
+                body = (
+                    f"The loop stopped after {loop.cycle_count} cycles because "
+                    f"its {loop.max_runtime_secs}s wall-clock budget ran out "
+                    "without it reporting done, so its goal may still be "
+                    "unmet. Restart it from the goal popover, or ask the agent "
+                    "to raise the budget (monitor_update)."
+                )
+            else:
+                title = "Monitoring loop hit its cycle cap"
+                body = (
                     f"The loop stopped after {loop.cycle_count} of "
                     f"{loop.max_cycles} cycles without reporting done, so its "
                     "goal may still be unmet. Reopen the goal popover to raise "
                     "the cap or restart it."
-                ),
-                meta=meta,
-            )
+                )
+            self.dashboard_state.notify("agent", title, body, meta=meta)
         except Exception:
             logger.debug("AutoNudge expiry notification failed", exc_info=True)
 
@@ -3238,10 +3413,10 @@ class GatewayOrchestrator:
         if conv_log is None:
             return
         # Lazy import avoids a circular dependency (dashboard.chat_utils → gateway).
-        from kiro_crew.dashboard.chat_utils import effective_session_key
+        from kiro_crew.dashboard.chat_utils import slot_history_key
 
         try:
-            await asyncio.to_thread(conv_log.set_title, effective_session_key(slot), slot.title)
+            await asyncio.to_thread(conv_log.set_title, slot_history_key(slot), slot.title)
         except Exception:
             logger.warning(
                 "Heartbeat: failed to persist slot title for %s", slot.key, exc_info=True
@@ -3413,8 +3588,8 @@ class GatewayOrchestrator:
                 try:
                     channel = await self.slack.open_dm(self._owner_id)
                     if channel:
-                        post = f"💓 *{title}*\n\n{to_slack_mrkdwn(result_text)}"
-                        await self.slack.post_message(channel, post)
+                        for post in _heartbeat_slack_parts(title, result_text):
+                            await self.slack.post_message(channel, post)
                 except Exception:
                     logger.exception("Heartbeat Slack delivery failed")
             return
@@ -3425,13 +3600,13 @@ class GatewayOrchestrator:
             try:
                 if self.slack and len(parts) == 3:
                     chan, ts = parts[1], parts[2]
-                    post = f"💓 *{title}*\n\n{to_slack_mrkdwn(result_text)}"
-                    await self.slack.post_message(chan, post, ts)
+                    for post in _heartbeat_slack_parts(title, result_text):
+                        await self.slack.post_message(chan, post, ts)
                 elif self.slack and self._owner_id:
                     chan = await self.slack.open_dm(self._owner_id)
                     if chan:
-                        post = f"💓 *{title}*\n\n{to_slack_mrkdwn(result_text)}"
-                        await self.slack.post_message(chan, post)
+                        for post in _heartbeat_slack_parts(title, result_text):
+                            await self.slack.post_message(chan, post)
             except Exception:
                 logger.exception("Heartbeat Slack delivery failed")
             if self.dashboard_state:
@@ -3443,8 +3618,8 @@ class GatewayOrchestrator:
             try:
                 channel = await self.slack.open_dm(self._owner_id)
                 if channel:
-                    post = f"💓 *{title}*\n\n{to_slack_mrkdwn(result_text)}"
-                    await self.slack.post_message(channel, post)
+                    for post in _heartbeat_slack_parts(title, result_text):
+                        await self.slack.post_message(channel, post)
             except Exception:
                 logger.exception("Heartbeat Slack delivery failed")
         if self.dashboard_state:
@@ -3495,12 +3670,20 @@ class GatewayOrchestrator:
     def _init_subagents(self) -> None:
         """Initialize the subagent manager."""
 
+        # Per-slot WS events route by EXACT slot-key match in the frontend —
+        # `subagent_event_slot` maps a parent session key to the tab that
+        # displays it (cron-born tabs are `cron-<id>`, channel-born tabs their
+        # transcript stem), falling back to the legacy prefix-strip when no
+        # tab is open. A raw `removeprefix("dashboard:")` here left the
+        # Subagents panel permanently empty for cron/channel-born sessions.
+        _event_slot = subagent_event_slot
+
         async def _broadcast_subagent_status(info: SubagentInfo, event: str) -> None:
             """Broadcast subagent status change via WS for per-slot tracking."""
             if not self.dashboard_state:
                 return
             try:
-                slot = info.parent_session_key.removeprefix("dashboard:")
+                slot = _event_slot(info.parent_session_key)
                 agents = (
                     self.subagent_mgr.running_agents_for(info.parent_session_key)
                     if self.subagent_mgr
@@ -3668,7 +3851,16 @@ class GatewayOrchestrator:
                         await asyncio.sleep(2**attempt)
                 return None  # unreachable, but satisfies type checker
 
-            await _broadcast_subagent_status(info, "done")
+            # A synthetic flush-only record is NOT a wave member (see
+            # SubagentManager.force_digest_flush): it exists only to force the
+            # wave's pending digest chunk out when its hold deadline expired.
+            # Every per-member side effect below must be skipped for it — a
+            # terminal WS event, orchestration accounting or a done/ok counter
+            # bump would invent an agent that never ran.
+            _flush_only = getattr(info, "_digest_flush_only", False) is True
+
+            if not _flush_only:
+                await _broadcast_subagent_status(info, "done")
             # Three-way outcome: a user stop is neutral — neither a success nor
             # a failure. The record contract keeps ``error`` unset for stops, so
             # every consumer below must branch on ``user_stopped`` explicitly
@@ -3709,7 +3901,11 @@ class GatewayOrchestrator:
                         logger.info("Orchestration stopped, ignoring subagent result %s", info.id)
                         return
                     task_key = info.task[:80]
-                    if info.user_stopped:
+                    if _flush_only:
+                        # No task ran — nothing to record. Recording it as a
+                        # success would credit a stage round to a timer.
+                        pass
+                    elif info.user_stopped:
                         # User stop: neither success nor failure. Recording it
                         # as success would let orchestration/synthesis advance
                         # on work the user explicitly killed and permanently
@@ -3731,7 +3927,7 @@ class GatewayOrchestrator:
                         if self.subagent_mgr
                         else []
                     )
-                    if not pending:
+                    if not pending and not _flush_only:
                         # All agents done → one round completed
                         stage = tracker.current_stage
                         if tracker.record_round(stage):
@@ -3780,7 +3976,7 @@ class GatewayOrchestrator:
             title, _ = redact_credentials(title)
 
             announce = (
-                f"[Subagent completion event]\n"
+                f"{SUBAGENT_COMPLETION_PREFIX}\n"
                 f"Agent `{info.id}`"
                 f"{f' ({info.agent})' if info.agent else ''}"
                 f" {status} {emoji}\n"
@@ -3790,6 +3986,13 @@ class GatewayOrchestrator:
             )
 
             parent_key = info.parent_session_key
+
+            if _flush_only:
+                # The synthetic record has no result of its own. Its title/body
+                # are only used by the "parent slot gone → notification only"
+                # fallback, so make them describe the WAVE, not a phantom agent.
+                title = "Wave results (partial)"
+                body = task_text
 
             # ── Batch accounting + wave digest (scale plumbing) ──
             # Every batch member is accounted here (the single completion
@@ -3806,26 +4009,50 @@ class GatewayOrchestrator:
                 _batch_id = ""
             if not isinstance(_batch_total, int):
                 _batch_total = 0
+            if _flush_only and not _batch_id:
+                # A flush-only record without wave identity has nothing to
+                # release and MUST NOT fall through to the per-agent routing
+                # below — that would inject a completion turn for an agent that
+                # never ran.
+                return
             if _batch_id:
-                bp = self._batch_progress.setdefault(
-                    _batch_id,
-                    {
-                        "total": _batch_total,
-                        "done": 0,
-                        "ok": 0,
-                        "err": 0,
-                        "stopped": 0,
-                        "fail_lines": [],
-                        "ok_lines": [],
-                        "guard_msgs": [],
-                        "held_ok_ids": [],
-                        # Chunked delivery bookkeeping: "flushed" = members whose
-                        # results have already been delivered in a prior chunk;
-                        # "chunks" = digest chunks emitted so far.
-                        "flushed": 0,
-                        "chunks": 0,
-                    },
-                )
+                if _flush_only:
+                    # Nothing to release (wave already closed / already flushed
+                    # by a completion that raced this sweep) → no-op.
+                    _bp = self._batch_progress.get(_batch_id)
+                    if _bp is None or _bp["done"] <= _bp["flushed"]:
+                        return
+                    bp = _bp
+                    # A forced flush never closes the wave: the sweep only fires
+                    # while members are still outstanding, so the wave-close
+                    # digest (counts + release guidance) is still to come.
+                    _last = False
+                    _oc = ""
+                else:
+                    bp = self._batch_progress.setdefault(
+                        _batch_id,
+                        {
+                            "total": _batch_total,
+                            "done": 0,
+                            "ok": 0,
+                            "err": 0,
+                            "stopped": 0,
+                            "fail_lines": [],
+                            "ok_lines": [],
+                            "guard_msgs": [],
+                            "held_ok_ids": [],
+                            # Members whose delivery is currently held, so the
+                            # hold-deadline sweep's timestamps can be cleared
+                            # when their chunk finally fires.
+                            "held_infos": [],
+                            # Chunked delivery bookkeeping: "flushed" = members whose
+                            # results have already been delivered in a prior chunk;
+                            # "chunks" = digest chunks emitted so far.
+                            "flushed": 0,
+                            "chunks": 0,
+                        },
+                    )
+            if _batch_id and not _flush_only:
                 bp["done"] += 1
                 # Fold EVERY member's orchestration escalation into the wave
                 # digest — held members return before the announce is sent, so
@@ -3879,7 +4106,7 @@ class GatewayOrchestrator:
                                 "batch_finished",
                                 {
                                     "batch_id": _batch_id,
-                                    "slot": parent_key.removeprefix("dashboard:"),
+                                    "slot": _event_slot(parent_key),
                                     "total": bp["total"],
                                     "ok": bp["ok"],
                                     "err": bp["err"],
@@ -3888,6 +4115,11 @@ class GatewayOrchestrator:
                             )
                     except Exception:
                         logger.debug("batch_finished broadcast failed", exc_info=True)
+            if _batch_id:
+                if _flush_only and bp["total"] <= 1:
+                    # Single-member wave: nothing is ever held, and falling
+                    # through would route the phantom per-agent announce.
+                    return
                 if bp["total"] > 1:
                     # ── Chunked wave delivery ── completed results feed the
                     # parent queue-style: every SUBAGENT_DIGEST_CHUNK_SIZE
@@ -3897,8 +4129,15 @@ class GatewayOrchestrator:
                     # incremental signal — one straggler no longer withholds
                     # every sibling's result for its entire runtime (Design
                     # Review CONCERN 1).
+                    #
+                    # The count trigger alone cannot deliver that incremental
+                    # signal for a wave smaller than the chunk size (issue
+                    # #2215): _pending can never reach it, so wave close is the
+                    # only flush. _flush_only is the LATENCY trigger the count
+                    # lacks — the reaper's hold-deadline sweep forces the
+                    # pending chunk out once results have been held too long.
                     _pending = bp["done"] - bp["flushed"]
-                    _flush = _last or _pending >= SUBAGENT_DIGEST_CHUNK_SIZE
+                    _flush = _last or _flush_only or _pending >= SUBAGENT_DIGEST_CHUNK_SIZE
                     if not _flush:
                         # Held for the next chunk — the terminal WS event,
                         # tracker accounting, and stats above already ran;
@@ -3912,6 +4151,12 @@ class GatewayOrchestrator:
                         # recovery digest; in normal operation they are marked
                         # delivered when their chunk flushes.
                         info._digest_held = True
+                        # Hold clock for the reaper's hold-deadline sweep. Kept
+                        # separate from _digest_held (the restart-safety flag the
+                        # run loop reads) so the sweep never mutates that
+                        # contract; cleared when this member's chunk fires.
+                        info._digest_held_at = time.time()
+                        bp.setdefault("held_infos", []).append(info)
                         if _oc == "completed":
                             bp["held_ok_ids"].append(info.id)
                         logger.info(
@@ -3929,6 +4174,12 @@ class GatewayOrchestrator:
                     # settles them only after _on_done (which includes the
                     # routing below) returns without raising.
                     info._digest_settle_ids = list(bp.get("held_ok_ids", []))
+                    # These members are no longer held: stop the hold clock so
+                    # the reaper's deadline sweep does not force a second flush
+                    # for results this chunk already carries.
+                    for _held in bp.get("held_infos", []):
+                        _held._digest_held_at = 0.0
+                    bp["held_infos"] = []
                     _failures = bp["fail_lines"]
                     _oks = bp["ok_lines"]
                     _digest_body = "\n".join(_failures + _oks)
@@ -3942,9 +4193,14 @@ class GatewayOrchestrator:
                     _chunk_k = bp["chunks"]
                     # Total chunks: full chunks + one final partial. Completion
                     # order fills chunks to exactly CHUNK_SIZE, so this is
-                    # ceil(total / chunk_size).
+                    # ceil(total / chunk_size) — but a NON-final chunk always
+                    # has at least the wave-close chunk still to come, so it can
+                    # never honestly label itself k/k. Without the +1 a
+                    # deadline-forced flush on a small wave would announce
+                    # "1/1 — 1 still running", telling the parent the wave is
+                    # fully delivered while a member is outstanding.
                     _chunk_j = max(
-                        _chunk_k,
+                        _chunk_k if _last else _chunk_k + 1,
                         -(-bp["total"] // SUBAGENT_DIGEST_CHUNK_SIZE),
                     )
                     _footer = (
@@ -3955,7 +4211,7 @@ class GatewayOrchestrator:
                     if _last:
                         # Final chunk: release the spawn-discipline gate.
                         announce = (
-                            f"[Subagent batch completion event]\n"
+                            f"{SUBAGENT_BATCH_COMPLETION_PREFIX}\n"
                             f"Batch results {_chunk_k}/{_chunk_j} — wave finished: "
                             f"{bp['ok']} ✅ · {bp['err']} ❌ · "
                             f"{bp['stopped']} ⏹ of {bp['total']} agents. "
@@ -3971,11 +4227,27 @@ class GatewayOrchestrator:
                         # spawns that would interleave with the batches still
                         # arriving from this run.
                         _remaining = max(0, bp["total"] - bp["done"])
+                        # A deadline-forced flush is a STRAGGLER release, not a
+                        # full chunk: say so, or the parent reads "still
+                        # running" as normal progress and keeps waiting rather
+                        # than deciding whether the remainder is worth waiting
+                        # for (issue #2215).
+                        _why = (
+                            f"The results below were finished and held for "
+                            f"{int(DIGEST_HOLD_SECS)}s+ while the remaining "
+                            f"agent(s) ran, so they are being delivered early "
+                            f"as a PARTIAL result set. Synthesize what you can "
+                            f"now; if a remaining agent never reports, work "
+                            f"with what you have or tell the user.\n"
+                            if _flush_only
+                            else ""
+                        )
                         announce = (
-                            f"[Subagent batch completion event]\n"
+                            f"{SUBAGENT_BATCH_COMPLETION_PREFIX}\n"
                             f"Batch results {_chunk_k}/{_chunk_j} — "
                             f"{bp['done']} of {bp['total']} delivered, "
                             f"{_remaining} still running.\n"
+                            f"{_why}"
                             f"Process these results now, but do NOT spawn new "
                             f"sub-agents yet — more result batches from this "
                             f"run are still arriving, and spawning now will "
@@ -4221,12 +4493,12 @@ class GatewayOrchestrator:
                                     self.sessions.get_channel(parent_key) if self.sessions else None
                                 ) or await self.slack.open_dm(self._owner_id)
                                 if channel:
-                                    reply_text, _ = redact_exfiltration_urls(
-                                        to_slack_mrkdwn(response)
-                                    )
-                                    reply_text, _ = redact_credentials(reply_text)
-                                    reply_text, options = extract_options(reply_text)
-                                    for part in split_message(reply_text):
+                                    # OPTIONS off the RAW text, then render: the
+                                    # tag is plain text, so extracting it after
+                                    # conversion made the controls hostage to
+                                    # to_slack_mrkdwn's 39,000-char truncation.
+                                    reply_text, options = extract_options(response)
+                                    for part in render_for_slack(reply_text):
                                         await self.slack.post_message(channel, part, parent_key)
                                     try:
                                         elapsed = (
@@ -4277,7 +4549,7 @@ class GatewayOrchestrator:
                                 safe_announce, _ = redact_credentials(safe_announce)
                                 safe_response, _ = redact_exfiltration_urls(response or "")
                                 safe_response, _ = redact_credentials(safe_response)
-                                save_conversation_turn(
+                                await save_conversation_turn_off_loop(
                                     self.conv_log,
                                     parent_key,
                                     safe_announce,
@@ -4445,10 +4717,17 @@ class GatewayOrchestrator:
                             "Subagent %s: failed to deliver cron response to Slack",
                             info.id,
                         )
-                # Reset only when no subagents running AND no injections pending
-                still_running = self.subagent_mgr and any(
-                    a.parent_session_key == parent_key and a.id != info.id
-                    for a in self.subagent_mgr.running
+                # Reset only when no subagents running or QUEUED AND no
+                # injections pending. Queued spawns (behind the concurrency /
+                # stagger gate) have no SubagentInfo in `running` yet — a
+                # sibling completing while the rest of the wave is still
+                # queued must not reset the parent out from under them.
+                still_running = self.subagent_mgr and (
+                    any(
+                        a.parent_session_key == parent_key and a.id != info.id
+                        for a in self.subagent_mgr.running
+                    )
+                    or self.subagent_mgr.queued_count_for(parent_key) > 0
                 )
                 still_injecting = self._cron_injecting.get(parent_key, 0) > 0
                 if not still_running and not still_injecting:
@@ -4463,11 +4742,20 @@ class GatewayOrchestrator:
                         # still be alive — reaper must be able to target it).
                         # parent_key is "cron:{job_id}" (persistent) or
                         # "cron:{job_id}:{run_id}" (ephemeral); job_id is the
-                        # second colon-separated segment in both cases.
+                        # second colon-separated segment in both cases. Clear
+                        # ONLY when the registration still points at the session
+                        # just reset: an agent-sequence job re-registers the
+                        # NEXT agent's key (cron:{job_id}:{agent}) while a prior
+                        # agent's deferred reset is still pending, and an
+                        # unconditional clear here would strip the reaper's
+                        # handle on that still-in-flight turn.
                         cron_svc = getattr(self, "cron_svc", None)
                         if cron_svc is not None:
                             parts = parent_key.split(":", 2)
-                            if len(parts) >= 2:
+                            if (
+                                len(parts) >= 2
+                                and cron_svc.get_active_session_key(parts[1]) == parent_key
+                            ):
                                 cron_svc.clear_active_session_key(parts[1])
                     except Exception:
                         logger.exception(
@@ -4496,7 +4784,7 @@ class GatewayOrchestrator:
             agent_id = request_id.removeprefix("spawn:")
             info = self.subagent_mgr.get(agent_id) if self.subagent_mgr is not None else None
             slot = (
-                info.parent_session_key.removeprefix("dashboard:")
+                _event_slot(info.parent_session_key)
                 if info and info.parent_session_key
                 else ""
             )
@@ -4545,7 +4833,7 @@ class GatewayOrchestrator:
         async def _subagent_event(etype: str, info: SubagentInfo, extra: dict) -> None:
             if not self.dashboard_state:
                 return
-            slot_name = info.parent_session_key.removeprefix("dashboard:")
+            slot_name = _event_slot(info.parent_session_key)
             base = {"id": info.id, "slot": slot_name}
             # Batch identity rides every frame when present so the UI can
             # group/aggregate a wave without a lookup table. (Type guard:
@@ -4563,7 +4851,7 @@ class GatewayOrchestrator:
                     error_text, _ = redact_credentials(error_text)
                     slot.append(
                         "assistant",
-                        f"[Subagent completion event]\n"
+                        f"{SUBAGENT_COMPLETION_PREFIX}\n"
                         f"Agent `{info.id}` ❌\n"
                         f"Task: {task_preview}\n\n"
                         f"Error: {error_text}\n"
@@ -5189,18 +5477,7 @@ class GatewayOrchestrator:
             cleanup_tasks.append(self._dashboard_runner.cleanup())
         if self._socket_client:
             cleanup_tasks.append(asyncio.wait_for(self._socket_client.close(), timeout=1.0))
-        if self._wecom_client:
-            cleanup_tasks.append(asyncio.wait_for(self._wecom_client.close(), timeout=2.0))
-        if self._telegram_client:
-            cleanup_tasks.append(asyncio.wait_for(self._telegram_client.close(), timeout=2.0))
-        if self._weixin_client:
-            cleanup_tasks.append(asyncio.wait_for(self._weixin_client.close(), timeout=2.0))
-        if self._discord_client:
-            cleanup_tasks.append(asyncio.wait_for(self._discord_client.close(), timeout=2.0))
-        if self._webex_client:
-            cleanup_tasks.append(asyncio.wait_for(self._webex_client.close(), timeout=2.0))
-        if self._teams_client:
-            cleanup_tasks.append(asyncio.wait_for(self._teams_client.close(), timeout=2.0))
+        cleanup_tasks.extend(registry.shutdown_tasks(self._channel_handles, timeout=2.0))
         # Cancel background model download if still in flight
         if self._model_download_task is not None and not self._model_download_task.done():
             self._model_download_task.cancel()
@@ -5233,20 +5510,62 @@ class GatewayOrchestrator:
             # under the enterprise ceiling and an operator opting out must not
             # hold a fleet on a build the policy forbids.
             #
-            # Checked BEFORE the `available` branch: that flag comes from
-            # `_do_update_check`'s `_version_tuple`, which returns (0,) for any
-            # pre-release — so a `1.4.0-nightly.<stamp>` remote reads as "nothing
-            # available" and a 1.3.0 host would never satisfy a 1.4.0 floor.
-            # `_auto_apply_update` still applies the source pin and its own
-            # no-new-commits early return, so this cannot bypass the ceiling or loop.
+            # Checked BEFORE the `available` branch, and deliberately independent
+            # of it: the mandate is about whether THIS host satisfies the floor,
+            # not about whether a newer build was advertised. `_auto_apply_update`
+            # still applies the source pin and its own no-new-commits early
+            # return, so this cannot bypass the ceiling or loop.
+            #
+            # Not gated on `self_updatable`: a policy floor is an enterprise
+            # ceiling, and this branch has always attempted the git apply on every
+            # layout. Teaching it the wheel path (which needs the installer, not a
+            # git reset) is a separate change from making the CHECK honest.
             if update_required(_running_version):
+                # A mandatory floor is handled by layout, because "apply" means
+                # different things per install shape:
+                #   * git checkout (self_updatable) -> git fetch + reset applies.
+                #   * wheel/cli.sh (not self_updatable, but carries an installer
+                #     `update_command`) -> cannot self-apply unattended; warn and
+                #     light the dashboard badge so the operator runs `kirocrew
+                #     update`. Before this branch existed the path `return`ed
+                #     silently, leaving the host below the floor with no signal.
+                #   * externally managed (dmg/appimage/docker: not self_updatable
+                #     AND no `update_command`) -> its own updater owns this; the
+                #     backend must not drive a git reset on a non-git tree nor
+                #     show an inapplicable CLI-update badge. Log and return.
+                if _update_info.get("self_updatable"):
+                    logger.warning(
+                        "Version compliance: running %s is below the policy minimum %s — "
+                        "applying a mandatory update (overrides auto_update)",
+                        _running_version,
+                        min_version(),
+                    )
+                    await self._auto_apply_update()
+                    return
+                if _update_info.get("update_command"):
+                    logger.warning(
+                        "Version compliance: running %s is below the policy minimum %s, "
+                        "but this install (%s) updates by re-running the installer — "
+                        "run `kirocrew update`",
+                        _running_version,
+                        min_version(),
+                        _update_info.get("install_kind") or "unknown",
+                    )
+                    # Light the badge: the SSE snapshot reads
+                    # `_update_info["available"]`, which the check may have left
+                    # False (a pre-release remote reads as not-newer) even though
+                    # the floor makes this update mandatory.
+                    _update_info["available"] = True
+                    if self.dashboard_state:
+                        self.dashboard_state.push_refresh("update_available")
+                    return
                 logger.warning(
-                    "Version compliance: running %s is below the policy minimum %s — "
-                    "applying a mandatory update (overrides auto_update)",
+                    "Version compliance: running %s is below the policy minimum %s, but this "
+                    "install (%s) is updated by its own updater — not applying from the backend",
                     _running_version,
                     min_version(),
+                    _update_info.get("install_kind") or "unknown",
                 )
-                await self._auto_apply_update()
                 return
 
             if _update_info.get("available"):
@@ -5254,11 +5573,29 @@ class GatewayOrchestrator:
                 from kiro_crew.config import KiroCrewConfig
 
                 cfg = KiroCrewConfig.load()
-                if cfg.auto_update:
+                # `_auto_apply_update` replaces code with git fetch + reset, so it
+                # can only serve a GIT CHECKOUT. A wheel install replaces itself by
+                # re-running the installer, which this process must not do
+                # unattended — so notify instead. Without this guard, the wheel
+                # path in `_do_update_check` (which can now report `available`)
+                # would drive a git reset in a tree that has no `.git`.
+                if cfg.auto_update and _update_info.get("self_updatable"):
                     logger.info("Auto-update enabled — applying update")
                     await self._auto_apply_update()
-                elif self.dashboard_state:
-                    self.dashboard_state.push_refresh("update_available")
+                else:
+                    if cfg.auto_update:
+                        logger.warning(
+                            "Auto-update is on, but this install (%s) updates by "
+                            "re-running the installer, not by git — notifying instead",
+                            _update_info.get("install_kind") or "unknown",
+                        )
+                    if self.dashboard_state:
+                        self.dashboard_state.push_refresh("update_available")
+            elif _update_info.get("error"):
+                # A check that could not run is NOT "already on latest" — saying so
+                # is the exact false reassurance the honest-`checked` contract in
+                # `handlers/updates.py` exists to prevent.
+                logger.info("Update check did not complete (%s)", _update_info.get("error"))
             else:
                 print("👻 Already on latest version")
         except Exception:
@@ -5604,8 +5941,15 @@ class GatewayOrchestrator:
 
         cleanup_orphaned_sessions()
 
-        # Prewarm sandbox probe cache so on-loop spawns never hit cold-cache path
-        prewarm_backend()
+        # Fill the sandbox probe cache BEFORE any on-loop spawn path can reach
+        # detect_backend(). Waiting (off-loop) rather than firing-and-forgetting
+        # is what makes that guarantee hold: a fire-and-forget prewarm leaves the
+        # very next caller racing the warm thread and reading a cold-cache
+        # transient as "no sandbox backend on this host".
+        try:
+            await asyncio.to_thread(warm_backend)
+        except RuntimeError:
+            logger.warning("sandbox warm_backend skipped (thread exhaustion); cache stays cold")
 
         # ── Initialise all services ──
         from kiro_crew.slack.events import SeenCache, init_socket_mode
@@ -5860,7 +6204,9 @@ class GatewayOrchestrator:
             logger.debug("Gateway run-marker clear skipped", exc_info=True)
 
         try:
-            await asyncio.wait_for(self._shutdown(), timeout=10.0)
+            await asyncio.wait_for(
+                self._shutdown(), timeout=GRACEFUL_SHUTDOWN_SECS
+            )
         except (asyncio.TimeoutError, Exception):
             logger.warning("Graceful shutdown timed out — force exiting")
 
@@ -5869,32 +6215,39 @@ class GatewayOrchestrator:
         cleanup_orphaned_sessions()
         os._exit(0)
 
-    async def _start_channel_transports(self) -> None:
+    async def _start_channel_transports(
+        self, descriptors: "tuple[ChannelDescriptor, ...] | None" = None
+    ) -> None:
         """Start each non-Slack transport, gated on the ``channels`` scope.
+
+        Registry-driven (PR ③ of the channel-plugin RFC): the roster comes from
+        :func:`kiro_crew.channels.builtin_channel_descriptors` and the loop
+        lives in :mod:`kiro_crew.messaging.registry` — adding a channel no
+        longer edits this method. ``descriptors`` is injectable for tests.
 
         Every transport is a guarded no-op unless enabled + credentialed (its
         own ``maybe_start_*``), and is ADDITIONALLY gated on the ``channels``
         governance scope: a policy that denies the transport member keeps it from
-        connecting at all, and its client stays ``None``. The scope + member ids
-        (``wecom``/``telegram``/``discord``/``webex``) are IDENTICAL to the
-        outbound chokepoints — outbound-send (``mcp_core``) and outbound
-        cross-surface mirroring (``chat_runner``) — so one ``channels`` allowlist
-        governs a transport at connect time and on every outbound path (this gate
-        is the connect-time member; inbound receive is gated per-message by
+        connecting at all, and its client stays ``None``. The member ids are
+        IDENTICAL to the outbound chokepoints — outbound-send (``mcp_core``) and
+        outbound cross-surface mirroring (``chat_runner``) — so one ``channels``
+        allowlist governs a transport at connect time and on every outbound path
+        (inbound receive is gated per-message by
         ``messaging.identity.channel_inbound_permitted``).
 
         Default-build invariant: with no policy governing ``channels`` (the
         standard OSS build) the gate permits, so every transport starts exactly
-        as before — byte-identical behavior. Slack is gated too, but in
-        ``_connect_slack`` rather than here, because it owns its own socket-client
-        lifecycle (a deny must drop that client, not just skip a start call).
+        as before — byte-identical behavior. Slack is a registry member too
+        (``start=None``) but is gated in ``_connect_slack`` rather than here,
+        because it owns its own socket-client lifecycle (a deny must drop that
+        client, not just skip a start call).
 
         Loop hygiene: ``_channel_transport_permitted`` reaches
         ``ProfileStore._ensure_fresh``, which stats/reads the profile files off
         disk — blocking I/O. This method runs on the gateway event loop (inside
         ``run()``), so the governance decisions are computed together in an
-        executor BEFORE any transport is started; only the actual
-        ``await maybe_start_*`` stays on the loop.
+        executor BEFORE any transport is started; only the actual factory
+        awaits stay on the loop.
 
         Enabled-only eval: the gate is queried ONLY for a transport whose
         ``_<member>_enabled`` is set (config-enabled + credentialed). A transport
@@ -5904,38 +6257,22 @@ class GatewayOrchestrator:
         the no-policy default is unchanged: every ENABLED transport still resolves
         to permit and starts exactly as before.
         """
-        # Evaluate each channel-start decision OFF the loop (each does blocking
-        # profile-file I/O), but ONLY for config-enabled transports — a disabled
-        # transport never starts, so skip it to avoid a deny-SEL for a channel
-        # that would no-op anyway. Members not evaluated stay not-permitted.
-        members = ("wecom", "telegram", "discord", "webex", "teams", "weixin")
-        enabled = {m: bool(getattr(self, f"_{m}_enabled", False)) for m in members}
+        if descriptors is None:
+            descriptors = builtin_channel_descriptors()
+        boot = registry.bootable(descriptors)
+        enabled = {
+            d.channel_type: bool(getattr(self, f"_{d.channel_type}_enabled", False))
+            for d in boot
+        }
         loop = asyncio.get_running_loop()
         permitted = await loop.run_in_executor(
             maintenance_executor(),
             lambda: {
-                m: (_channel_transport_permitted(m) if enabled[m] else False) for m in members
+                m: (_channel_transport_permitted(m) if enabled[m] else False)
+                for m in enabled
             },
         )
-        # WeChat (WeCom AI-bot) channel — guarded no-op unless enabled + credentialed.
-        if permitted["wecom"]:
-            self._wecom_client = await maybe_start_wecom(self)
-        # Telegram channel — guarded no-op unless enabled + token present.
-        if permitted["telegram"]:
-            self._telegram_client = await maybe_start_telegram(self)
-        # Discord channel — guarded no-op unless enabled + token present.
-        if permitted["discord"]:
-            self._discord_client = await maybe_start_discord(self)
-        # Webex channel — guarded no-op unless enabled + token present.
-        if permitted["webex"]:
-            self._webex_client = await maybe_start_webex(self)
-        # Teams channel — guarded no-op unless enabled + App ID/password present.
-        if permitted["teams"]:
-            self._teams_client = await maybe_start_teams(self)
-        # WeChat (personal Weixin over iLink) channel — guarded no-op unless
-        # enabled + credentialed. Distinct member from "wecom" (enterprise).
-        if permitted["weixin"]:
-            self._weixin_client = await maybe_start_weixin(self)
+        self._channel_handles = await registry.start_channels(self, descriptors, permitted)
 
 
 async def run_gateway(

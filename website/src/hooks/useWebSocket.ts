@@ -5,9 +5,9 @@ import { useAppDispatch } from '../store'
 import { store } from '../store'
 import { sseStatus, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, setChannelTrusted, sseSlotTitle, triggerRefresh, fetchSlots, markSlotUnread, setUpdateProgress, sseSubagentStatus, sseSubagentText, touchSlotActivity, patchSlotSourceLinks, type SubagentDetail } from '../store/dashboardSlice'
 import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, fetchNotifications } from '../store/notificationsSlice'
-import { MC_NOTIFICATION_EVENT, TURN_DONE_KIND, shouldChimeOnTurnDone, type McNotificationDetail } from './notificationEvent'
+import { MC_NOTIFICATION_EVENT, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone, type McNotificationDetail } from './notificationEvent'
 import { emitThemeSound } from './themeSound'
-import { fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, sseMcpAppRender, setGoalLoops, sseGoalLoop } from '../store/chatSlice'
+import { fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop } from '../store/chatSlice'
 import { api } from '../api/client'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
@@ -226,7 +226,7 @@ export function useWebSocket() {
         if (existing.some((n: Notification) => n.approval_id === a.id)) continue
         dispatch(addNotification({
           kind: 'approval',
-          title: `Tool approval: ${a.tool || 'Unknown'}`,
+          title: i18nT('hooks.useWebSocket.tool_approval', { name: a.tool || i18nT('hooks.useWebSocket.unknown') }),
           body: `**Source:** ${a.source || 'agent'}\n\n${a.tool_input || ''}`.trim(),
           ts: String(a.ts || Date.now() / 1000),
           approval_id: a.id,
@@ -545,13 +545,23 @@ export function useWebSocket() {
             break
           case 'approval': {
             queryClient.invalidateQueries({ queryKey: ['global-approvals'] })
+            // Approval-blocked chime: the agent is stuck until the user acts.
+            // Suppressed during reconnect catch-up (same policy as turn-done).
+            if (!reconnectingRef.current) {
+              try {
+                const detail: McNotificationDetail = { kind: APPROVAL_KIND }
+                window.dispatchEvent(new CustomEvent(MC_NOTIFICATION_EVENT, { detail }))
+              } catch (err) {
+                console.warn('mc-notification listener error', err)
+              }
+            }
             // Browser notification when tab not focused (permission must be granted via UI interaction elsewhere)
             if (typeof Notification !== 'undefined' && document.hidden && Notification.permission === 'granted') {
               new Notification(i18nT('hooks.useWebSocket.approval_required'), { body: data.tool || i18nT('hooks.useWebSocket.a_task_needs_your_decision'), tag: 'kirocrew-approval' })
             }
             dispatch(addNotification({
               kind: 'approval',
-              title: `Tool approval: ${data.tool || 'Unknown'}`,
+              title: i18nT('hooks.useWebSocket.tool_approval', { name: data.tool || i18nT('hooks.useWebSocket.unknown') }),
               body: `**Source:** ${data.source || 'agent'}\n\n${data.tool_input || ''}\n\n${data.tool_purpose || ''}`.trim(),
               ts: String(data.ts || Date.now() / 1000),
               approval_id: data.id,
@@ -714,7 +724,7 @@ export function useWebSocket() {
             break
           }
           case 'tool_call':
-            dispatch(sseToolActivity({ ...data as { slot: string; tool: string; kind: string; purpose: string; input_preview: string }, auto: (data as Record<string, unknown>).auto === true, tool_call_id: (data as Record<string, unknown>).tool_call_id as string | undefined, is_update: (data as Record<string, unknown>).is_update === true }))
+            dispatch(sseToolActivity({ ...data as { slot: string; tool: string; kind: string; purpose: string; input_preview: string; is_shell?: boolean }, auto: (data as Record<string, unknown>).auto === true, tool_call_id: (data as Record<string, unknown>).tool_call_id as string | undefined, is_update: (data as Record<string, unknown>).is_update === true, is_shell: (data as Record<string, unknown>).is_shell === true }))
             if (data.slot) {
               dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'tool', text: sanitizeLlmOutput((data as Record<string, unknown>).purpose as string || data.tool), toolName: sanitizeLlmOutput(data.tool), ts: Date.now() }))
             }
@@ -766,9 +776,45 @@ export function useWebSocket() {
             }
             break
           }
-          case 'activity_event':
-            dispatch(sseActivityEvent(data as { slot: string; kind: string; text: string }))
+          case 'slot_folder_suggestion': {
+            // Post-titling offer to file an unfiled session. Every field is the
+            // user's own stored folder data (the backend model call returns an
+            // index, not text), but the shape is still validated here so a
+            // malformed frame cannot render an empty or half-filled card.
+            const raw = data as { slot?: string; folder_id?: string; folder_name?: string; breadcrumb?: string; ts?: number }
+            if (raw.slot && typeof raw.folder_id === 'string' && raw.folder_id && typeof raw.folder_name === 'string' && raw.folder_name) {
+              dispatch(setFolderSuggestion({
+                slot: raw.slot,
+                folderId: raw.folder_id,
+                folderName: raw.folder_name,
+                breadcrumb: typeof raw.breadcrumb === 'string' ? raw.breadcrumb : '',
+                ...(typeof raw.ts === 'number' ? { ts: raw.ts } : {}),
+              }))
+            }
             break
+          }
+          case 'activity_event': {
+            const ev = data as { slot: string; kind: string; text: string; spawned?: boolean }
+            // A session was just created or resumed, which is the ONLY moment the
+            // backend learns what this account is entitled to run (it comes from
+            // session/new's advertised list). /api/models narrows its catalog to
+            // that set, so refetch it then — a cold gateway answered the first
+            // fetch from the unnarrowed catalog and, being a live 200, stopped
+            // the self-heal poll, leaving the picker offering models no turn can
+            // use for the rest of the page's life.
+            //
+            // Gated on `spawned`, not on the frame's presence: this frame is also
+            // emitted on warm turns, where nothing was respawned and the
+            // advertised list cannot have changed. /api/models SPAWNS
+            // `kiro chat --list-models`, so refetching per prompt would run a
+            // subprocess on every message. An absent flag is treated as "not
+            // spawned" so an unexpected emitter cannot reintroduce that.
+            if (ev.kind === 'session' && ev.spawned === true) {
+              queryClient.invalidateQueries({ queryKey: ['available-models'] })
+            }
+            dispatch(sseActivityEvent(ev))
+            break
+          }
           case 'subagent_spawn':
             dispatch(sseSubagentSpawn(data as { slot: string; id: string; task: string; agent: string }))
             break

@@ -78,9 +78,9 @@ describe('LanguageProvider', () => {
   })
 
   it('falls back to the default language when the browser matches nothing', async () => {
-    // `ja-JP` is deliberately a language we do NOT ship. Using a shippable tag
-    // here silently inverts the test the moment that language lands.
-    vi.spyOn(navigator, 'languages', 'get').mockReturnValue(['ja-JP'])
+    // Klingon is deliberately not a product locale. A plausible future language
+    // would silently invert this test when its catalog lands.
+    vi.spyOn(navigator, 'languages', 'get').mockReturnValue(['tlh-US'])
     wrap(<Probe />)
     await waitFor(() => expect(screen.getByTestId('detected')).toHaveTextContent('en'))
   })
@@ -132,6 +132,18 @@ describe('LanguageProvider', () => {
     wrap(<Probe />)
     await waitFor(() => expect(document.documentElement.lang).toBe('zh-CN'))
   })
+
+  // A regional tag must land on the bare code, or the locale-specific font
+  // override keyed on it — `html:lang(ja)`, `html:lang(ko)` — never matches and the
+  // script silently renders through the Simplified Chinese alias.
+  it.each([['ja-JP', 'ja'], ['ko-KR', 'ko']])(
+    'normalizes the %s browser tag for the locale-specific font override',
+    async (tag, expected) => {
+      vi.spyOn(navigator, 'languages', 'get').mockReturnValue([tag])
+      wrap(<Probe />)
+      await waitFor(() => expect(document.documentElement.lang).toBe(expected))
+    },
+  )
 
   it('is inert but does not crash outside a provider', () => {
     // An isolated component test shouldn't have to mount the provider.

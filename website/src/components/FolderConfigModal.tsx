@@ -1,30 +1,29 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
-import { Zap, RotateCcw, FolderOpen, ChevronRight, TriangleAlert } from 'lucide-react'
+import { Zap, FolderOpen, ChevronRight, TriangleAlert } from 'lucide-react'
 import Modal from './Modal'
 import { Input, Btn } from './ui'
 import ProjectPicker from './ProjectPicker'
-import { FOLDER_EMOJIS, isSingleEmoji } from './folderEmoji'
+import SimpleSelect from './SimpleSelect'
+import { FOLDER_COLOR_PALETTE } from './folderColorCatalog'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { resolveFolderProjectDir } from '../utils/folderAgent'
 import { ChatFolder } from '../types'
 import { i18nT } from '../i18n/t'
 
-/** The folder fields this modal owns. `regenerateIcon` is not a folder field but
- *  a request: the backend rejects `icon` and `regenerate_icon` in one PATCH, so
- *  the two are modelled as mutually exclusive states rather than one string. */
-export type FolderConfigField = 'name' | 'icon' | 'projectDir' | 'defaultAgent'
+/** The folder fields this modal owns. */
+export type FolderConfigField = 'name' | 'color' | 'projectDir' | 'defaultAgent'
 
 export interface FolderConfigDraft {
   name: string
-  icon: string
-  regenerateIcon: boolean
+  /** Palette hex for the folder glyph tint; '' = default gray. */
+  color: string
   projectDir: string
   defaultAgent: string
   /** Fields the USER actually edited, measured against what the modal opened
    *  with. The caller must build its PATCH from this rather than diffing the
-   *  draft against live cache: a field the background icon generator (or another
-   *  client) changed while the modal was open differs from the draft without the
-   *  user having touched it, and re-sending the stale value silently reverts it. */
+   *  draft against live cache: a field another client changed while the modal
+   *  was open differs from the draft without the user having touched it, and
+   *  re-sending the stale value silently reverts it. */
   touched: FolderConfigField[]
 }
 
@@ -61,7 +60,7 @@ function ancestorChain(folders: ChatFolder[], id: string | undefined): ChatFolde
   return out
 }
 
-const EMPTY: FolderConfigDraft = { name: '', icon: '', regenerateIcon: false, projectDir: '', defaultAgent: '', touched: [] }
+const EMPTY: FolderConfigDraft = { name: '', color: '', projectDir: '', defaultAgent: '', touched: [] }
 
 /**
  * One modal for both "New folder" and "Folder settings".
@@ -80,14 +79,11 @@ export default function FolderConfigModal({
   open, onClose, mode, parentId, folder, folders, installedAgents, globalDefaultAgent, onSubmit,
 }: Props) {
   const [draft, setDraft] = useState<FolderConfigDraft>(EMPTY)
-  const [emojiOpen, setEmojiOpen] = useState(false)
-  const [iconErr, setIconErr] = useState(false)
-  const [customEmoji, setCustomEmoji] = useState('')
   const [pickerOpen, setPickerOpen] = useState(false)
   // The backend rejects a free-typed project_dir (not absolute / not an existing
-  // directory / sensitive path) and a multi-emoji icon with a 400. Submit used to
-  // be fire-and-forget, so a rejection closed the modal and threw the whole draft
-  // away with no feedback. Hold the modal open until the save actually lands.
+  // directory / sensitive path) with a 400. Submit used to be fire-and-forget,
+  // so a rejection closed the modal and threw the whole draft away with no
+  // feedback. Hold the modal open until the save actually lands.
   const [saving, setSaving] = useState(false)
   const [saveErr, setSaveErr] = useState('')
   // What the draft looked like when the modal opened — the baseline for
@@ -119,8 +115,7 @@ export default function FolderConfigModal({
     const seeded: FolderConfigDraft = mode === 'edit' && f
       ? {
         name: f.name ?? '',
-        icon: f.icon ?? '',
-        regenerateIcon: false,
+        color: f.color ?? '',
         projectDir: f.project_dir ?? '',
         defaultAgent: f.default_agent ?? '',
         touched: [],
@@ -128,7 +123,7 @@ export default function FolderConfigModal({
       : EMPTY
     setDraft(seeded)
     seedRef.current = seeded
-    setEmojiOpen(false); setIconErr(false); setCustomEmoji(''); setPickerOpen(false)
+    setPickerOpen(false)
     setSaving(false); setSaveErr('')
   }, [open, mode, seedKey])
 
@@ -161,7 +156,7 @@ export default function FolderConfigModal({
   const canSubmit = trimmedName.length > 0
 
   // A folder can reference an agent that is no longer installed (uninstalled or
-  // renamed). Without an <option> for it the select falls back to showing the
+  // renamed). Without an option for it the select falls back to showing the
   // first entry — "None" — and Save would then write default_agent:'' and
   // silently destroy the folder's configuration. Keep the orphan selectable so
   // it round-trips, flagged so the user knows why it isn't running.
@@ -169,48 +164,34 @@ export default function FolderConfigModal({
     ? draft.defaultAgent
     : ''
 
+  // Values and display labels as two PARALLEL arrays, orphan first so it keeps
+  // the position its <option> held. The '' ("None" / "Inherit (x)") row is
+  // SimpleSelect's `clearLabel` rather than a member of these arrays.
+  const agentNames = installedAgents.map(a => a.name)
+  const agentOptions = orphanAgent ? [orphanAgent, ...agentNames] : agentNames
+  const agentOptionLabels = orphanAgent
+    ? [i18nT('components.folderConfigModal.agent_not_installed', { agent: orphanAgent }), ...agentNames]
+    : agentNames
+
   const submit = useCallback(async () => {
     if (!canSubmit || saving) return
-    // A typed-but-not-Entered custom emoji used to be dropped on the floor: the
-    // field only applied it from its own Enter handler, so typing 🦄 and clicking
-    // "Create folder" shipped the auto icon with no feedback. Fold it in here —
-    // and if it isn't a single emoji, say so rather than silently ignoring it.
-    let icon = draft.icon
-    let regenerateIcon = draft.regenerateIcon
-    const typed = customEmoji.trim()
-    if (typed) {
-      if (!isSingleEmoji(typed)) { setIconErr(true); setEmojiOpen(true); return }
-      icon = typed
-      regenerateIcon = false
-    }
     const seeded = seedRef.current
     const edited: FolderConfigField[] = []
     if (trimmedName !== seeded.name) edited.push('name')
-    if (icon !== seeded.icon) edited.push('icon')
+    if (draft.color !== seeded.color) edited.push('color')
     if (draft.projectDir !== seeded.projectDir) edited.push('projectDir')
     if (draft.defaultAgent !== seeded.defaultAgent) edited.push('defaultAgent')
     setSaving(true); setSaveErr('')
     try {
-      await onSubmit({ ...draft, name: trimmedName, icon, regenerateIcon, touched: edited })
+      await onSubmit({ ...draft, name: trimmedName, touched: edited })
     } catch (e) {
       // Stay open, keep every field, and say why.
       setSaveErr(e instanceof Error && e.message ? e.message : i18nT('components.folderConfigModal.save_failed'))
     } finally {
       setSaving(false)
     }
-  }, [canSubmit, saving, draft, trimmedName, customEmoji, onSubmit])
+  }, [canSubmit, saving, draft, trimmedName, onSubmit])
 
-  // Clearing `customEmoji` here is load-bearing, not tidiness: submit() folds a
-  // non-empty value in, so a leftover typed emoji would outrank whatever the user
-  // picked afterwards from the grid (or a Reset back to auto) and persist the
-  // wrong icon.
-  const chooseEmoji = (em: string) => {
-    setDraft(d => ({ ...d, icon: em, regenerateIcon: false }))
-    setCustomEmoji('')
-    setIconErr(false)
-  }
-
-  const glyph = draft.icon || '🗂️'
 
   // The inline input this replaced held ONE field; the modal holds four, so an
   // accidental backdrop graze now costs real work. Guard the accidental paths
@@ -218,10 +199,10 @@ export default function FolderConfigModal({
   const seed = seedRef.current
   const touched: FolderConfigField[] = []
   if (draft.name !== seed.name) touched.push('name')
-  if (draft.icon !== seed.icon || !!customEmoji.trim()) touched.push('icon')
+  if (draft.color !== seed.color) touched.push('color')
   if (draft.projectDir !== seed.projectDir) touched.push('projectDir')
   if (draft.defaultAgent !== seed.defaultAgent) touched.push('defaultAgent')
-  const isDirty = touched.length > 0 || draft.regenerateIcon !== seed.regenerateIcon
+  const isDirty = touched.length > 0
 
   return (
     <>
@@ -267,88 +248,59 @@ export default function FolderConfigModal({
             </span>
           </div>
 
-          {/* Icon + name. Centre-aligned so the glyph's optical centre lines up
-           *  with the input's, and the "auto" badge sits inside the button box. */}
-          <div className="flex items-center gap-3">
-            <button
-              type="button"
-              data-testid="folder-config-icon"
-              aria-label={i18nT('components.folderConfigModal.icon')}
-              aria-expanded={emojiOpen}
-              onClick={() => setEmojiOpen(o => !o)}
-              className="relative shrink-0 w-11 h-11 grid place-items-center text-[20px] leading-none rounded-[10px] bg-bg-elevated border border-dashed border-border-strong cursor-pointer transition-colors hover:border-accent hover:bg-accent-subtle"
-            >
-              {glyph}
-              {!draft.icon && (
-                <span className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 px-1 text-[10px] leading-[1.3] rounded-full bg-card border border-border text-muted">
-                  {i18nT('components.folderConfigModal.auto')}
-                </span>
-              )}
-            </button>
-            <label htmlFor="folder-config-name-input" className="flex-1 min-w-0 flex flex-col gap-1.5">
-              <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.name')}</span>
-              <Input
-                ref={nameRef}
-                id="folder-config-name-input"
-                className="w-full"
-                data-testid="folder-config-name"
-                placeholder={i18nT('components.folderConfigModal.name_placeholder')}
-                value={draft.name}
-                onChange={e => setDraft(d => ({ ...d, name: e.target.value }))}
-                {...ime.composition}
-                onKeyDown={e => { if (e.key === 'Enter' && !ime.isComposing(e)) { e.preventDefault(); submit() } }}
-              />
-            </label>
-          </div>
+          {/* Name. The folder's identity mark is a palette color, applied to
+           *  the swatch row below — there is no per-folder icon to preview,
+           *  so the name input owns the full width. */}
+          <label htmlFor="folder-config-name-input" className="flex flex-col gap-1.5">
+            <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.name')}</span>
+            <Input
+              ref={nameRef}
+              id="folder-config-name-input"
+              className="w-full"
+              data-testid="folder-config-name"
+              placeholder={i18nT('components.folderConfigModal.name_placeholder')}
+              value={draft.name}
+              onChange={e => setDraft(d => ({ ...d, name: e.target.value }))}
+              {...ime.composition}
+              onKeyDown={e => { if (e.key === 'Enter' && !ime.isComposing(e)) { e.preventDefault(); submit() } }}
+            />
+          </label>
 
-          {/* Emoji panel — inline rather than a nested popover, so it cannot fight
-           *  the modal for focus or stack a second dismissable layer. */}
-          {emojiOpen && (
-            <div className="rounded-lg border border-border bg-bg-accent p-3 flex flex-col gap-2">
-              <div className="flex items-center gap-2 text-muted">
-                <span className="text-[11.5px] font-semibold">{i18nT('components.folderConfigModal.icon')}</span>
-                <button
-                  type="button"
-                  data-testid="folder-config-icon-reset"
-                  className="ml-auto flex items-center gap-1 text-[11px] text-muted hover:text-accent bg-transparent border-none cursor-pointer p-0"
-                  onClick={() => { setDraft(d => ({ ...d, icon: '', regenerateIcon: mode === 'edit' })); setCustomEmoji(''); setIconErr(false) }}
-                >
-                  <RotateCcw size={11} /> {i18nT('components.folderConfigModal.reset_to_auto')}
-                </button>
-              </div>
-              <div className="grid grid-cols-8 gap-0.5">
-                {FOLDER_EMOJIS.map(em => (
+          {/* Color — always visible, compact. Leading "no color" swatch
+           *  doubles as the remove affordance, so there is no separate reset
+           *  control. */}
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.color')}</span>
+            <div className="flex items-center gap-1 flex-wrap">
+              <button
+                type="button"
+                data-testid="folder-config-color-reset"
+                title={i18nT('components.folderConfigModal.no_color')}
+                aria-label={i18nT('components.folderConfigModal.no_color')}
+                aria-pressed={!draft.color}
+                onClick={() => setDraft(d => ({ ...d, color: '' }))}
+                className={`relative w-5 h-5 rounded-full cursor-pointer border overflow-hidden bg-bg-elevated border-border-strong ${!draft.color ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+              >
+                {/* diagonal slash = the universal "none" cell */}
+                <span aria-hidden className="absolute left-1/2 top-1/2 w-[26px] h-px bg-danger -translate-x-1/2 -translate-y-1/2 rotate-45" />
+              </button>
+              {FOLDER_COLOR_PALETTE.map(({ value, label }) => {
+                const name = label()
+                return (
                   <button
-                    key={em}
+                    key={value}
                     type="button"
-                    aria-label={`${i18nT('components.folderConfigModal.icon')} ${em}`}
-                    aria-pressed={draft.icon === em}
-                    onClick={() => chooseEmoji(em)}
-                    className={`h-7 flex items-center justify-center rounded cursor-pointer bg-transparent border-none text-[15px] leading-none hover:bg-bg-hover ${draft.icon === em ? 'bg-accent-subtle ring-1 ring-accent' : ''}`}
-                  >{em}</button>
-                ))}
-              </div>
-              <Input
-                className={`w-full text-[12px] py-1 ${iconErr ? 'border-danger' : ''}`}
-                maxLength={16}
-                data-testid="folder-config-icon-custom"
-                aria-label={i18nT('components.folderConfigModal.custom_emoji')}
-                placeholder={i18nT('components.folderConfigModal.or_type_paste_an_emoji')}
-                value={customEmoji}
-                onChange={e => { setCustomEmoji(e.target.value); if (iconErr) setIconErr(false) }}
-                {...ime.composition}
-                onKeyDown={e => {
-                  if (e.key !== 'Enter' || ime.isComposing(e)) return
-                  e.preventDefault(); e.stopPropagation()   // don't submit the whole form
-                  const v = customEmoji.trim()
-                  if (!v) return
-                  if (!isSingleEmoji(v)) { setIconErr(true); return }
-                  chooseEmoji(v)
-                }}
-              />
-              {iconErr && <div className="text-[11px] text-danger">{i18nT('components.folderConfigModal.enter_a_single_emoji')}</div>}
+                    title={i18nT('components.folderConfigModal.set_color_to_name', { name })}
+                    aria-label={i18nT('components.folderConfigModal.set_color_to_name', { name })}
+                    aria-pressed={draft.color === value}
+                    onClick={() => setDraft(d => ({ ...d, color: value }))}
+                    className={`w-5 h-5 rounded-full cursor-pointer border transition-transform hover:scale-110 ${draft.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                    style={{ background: `color-mix(in srgb, ${value} 30%, var(--bg-elevated))`, borderColor: value }}
+                  />
+                )
+              })}
             </div>
-          )}
+          </div>
 
           {/* Project directory */}
           <div className="flex flex-col gap-1.5">
@@ -377,32 +329,28 @@ export default function FolderConfigModal({
             )}
           </div>
 
-          {/* Default agent */}
-          <label htmlFor="folder-config-agent-select" className="flex flex-col gap-1.5">
+          {/* Default agent. SimpleSelect renders a <button>, not a <select>, so
+           *  this block is a plain div like the project-directory one above and
+           *  the heading's own key doubles as the control's aria-label — an
+           *  external <label htmlFor> cannot associate with it. Its popup
+           *  portals at z-[9999], above the modal's z-[101], the same way
+           *  ProjectPicker's does below. */}
+          <div className="flex flex-col gap-1.5">
             <span className="flex items-center gap-1.5 text-[11.5px] font-semibold text-muted">
               <Zap size={12} className="shrink-0" /> {i18nT('components.folderConfigModal.default_agent')}
             </span>
-            <select
-              id="folder-config-agent-select"
-              data-testid="folder-config-agent"
-              className="bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm outline-none cursor-pointer focus-ring"
+            <SimpleSelect
+              aria-label={i18nT('components.folderConfigModal.default_agent')}
+              options={agentOptions}
+              optionLabels={agentOptionLabels}
+              clearLabel={globalDefaultAgent
+                ? i18nT('components.folderConfigModal.inherit_named', { agent: globalDefaultAgent })
+                : i18nT('components.folderConfigModal.none')}
               value={draft.defaultAgent}
-              onChange={e => setDraft(d => ({ ...d, defaultAgent: e.target.value }))}
-            >
-              <option value="">
-                {globalDefaultAgent
-                  ? i18nT('components.folderConfigModal.inherit_named', { agent: globalDefaultAgent })
-                  : i18nT('components.folderConfigModal.none')}
-              </option>
-              {orphanAgent && (
-                <option value={orphanAgent}>
-                  {i18nT('components.folderConfigModal.agent_not_installed', { agent: orphanAgent })}
-                </option>
-              )}
-              {installedAgents.map(a => <option key={a.name} value={a.name}>{a.name}</option>)}
-            </select>
+              onChange={v => setDraft(d => ({ ...d, defaultAgent: v }))}
+            />
             <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.default_agent_hint')}</span>
-          </label>
+          </div>
         </div>
       </Modal>
 

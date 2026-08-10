@@ -91,11 +91,13 @@ credential directories by bind-mount (Linux user + mount namespaces) or file-rea
 denial (macOS Seatbelt), and scrubbing credential-bearing environment variables
 on the way in. The parent gateway process is unaffected.
 
-**`agent.sandbox` defaults to `"off"`, and the only other selectable value is
-`"auto"`** (`config/loader.py`, `AgentConfig.sandbox`, `enum=["auto", "off"]`;
+**`agent.sandbox` defaults to `"auto"`, engaging OS-level isolation
+(namespace on Linux, sandbox-exec on macOS).** The only alternative value is
+`"off"` (`config/loader.py`, `AgentConfig.sandbox`, `enum=["auto", "off"]`;
 the same two-value enum gates the dashboard config editor in
-`dashboard/handlers/core.py`). `"off"` is not "no isolation": it defers isolation
-to `kiro-cli`'s own internal agent sandbox, which cannot nest inside Kiro Crew's
+`dashboard/handlers/core.py`). `"off"` skips Kiro Crew's own sandbox but still
+delegates to `kiro-cli`'s internal agent sandbox on macOS when it is enabled,
+which cannot nest inside Kiro Crew's
 Seatbelt wrap (the macOS kernel returns EPERM even under an allow-all outer
 profile), so exactly one layer can own isolation per spawn. Setting `"auto"`
 re-enables Kiro Crew's own sandbox.
@@ -116,7 +118,12 @@ Two properties are load-bearing at the architecture level:
   a mode other than `off`, `wrap_argv` raises rather than spawning unconfined.
   Running unconfined is an explicit opt-in (`agent.sandbox_allow_unsandboxed_exec`);
   a separate flag (`agent.sandbox_allow_no_isolation`) only demotes the warning's
-  log level and does not permit execution.
+  log level and does not permit execution. The opt-in's default is
+  **platform-independent** — a platform-derived default would grant unconfined
+  execution on every backend-less host with no operator having declared it — so
+  the discoverable path is instead a consent step in `kirocrew setup`, which
+  prompts (default no) when `detect_backend()` reports `"none"` and writes the
+  key only on an explicit yes.
 - **Delegation is audited, never silent.** When `kiro-cli`'s internal sandbox owns
   isolation for a spawn, the decision is config-driven (never a reaction to a wrap
   failure), logged once per process, and SEL-audited on an audit-or-deny basis: if

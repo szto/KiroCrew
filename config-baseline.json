@@ -17,6 +17,8 @@
         "approval_mode": "auto",
         "streaming": true,
         "model": "auto",
+        "role_models": {},
+        "role_efforts": {},
         "reasoning_effort": "",
         "provider": "acp",
         "default_agent": "",
@@ -24,6 +26,7 @@
         "sandbox_allow_no_isolation": false,
         "sandbox_allow_unsandboxed_exec": false,
         "apps_allow_third_party": false,
+        "apps_trusted": [],
         "jail": "auto",
         "dangerously_skip_permissions": false,
         "yolo_duration": "6h",
@@ -105,6 +108,62 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": "auto"
+    },
+    {
+      "path": "agent.role_models",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Per-role models",
+      "help": "Optional per-task-class model overrides. Keys: 'background' (lite / heartbeat background workers) and 'subagent' (spawned sub-agents). An empty value or 'auto' defers to the chat default (agent.model) and then to the provider default, so an unpinned role stays usable on every subscription tier. Pin a cheaper model here to run background / sub-agent work on it without changing the interactive chat default.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "agent.role_models.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "agent.role_efforts",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Per-role reasoning effort",
+      "help": "Optional per-task-class reasoning effort, paired with role_models (keys: 'background', 'subagent'). Empty for a role inherits the chat default (agent.reasoning_effort) and then the provider/model default. Only applies on reasoning-capable models.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "agent.role_efforts.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "agent.reasoning_effort",
@@ -197,7 +256,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Allow Unsandboxed Execution",
-      "help": "When true, allow agent subprocesses to execute without any sandbox backend (fail-open). When false (default), wrap_argv raises a RuntimeError if no sandbox backend is available and mode is not 'off', preventing unsandboxed execution entirely (fail-closed). This is distinct from sandbox_allow_no_isolation which only controls warning severity — this field controls whether execution proceeds at all.",
+      "help": "When true, allow agent subprocesses to execute without any sandbox backend (fail-open). When false (default), wrap_argv raises a RuntimeError if no sandbox backend is available and mode is not 'off', preventing unsandboxed execution entirely (fail-closed). This is distinct from sandbox_allow_no_isolation which only controls warning severity — this field controls whether execution proceeds at all. The default is platform-independent: on a host with no backend (any Windows host, a Linux kernel refusing user namespaces) `kirocrew setup` OFFERS this opt-in interactively and writes it only on an explicit yes, so unconfined execution stays operator-declared and is never enabled implicitly by the platform.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
@@ -211,10 +270,38 @@
       "sensitive": false,
       "tags": [],
       "label": "Allow Third-Party Apps",
-      "help": "Explicitly allow executable code from third-party (non-builtin) apps. Defaults to false. Only the JSON boolean true admits in-process Python hooks, backend processes, lifecycle/install scripts, and openCommand. App code can access the filesystem, network, and in-memory credentials; enable this only for apps you trust (CSE SEC-012).",
+      "help": "Explicitly allow executable code from third-party (non-builtin) apps. Defaults to false. Only the JSON boolean true admits in-process Python hooks, backend processes, lifecycle/install scripts, and openCommand. App code can access the filesystem, network, and in-memory credentials; enable this only for apps you trust (CSE SEC-012). Prefer apps_trusted, which grants the same admission to ONE named app.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
+    },
+    {
+      "path": "agent.apps_trusted",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Trusted Apps",
+      "help": "Per-app grants for third-party execution — the narrow form of apps_allow_third_party. An app whose manifest name appears here is admitted to run Python hooks, its backend, lifecycle scripts, and openCommand; every other third-party app stays blocked. Only a JSON array of app-name strings is honoured, and no wildcard entry is accepted (use apps_allow_third_party to trust all).",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "agent.apps_trusted.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "agent.jail",
@@ -1301,7 +1388,11 @@
         "embed_timeout_secs": 10.0,
         "embed_content_budget": 0,
         "pool_idle_ttl_secs": 300,
-        "auto_ingest_doc_links": false,
+        "auto_add_documents": true,
+        "auto_register_project_docs": true,
+        "auto_ingest_chunk_budget": 150,
+        "folder_ingest_chunk_budget": 300,
+        "dedup_every_n_sweeps": 12,
         "doc_ingest_hosts": [],
         "auto_discover_folder": false,
         "auto_discover_dirname": "knowledge-docs"
@@ -1411,18 +1502,74 @@
       "defaultValue": 300
     },
     {
-      "path": "knowledge.auto_ingest_doc_links",
+      "path": "knowledge.auto_add_documents",
       "kind": "core",
       "type": "boolean",
       "required": false,
       "deprecated": false,
       "sensitive": false,
       "tags": [],
-      "label": "Auto-Ingest Doc Links",
-      "help": "Automatically ingest documents referenced by links pasted into chat whose host is in the doc-ingest allowlist. Off by default. An edition that supplies a doc-link scanner (via the dashboard on_user_message seam) uses this + the host allowlist below; inert in the public build unless a link scanner is wired.",
+      "label": "Auto-Add Documents",
+      "help": "Let the agent add documents it comes across during normal work to the Knowledge Library, so they become searchable later. The agent reads the document with its own tools, under your approval, and hands over the text -- Kiro Crew fetches nothing itself, so the doc-ingest host allowlist below does not apply. Added documents appear in a single aggregate 'Auto-added' source you can remove in one click. On by default. Renamed from auto_ingest_doc_links, which is still accepted.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": false
+      "defaultValue": true
+    },
+    {
+      "path": "knowledge.auto_register_project_docs",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Auto-Register Project Documents",
+      "help": "Register the documents of each project you work in as a Knowledge source automatically, so a project's design docs, specs and READMEs become searchable without adding the folder by hand. Only documents are taken (.md/.pdf/.docx/.org above a small size floor, excluding agent instructions, generated files and repository boilerplate) -- never source code. No confirmation step: the document filter and the per-sweep chunk budget below bound the cost, and deleting the source keeps it deleted. On by default.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
+      "path": "knowledge.auto_ingest_chunk_budget",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Auto-Ingest Chunk Budget",
+      "help": "Chunks an automatically-registered source may ingest per watcher sweep. Each chunk costs one LLM extraction call, so this is what actually bounds the cost of auto-registration -- file filters bound pollution, not spend. Newest documents land first and the rest trickle in on later sweeps, so a new project never arrives as a burst. 0 removes the bound.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 150
+    },
+    {
+      "path": "knowledge.folder_ingest_chunk_budget",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Folder Ingest Chunk Budget",
+      "help": "Chunks a folder you add by hand may ingest per watcher sweep. Adding a source-code repository discovers thousands of files, and each chunk costs an LLM extraction call on a pool of billed sessions, so an unpaced first scan can spend a large amount unattended. Nothing is skipped: newest files land first and the rest continue on later sweeps. Higher than the auto-ingest budget because you asked for the folder explicitly. 0 removes the bound; a per-source chunk_budget property overrides it for one folder.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 300
+    },
+    {
+      "path": "knowledge.dedup_every_n_sweeps",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "De-duplicate Every N Sweeps",
+      "help": "Run a full duplicate-collapsing pass every Nth watcher sweep. The per-write gate refuses a byte-identical document, but only a full pass catches a near-duplicate (the same document edited slightly between two sources) or duplicates that already existed. At the default 300s sweep interval, 12 is roughly hourly. 0 disables it.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 12
     },
     {
       "path": "knowledge.doc_ingest_hosts",
@@ -1433,7 +1580,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Doc-Ingest Host Allowlist",
-      "help": "Exact hostnames whose links may be auto-ingested when auto_ingest_doc_links is on. Empty = ingest nothing (SSRF-safe deny-by-default): a link is only fetched if its host is an exact member of this list. Prevents a pasted link to an internal metadata endpoint or arbitrary host from being fetched.",
+      "help": "Exact hostnames whose links may be fetched by KIROCREW ITSELF and ingested, for an edition that wires a server-side doc-link scanner. Empty = fetch nothing (SSRF-safe deny-by-default). This governs only that server-fetch path -- it does NOT gate 'Auto-Add Documents' above, where the agent has already fetched the content under its own approval and Kiro Crew fetches nothing. Applying it there would make the feature ingest nothing on a default config while its toggle reads on.",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": []
@@ -1493,7 +1640,7 @@
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": {
-        "max_triggered": 3,
+        "max_triggered": 0,
         "lazy_load": false,
         "auto_create_from_sessions": false,
         "auto_refine_on_deviation": false,
@@ -1505,7 +1652,7 @@
         "archive_after_days": 90,
         "pending_ttl_days": 30,
         "generate_scripts": true,
-        "judge_model": "claude-haiku-4.5",
+        "judge_model": "auto",
         "extra_paths": []
       }
     },
@@ -1518,10 +1665,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Max Triggered",
-      "help": "Maximum number of skills to load per message (≥1).",
+      "help": "Maximum number of skills a single message may flag as relevant (≥0). Each match injects that skill's full content, unless the skill sets inject_on_trigger: false (pointer-only; requires max_triggered > 0 to have any effect). Defaults to 0 (disabled): the agent discovers skills from the Available Skills index and reads them on demand via cat, $skillname, or skill_search. Set to a positive integer to re-enable per-turn word-overlap trigger matching.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 3
+      "defaultValue": 0
     },
     {
       "path": "skills.lazy_load",
@@ -1686,10 +1833,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Skill Judge Model",
-      "help": "Cheap model used for the dedupe judge and the advisory pending review. Kept separate from the main chat model to bound cost.",
+      "help": "Model used for the dedupe judge and the advisory pending review. Defaults to \"auto\" to inherit the account's governed model; the value only gates whether the judge runs (any truthy value enables it) — the judge turn itself runs on the shared background session.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": "claude-haiku-4.5"
+      "defaultValue": "auto"
     },
     {
       "path": "skills.extra_paths",
@@ -1910,6 +2057,7 @@
       "enumValues": [
         "whisper",
         "mlx",
+        "apple",
         "transcribe"
       ],
       "defaultValue": "whisper"
@@ -2040,7 +2188,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Streaming",
-      "help": "Stream partial transcripts live to the dashboard input (transcribe provider only).",
+      "help": "Stream partial transcripts live to the dashboard input. Supported by the streaming providers only: `transcribe` (AWS, cloud) and `apple` (on-device, macOS 26+). The whisper/mlx CLIs have no partial-result channel.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
@@ -2054,7 +2202,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Semantic endpointing",
-      "help": "While streaming dictation, run a fast background model on each stable transcript segment to detect when you have finished a complete request, then auto-submit. Transcribe streaming only; off by default.",
+      "help": "While streaming dictation, run a fast background model on each stable transcript segment to detect when you have finished a complete request, then auto-submit. Streaming providers only (transcribe, apple); off by default.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
@@ -3847,6 +3995,9 @@
       "enumValues": null,
       "defaultValue": {
         "url": "",
+        "tailscale": {
+          "enabled": false
+        },
         "restore_sessions": false,
         "restore_window_minutes": 30,
         "surface_channel_sessions": true,
@@ -3858,8 +4009,10 @@
         "widget_density": "more",
         "verbosity": "default",
         "link_previews": false,
+        "usage_text_scrape_enabled": false,
         "tail_fork_enabled": false,
         "auto_open_browser": true,
+        "prevent_sleep": false,
         "quick_send": false,
         "session_grid": false,
         "mcp_app_panel": false,
@@ -3879,10 +4032,11 @@
         "user_role_other": "",
         "user_technical_level": "",
         "tips_enabled": true,
+        "folder_suggestions_enabled": true,
         "tips_cadence_hours": 6.0,
         "tips_snooze_hours": 48.0,
         "tips_recency_decay": 0.6,
-        "tips_model": "claude-haiku-4.5",
+        "tips_model": "auto",
         "tips_explore_ratio": 0.2,
         "gitlab_hosts": []
       }
@@ -3900,6 +4054,36 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "dashboard.tailscale",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Tailscale",
+      "help": "Reach the dashboard over your tailnet via `tailscale serve`.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "enabled": false
+      }
+    },
+    {
+      "path": "dashboard.tailscale.enabled",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Tailnet Access",
+      "help": "Accept this machine's own MagicDNS name as a dashboard origin, so `tailscale serve` works without hand-writing dashboard.url. Reads the local Tailscale daemon once at startup; contributes nothing if Tailscale is absent, stopped, or MagicDNS is off. Does NOT widen the network bind and does NOT change authentication — every request still needs a dashboard session.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "dashboard.restore_sessions",
@@ -4039,11 +4223,12 @@
       "sensitive": false,
       "tags": [],
       "label": "Response Verbosity",
-      "help": "Controls how terse the agent's prose is. 'default' is normal; 'concise' injects brevity guidelines (lead with the answer, cut filler, keep code/errors verbatim) while preserving full detail for security warnings, irreversible-action confirmations, and ordered multi-step instructions.",
+      "help": "Controls how terse the agent's prose is. 'default' is normal; 'concise' injects brevity guidelines (lead with the answer, cut filler, keep code/errors verbatim); 'ultra' writes for an ADHD reader — the answer lands in a 3-sentence opening, and any detail after it must be scannable bullets rather than prose. Both levels preserve full detail for security warnings, irreversible-action confirmations, and ordered multi-step instructions.",
       "hasChildren": false,
       "enumValues": [
         "default",
-        "concise"
+        "concise",
+        "ultra"
       ],
       "defaultValue": "default"
     },
@@ -4057,6 +4242,20 @@
       "tags": [],
       "label": "Link Previews",
       "help": "Render http(s) links in assistant messages as favicon + page title instead of a raw URL. Off by default because it is a network decision, not a display one: this machine fetches every link the model outputs, so each linked site sees a request from your IP address. When false the /api/link-meta endpoint fetches nothing and returns 403.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "dashboard.usage_text_scrape_enabled",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Spend Credits To Read The Credit Meter",
+      "help": "Let the credit pill fall back to a `kiro-cli /usage` chat turn when the free usage API returns no plan. That fallback is a REAL billed LLM turn on whichever model the lite agent resolves, and it repeats on every refresh interval for as long as any dashboard tab is open, so it is off by default: a meter that reports spending must not itself spend. While it is off the pill shows whatever the free API returned and hides when the API has nothing to show.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
@@ -4088,6 +4287,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
+    },
+    {
+      "path": "dashboard.prevent_sleep",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Prevent Sleep While Running",
+      "help": "Keep this computer awake while the agent is running a task, so a long task is not interrupted by the machine going to sleep. Off by default. Uses caffeinate on macOS, systemd-inhibit on Linux, and SetThreadExecutionState on Windows; on a host with no keep-awake backend it is a no-op.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "dashboard.quick_send",
@@ -4335,6 +4548,20 @@
       "defaultValue": true
     },
     {
+      "path": "dashboard.folder_suggestions_enabled",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Folder Suggestions Enabled",
+      "help": "Offer to file a newly-titled, unfiled chat session into a matching folder.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
       "path": "dashboard.tips_cadence_hours",
       "kind": "core",
       "type": "number",
@@ -4385,10 +4612,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Tips Model",
-      "help": "Model ID for tips generation (pinned to Haiku-class for cost efficiency).",
+      "help": "Model ID for tips generation. Defaults to \"auto\" so it inherits the account's governed model; a hardcoded id can be rejected on accounts or partitions that do not serve it.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": "claude-haiku-4.5"
+      "defaultValue": "auto"
     },
     {
       "path": "dashboard.tips_explore_ratio",

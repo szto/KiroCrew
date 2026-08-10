@@ -24,7 +24,12 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import platform_compat
-from kiro_crew.dashboard.origin import is_https_request, is_loopback
+from kiro_crew.dashboard.cf_access import CF_ACCESS_HEADER, validate_cf_access_jwt
+from kiro_crew.dashboard.origin import (
+    is_https_request,
+    is_loopback,
+    is_proxied_request,
+)
 from kiro_crew.dashboard.refresh_tokens import (
     MAX_REFRESH_TTL_SECS,
     REFRESH_COOKIE_PATH,
@@ -246,7 +251,9 @@ class TokenStateManager:
         self._max_nonces = max_concurrent_nonces
         # OrderedDict maintains insertion order for O(1) oldest eviction
         self._nonces: OrderedDict[str, float] = OrderedDict()
-        self._ip_bindings: dict[str, tuple[str, float]] = {}  # token → (ip, exp)
+        # Observation latches for the Security Posture surface only — never read
+        # by an auth decision. See bind_ip() / proxied_pin_observed().
+        self._ip_bindings: dict[str, tuple[str, float, bool]] = {}  # token → (ip, exp, proxied)
         self._consumed: dict[str, float] = {}  # token → exp
 
     def register_nonce(self, nonce: str, expiry: float) -> str | None:
@@ -274,10 +281,41 @@ class TokenStateManager:
             self._nonces.move_to_end(nonce)
             return True, ""
 
-    def bind_ip(self, token: str, ip: str, session_exp: float) -> None:
-        """Bind a token to a client IP address."""
+    def bind_ip(self, token: str, ip: str, session_exp: float, proxied: bool = False) -> None:
+        """Bind a token to a client IP address.
+
+        ``proxied`` records that *ip* came from a same-host proxy rather than
+        from the client itself, which means this binding pins the token to the
+        proxy and is therefore shared by every client behind it. It is an
+        observation for the Security Posture surface only — it does not change
+        the binding or how :meth:`check_ip` compares it.
+        """
         with self._lock:
-            self._ip_bindings[token] = (ip, session_exp)
+            self._ip_bindings[token] = (ip, session_exp, proxied)
+
+    def proxied_pin_observed(self, now: float) -> bool | None:
+        """Report the pin scope of the sessions that are LIVE at *now*.
+
+        ``None`` = no session is currently pinned, so there is no scope to
+        report — which is NOT the same as "pins are effective" and must not be
+        rendered as if it were. ``True`` = at least one live session is pinned to
+        a same-host proxy's address and is therefore shared by every client
+        behind it. ``False`` = live sessions are pinned to client addresses.
+
+        Derived from the bindings rather than from a latch, deliberately. A latch
+        would outlive the sessions it describes: one tunnelled login would report
+        SHARED until the gateway restarted, even after that session expired and
+        the user went back to direct access — the same class of stale claim this
+        reporting exists to remove.
+
+        Filters on ``exp`` rather than trusting :meth:`evict_expired` to have
+        run, so the answer never depends on when eviction last happened.
+        """
+        with self._lock:
+            live_proxied = [p for _, exp, p in self._ip_bindings.values() if exp > now]
+            if not live_proxied:
+                return None
+            return any(live_proxied)
 
     def check_ip(self, token: str, ip: str) -> bool:
         """Check if token is bound to the given IP (or unbound)."""
@@ -310,7 +348,7 @@ class TokenStateManager:
         """Remove all expired entries from all state stores."""
         with self._lock:
             # Evict expired IP bindings
-            expired_tokens = [t for t, (_, exp) in self._ip_bindings.items() if exp < now]
+            expired_tokens = [t for t, (_, exp, _p) in self._ip_bindings.items() if exp < now]
             for t in expired_tokens:
                 self._ip_bindings.pop(t, None)
             # Evict consumed tokens independently using their own expiry
@@ -379,12 +417,44 @@ _BYPASS_EXACT = {
     "/api/health",
     "/api/live",
     "/api/ready",
-    # Microsoft Teams inbound webhook: Bot Framework (Microsoft's servers, no
-    # dashboard cookie) POSTs activities here. The handler does its OWN auth --
-    # it validates the Bot Framework JWT (issuer + App-ID audience + signature)
-    # before processing -- so it must bypass the dashboard cookie gate. Same
-    # self-authenticating-external-caller class as a chat provider webhook.
-    "/api/messaging/teams",
+}
+
+# Exact-path bypasses that apply to SOME methods only, path -> allowed methods.
+#
+# A path-only bypass is unsound whenever another route pattern also matches the
+# same literal path under a different method: the entry opens every one of those
+# methods, not just the self-authenticating one it was written for. Scoping the
+# entry to the method whose handler does its own auth leaves the rest on the
+# ordinary token gate. Every self-authenticating webhook belongs here rather than
+# in the path-only set above, whether or not another route currently collides —
+# the collision is a property of the route table, which moves.
+#
+# ``POST /api/hooks/agent`` is the inbound agent webhook: external systems (CI
+# runners, code-review bots, deploy pipelines) post here holding a webhook token
+# and nothing else — no dashboard cookie, no gateway IPC secret. The handler does
+# its OWN auth (api_hooks_agent -> _verify_hook_token compares the bearer against
+# the sha256 of every stored token entry with hmac.compare_digest and refuses
+# with 401 when none match, including when no token exists at all, so the
+# endpoint is closed by default on a fresh install). It is a deliberate exposure
+# decision: a valid token authorizes a real agent turn with full tool access, so
+# the handler also rate-limits repeated failures per source
+# (webhooks.auth_throttle) and records every 401 in the run history.
+#
+# For that entry the method scope is load-bearing, not tidiness. The literal
+# string ``agent`` also matches the ``{hook_id}`` wildcard of the dashboard's own
+# hook CRUD routes — PUT and DELETE ``/api/hooks/{hook_id}`` — whose handler
+# (api_hook_detail) authenticates via the dashboard token alone. Unscoped, both
+# reach it with no credential of any kind.
+#
+# ``POST /api/messaging/teams`` is the Microsoft Teams inbound webhook: Bot
+# Framework (Microsoft's servers, no dashboard cookie) posts activities there and
+# the handler does its OWN auth, validating the Bot Framework JWT (issuer +
+# App-ID audience + signature) before processing. Only POST is routed today, so
+# the scope closes nothing yet — it is here so the shape a future entry gets
+# copied from is the safe one.
+_BYPASS_EXACT_METHODS: dict[str, frozenset[str]] = {
+    "/api/hooks/agent": frozenset({"POST"}),
+    "/api/messaging/teams": frozenset({"POST"}),
 }
 
 # Anchored bypass for installed-app static UI bundles only (federated-app
@@ -920,9 +990,29 @@ def _evict_expired() -> None:
     _state.evict_expired(time.time())
 
 
-def bind_token_ip(token: str, ip: str, session_exp: float = 0.0) -> None:
-    """Bind a token to a client IP for session validation."""
-    _state.bind_ip(token, ip, session_exp or time.time() + MAX_SESSION_TTL_SECS)
+def bind_token_ip(
+    token: str, ip: str, session_exp: float = 0.0, proxied: bool = False
+) -> None:
+    """Bind a token to a client IP for session validation.
+
+    ``proxied`` is an observation only (see ``_TokenState.bind_ip``): it records
+    that *ip* is a same-host proxy's address rather than the client's, so the
+    Security Posture surface can report that the pin is shared. It never changes
+    the binding or the comparison.
+    """
+    _state.bind_ip(token, ip, session_exp or time.time() + MAX_SESSION_TTL_SECS, proxied)
+
+
+def proxied_pin_observed() -> bool | None:
+    """Report the pin scope of the sessions live right now.
+
+    ``None`` = nothing is currently pinned (no scope to report), ``True`` = at
+    least one live session is pinned to a same-host proxy address and is
+    therefore shared by every client behind it, ``False`` = live sessions are
+    pinned to client addresses. Recovers on its own once proxied sessions
+    expire — no gateway restart needed.
+    """
+    return _state.proxied_pin_observed(time.time())
 
 
 def check_token_ip(token: str, ip: str) -> bool:
@@ -1190,6 +1280,8 @@ def token_auth_middleware(
     port: int = 5476,
     local_only: bool = True,
     spa_shell_handler: Callable[..., Any] | None = None,
+    cf_access_team_domain: str = "",
+    cf_access_aud: str = "",
 ) -> Callable[..., Any]:
     """Factory returning aiohttp middleware for token-based dashboard auth.
 
@@ -1208,6 +1300,14 @@ def token_auth_middleware(
     of hard-denying, so DCV/SSH-forwarded browsers polling these routes
     (e.g. ``/api/spawn`` every 5s) don't trigger false session-expired
     banners.  Use this for any internal-path that the browser polls.
+
+    *cf_access_team_domain* + *cf_access_aud* (both required to enable)
+    turn on Cloudflare Access trust: a request with no valid token/cookie
+    that carries a ``Cf-Access-Jwt-Assertion`` header signed by the team
+    domain for that audience is authenticated as the JWT's ``email`` and
+    minted the normal access + refresh cookies — no token-URL paste. A
+    failed assertion never widens access: it falls through to the exact
+    deny/SPA-shell handling that runs when the header is absent.
 
     """
 
@@ -1234,6 +1334,63 @@ def token_auth_middleware(
         if not token:
             return False, "", "no token", ""
         return validate_token_with_app(token, use_session_exp=True)
+
+    async def _try_cf_access(request: web.Request) -> tuple[str, str, float] | None:
+        """Authenticate via a Cloudflare Access assertion, if configured.
+
+        Returns ``(email, session_token, session_exp)`` on success, else
+        ``None`` so the caller falls through to the normal deny/SPA-shell
+        handling. The minted session token is IP-bound like a token-URL
+        session; ``register_nonce=False`` because there is no link nonce.
+        """
+        if not (cf_access_team_domain and cf_access_aud):
+            return None
+        assertion = request.headers.get(CF_ACCESS_HEADER, "")
+        if not assertion:
+            return None
+        valid, email, reason = await validate_cf_access_jwt(
+            assertion, cf_access_team_domain, cf_access_aud
+        )
+        if not valid:
+            # Log the rejected assertion (forged / expired / wrong app) but do
+            # NOT deny here — the request is handled exactly as if the header
+            # were absent, so a bad assertion never changes the auth surface.
+            _log_auth(request, "", "cf_denied", reason)
+            return None
+        session_exp = time.time() + MAX_SESSION_TTL_SECS
+        session_token = generate_token(
+            email, ttl_seconds=MAX_SESSION_TTL_SECS, register_nonce=False
+        )
+        bind_token_ip(
+            session_token,
+            request.remote or "unknown",
+            session_exp,
+            is_proxied_request(request),
+        )
+        return email, session_token, session_exp
+
+    async def _serve_cf_access(
+        request: web.Request,
+        handler: object,
+        user_id: str,
+        session_token: str,
+        session_exp: float,
+    ) -> web.StreamResponse:
+        """Serve an Access-authenticated request and mint its session cookies."""
+        request["user"] = user_id
+        request["app"] = ""
+        resp = await handler(request)  # type: ignore[operator]
+        _attach_auth_cookies(
+            resp,
+            request,
+            cookie_name=f"mc_token_{_cookie_port_from_host(request, port)}",
+            session_token=session_token,
+            session_exp=session_exp,
+            user_id=user_id,
+            port=port,
+        )
+        _log_auth(request, user_id, "ok", "cf_access")
+        return resp  # type: ignore[return-value]
 
     @web.middleware
     async def middleware(request: web.Request, handler: object) -> web.StreamResponse:
@@ -1428,6 +1585,11 @@ def token_auth_middleware(
             return await handler(request)  # type: ignore[operator]
         if path in _BYPASS_EXACT:
             return await handler(request)  # type: ignore[operator]
+        # Method-scoped exact bypasses. A non-listed method on the same path
+        # falls through to the ordinary token gate rather than bypassing it.
+        _bypass_methods = _BYPASS_EXACT_METHODS.get(path)
+        if _bypass_methods is not None and request.method in _bypass_methods:
+            return await handler(request)  # type: ignore[operator]
         # Icon files: anchored regex with bounded digit count to prevent
         # ReDoS and ensure only legitimate PWA icon paths bypass auth.
         if re.fullmatch(r"/icon-\d{1,4}\.png", path):
@@ -1471,6 +1633,14 @@ def token_auth_middleware(
             from_cookie = bool(token)
 
         if not token:
+            # Cloudflare Access trust: a signed team-domain assertion
+            # authenticates the request outright — the CF-vetted browser never
+            # sees the token-paste banner. Checked before the SPA-shell bypass
+            # so an Access-authenticated navigation gets real content plus a
+            # minted session, not the unauthenticated shell.
+            _cf = await _try_cf_access(request)
+            if _cf is not None:
+                return await _serve_cf_access(request, handler, *_cf)
             # Cold-start (no token — e.g. the access cookie expired over a
             # weekend). Serve the shell directly (not the matched handler) so
             # the app boots and self-recovers via the refresh cookie. Default-
@@ -1486,6 +1656,13 @@ def token_auth_middleware(
             token, use_session_exp=from_cookie
         )
         if not valid:
+            # Expired/forged token but a valid Access assertion: re-mint the
+            # session transparently (the fresh cookies overwrite the stale
+            # ones). This is what lets a CF-fronted browser recover from a
+            # lapsed session without ever seeing the session-expired banner.
+            _cf = await _try_cf_access(request)
+            if _cf is not None:
+                return await _serve_cf_access(request, handler, *_cf)
             # Cold-start variant: an expired/forged token is present (cookie
             # survived but its token lapsed). Same rationale — serve the shell
             # so the SPA can boot and silently refresh.
@@ -1580,8 +1757,16 @@ def token_auth_middleware(
                 # an in-memory check and is cheap enough to run inline.
                 await asyncio.to_thread(_get_revoked_store().revoke, _link_nonce, session_exp)
             # Bind the SESSION token (what becomes the cookie) to the client IP,
-            # not the consumed URL token.
-            bind_token_ip(session_token, client_ip, session_exp)
+            # not the consumed URL token. ``proxied`` is recorded so Security
+            # Posture can tell the user whether that pin is per-client or shared
+            # with everyone behind a same-host tunnel — it does not affect the
+            # binding itself.
+            bind_token_ip(
+                session_token,
+                client_ip,
+                session_exp,
+                is_proxied_request(request),
+            )
 
             # Token-consumption anchor seam (Default: no-op, OSS-identical). A
             # Slack challenge-redirect link, once opened on a verified device,
@@ -1625,87 +1810,113 @@ def token_auth_middleware(
 
         # Set cookie after handler (needs response object)
         if not from_cookie:
-            cookie_max_age = MAX_SESSION_TTL_SECS
-            if session_exp:
-                remaining = int(session_exp - time.time())
-                if 0 < remaining <= MAX_SESSION_TTL_SECS:
-                    cookie_max_age = remaining
-            resp.set_cookie(
-                cookie_name,
-                session_token,
-                httponly=True,
-                samesite="Lax",
-                # Secure only when over HTTPS (direct or via a
-                # TLS-terminating tunnel/proxy — see is_https_request).
-                # Localhost plain HTTP must not set it or the browser
-                # refuses to send it back.
-                secure=is_https_request(request),
-                path="/",
-                max_age=cookie_max_age,
+            _attach_auth_cookies(
+                resp,
+                request,
+                cookie_name=cookie_name,
+                session_token=session_token,
+                session_exp=session_exp,
+                user_id=user_id,
+                port=port,
             )
-            # Clean up legacy cookie from pre-port-specific era
-            resp.set_cookie("mc_token", "", max_age=0, path="/")
-
-            # Trim other-port auth cookies from the shared 127.0.0.1 jar so it
-            # can't grow past aiohttp's header limit (see
-            # refresh_tokens.foreign_port_cookies). Gated on jar size so live
-            # co-existing gateways keep their sessions until accumulation
-            # genuinely threatens overflow. This page request only carries
-            # other-port ACCESS cookies (path "/"); other-port refresh cookies
-            # (path "/api/auth") are trimmed on the next refresh call.
-            if cookie_jar_needs_pruning(request.cookies):
-                for _stale_name, _stale_path in foreign_port_cookies(
-                    request.cookies, _cookie_port_from_host(request, port)
-                ):
-                    resp.set_cookie(_stale_name, "", max_age=0, path=_stale_path)
-
-            # Initial mint via token URL: also attach a refresh cookie so
-            # the user does not have to re-mint via URL every ~20h. Inlined
-            # here (rather than calling handlers.auth_refresh) to keep the
-            # import top-level and the cycle direction one-way:
-            # token_auth → refresh_tokens, never the reverse.
-            try:
-                refresh_token, chain_id, _jti, refresh_exp = generate_refresh_token(user_id)
-                refresh_remaining = int(refresh_exp - time.time())
-                if refresh_remaining > 0:
-                    resp.set_cookie(
-                        refresh_cookie_name(_cookie_port_from_host(request, port)),
-                        refresh_token,
-                        httponly=True,
-                        samesite="Lax",
-                        secure=is_https_request(request),
-                        path=REFRESH_COOKIE_PATH,
-                        max_age=min(refresh_remaining, MAX_REFRESH_TTL_SECS),
-                    )
-                    # Audit the initial-mint event so forensics can trace any
-                    # subsequent chain revocation back to the user it was issued to.
-                    try:
-                        _sel_fn().log_api_access(
-                            caller=user_id,
-                            operation="refresh_token_initial_mint",
-                            outcome="ok",
-                            source="refresh_tokens",
-                            resources=chain_id,
-                        )
-                    except Exception as exc:  # pragma: no cover
-                        # SEL must never block auth flows, but log the failure
-                        # so it's observable.
-                        logger.debug("token_auth: SEL audit failed: %s", exc)
-            except Exception as _refresh_err:
-                # Refresh cookie is best-effort. If something goes wrong
-                # here, the access cookie still works as before — the
-                # user just won't get the refresh upgrade until next mint.
-                logger.warning(
-                    "token_auth: failed to attach refresh cookie (%s); "
-                    "access cookie still set, user can re-mint as before",
-                    _refresh_err,
-                )
 
         _log_auth(request, user_id, "ok", "")
         return resp  # type: ignore[return-value]
 
     middleware._is_token_auth = True  # type: ignore[attr-defined]  # sentinel for server.py security gate
     return middleware
+
+
+def _attach_auth_cookies(
+    resp: web.StreamResponse,
+    request: web.Request,
+    *,
+    cookie_name: str,
+    session_token: str,
+    session_exp: float,
+    user_id: str,
+    port: int,
+) -> None:
+    """Attach the freshly-minted access cookie + paired refresh cookie.
+
+    Shared by the token-URL exchange and the Cloudflare Access auto-login —
+    both mint a brand-new session and must issue identical cookie material.
+    """
+    cookie_max_age = MAX_SESSION_TTL_SECS
+    if session_exp:
+        remaining = int(session_exp - time.time())
+        if 0 < remaining <= MAX_SESSION_TTL_SECS:
+            cookie_max_age = remaining
+    resp.set_cookie(
+        cookie_name,
+        session_token,
+        httponly=True,
+        samesite="Lax",
+        # Secure only when over HTTPS (direct or via a
+        # TLS-terminating tunnel/proxy — see is_https_request).
+        # Localhost plain HTTP must not set it or the browser
+        # refuses to send it back.
+        secure=is_https_request(request),
+        path="/",
+        max_age=cookie_max_age,
+    )
+    # Clean up legacy cookie from pre-port-specific era
+    resp.set_cookie("mc_token", "", max_age=0, path="/")
+
+    # Trim other-port auth cookies from the shared 127.0.0.1 jar so it
+    # can't grow past aiohttp's header limit (see
+    # refresh_tokens.foreign_port_cookies). Gated on jar size so live
+    # co-existing gateways keep their sessions until accumulation
+    # genuinely threatens overflow. This page request only carries
+    # other-port ACCESS cookies (path "/"); other-port refresh cookies
+    # (path "/api/auth") are trimmed on the next refresh call.
+    if cookie_jar_needs_pruning(request.cookies):
+        for _stale_name, _stale_path in foreign_port_cookies(
+            request.cookies, _cookie_port_from_host(request, port)
+        ):
+            resp.set_cookie(_stale_name, "", max_age=0, path=_stale_path)
+
+    # Initial mint via token URL: also attach a refresh cookie so
+    # the user does not have to re-mint via URL every ~20h. Inlined
+    # here (rather than calling handlers.auth_refresh) to keep the
+    # import top-level and the cycle direction one-way:
+    # token_auth → refresh_tokens, never the reverse.
+    try:
+        refresh_token, chain_id, _jti, refresh_exp = generate_refresh_token(user_id)
+        refresh_remaining = int(refresh_exp - time.time())
+        if refresh_remaining > 0:
+            resp.set_cookie(
+                refresh_cookie_name(_cookie_port_from_host(request, port)),
+                refresh_token,
+                httponly=True,
+                samesite="Lax",
+                secure=is_https_request(request),
+                path=REFRESH_COOKIE_PATH,
+                max_age=min(refresh_remaining, MAX_REFRESH_TTL_SECS),
+            )
+            # Audit the initial-mint event so forensics can trace any
+            # subsequent chain revocation back to the user it was issued to.
+            try:
+                _sel_fn().log_api_access(
+                    caller=user_id,
+                    operation="refresh_token_initial_mint",
+                    outcome="ok",
+                    source="refresh_tokens",
+                    resources=chain_id,
+                )
+            except Exception as exc:  # pragma: no cover
+                # SEL must never block auth flows, but log the failure
+                # so it's observable.
+                logger.debug("token_auth: SEL audit failed: %s", exc)
+    except Exception as _refresh_err:
+        # Refresh cookie is best-effort. If something goes wrong
+        # here, the access cookie still works as before — the
+        # user just won't get the refresh upgrade until next mint.
+        logger.warning(
+            "token_auth: failed to attach refresh cookie (%s); "
+            "access cookie still set, user can re-mint as before",
+            _refresh_err,
+        )
 
 
 def _deny(request: web.Request, reason: str) -> web.Response:

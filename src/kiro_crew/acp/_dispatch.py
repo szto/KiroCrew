@@ -17,6 +17,7 @@ import difflib
 import json
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -86,9 +87,112 @@ def set_mode_params(session_id: str, agent: str) -> dict[str, Any]:
     return {"sessionId": session_id, "modeId": agent}
 
 
+def parse_session_modes(resp: dict[str, Any]) -> tuple[list[str], str, bool]:
+    """Extract advertised mode ids, current mode id, and whether the backend
+    advertised a modes list at all, from a ``session/new`` / ``session/load``
+    response.
+
+    kiro-cli returns ``modes: {currentModeId, availableModes: [{id, name,
+    description}, ...]}`` (parallel to the ``models`` payload). Returns
+    ``(ids, current_id, advertised)`` where ``advertised`` is True iff the
+    response carried a ``modes`` object with an ``availableModes`` **list**
+    (even an empty one).
+
+    The ``advertised`` flag is load-bearing: an OMITTED modes list (older
+    kiro-cli / offline fake backend → ``advertised=False``) means "unknown,
+    attempt ``set_mode`` for backward compatibility", whereas an ``availableModes:
+    []`` that is *present but empty* (``advertised=True``, ``ids=[]``) means the
+    backend genuinely offers no modes — the caller must fail closed, not attempt
+    a ``set_mode`` that would fault with ``Mode '<agent>' not found``.
+
+    Item id is read from ``id`` first, then ``modeId`` / ``value`` as fallbacks,
+    mirroring the defensive shape-reading in ``_normalize_models``. Never raises.
+    """
+    modes = resp.get("modes")
+    if not isinstance(modes, dict):
+        return [], "", False
+    current = modes.get("currentModeId")
+    current_id = current if isinstance(current, str) else ""
+    advertised_raw = modes.get("availableModes")
+    if not isinstance(advertised_raw, list):
+        return [], current_id, False
+    ids: list[str] = []
+    for m in advertised_raw:
+        if not isinstance(m, dict):
+            continue
+        mode_id = m.get("id") or m.get("modeId") or m.get("value")
+        if mode_id:
+            ids.append(str(mode_id))
+    return ids, current_id, True
+
+
 def set_model_params(session_id: str, model_id: str) -> dict[str, Any]:
     """Params for ``session/set_model`` (override the model on a session)."""
     return {"sessionId": session_id, "modelId": model_id}
+
+
+#: Top-level ``_kiro.dev/metadata`` params this parser consumes. ``sessionId`` is
+#: consumed a layer up — ``AcpRuntime`` routes every notification by it to the
+#: right per-session queue — so reporting it would mislabel a load-bearing routing
+#: field as an unhandled discovery on the first frame of every shared-runtime
+#: session.
+_KNOWN_METADATA_KEYS = frozenset({"contextUsagePercentage", "meteringUsage", "sessionId"})
+
+#: ``meteringUsage`` entry keys this parser knows, and the one ``unit`` value the
+#: credit sum reads. An entry with any other unit contributes nothing.
+_KNOWN_METERING_KEYS = frozenset({"unit", "unitPlural", "value"})
+_KNOWN_METERING_UNITS = frozenset({"credit"})
+
+#: Field names already reported, so a stream of per-turn notifications logs each
+#: novel shape once per process rather than on every frame. Two threads racing
+#: here can only duplicate a log line, so the hot path takes no lock.
+_reported_metadata_fields: set[str] = set()
+
+
+def _log_unrecognized_metadata_fields(params: dict[str, Any]) -> None:
+    """Report ``_kiro.dev/metadata`` fields this parser drops, once each.
+
+    kiro-cli owns the metadata payload, so a field it begins sending — prompt-cache
+    counters being the case in point, since ``AcpPromptStats`` already carries
+    ``cache_read_tokens``/``cache_creation_tokens`` slots that nothing fills — is
+    otherwise discarded with no way to notice.
+
+    What reaches the log is deliberately narrow: field NAMES and value TYPES, plus
+    — for ``meteringUsage`` units alone — the unit LABEL itself, because there the
+    label IS the signal (``unit=cacheRead`` is the discovery; ``unit:str`` conveys
+    nothing, since the unit is always a string). A unit is a low-cardinality
+    dimension name drawn from kiro's own billing vocabulary, never a quantity,
+    alias, or identifier, so no billing detail reaches the log.
+    """
+    novel: list[str] = []
+    for key, value in params.items():
+        if key in _KNOWN_METADATA_KEYS or key in _reported_metadata_fields:
+            continue
+        _reported_metadata_fields.add(key)
+        novel.append(f"{key}:{type(value).__name__}")
+
+    metering = params.get("meteringUsage")
+    if isinstance(metering, list):
+        for entry in metering:
+            if not isinstance(entry, dict):
+                continue
+            for key, value in entry.items():
+                name = f"meteringUsage[].{key}"
+                if key in _KNOWN_METERING_KEYS or name in _reported_metadata_fields:
+                    continue
+                _reported_metadata_fields.add(name)
+                novel.append(f"{name}:{type(value).__name__}")
+            unit = entry.get("unit")
+            # A non-credit unit is silently dropped by the credit sum, so naming it
+            # is the only signal that kiro started reporting a new usage dimension.
+            if isinstance(unit, str) and unit not in _KNOWN_METERING_UNITS:
+                name = f"meteringUsage[].unit={unit}"
+                if name not in _reported_metadata_fields:
+                    _reported_metadata_fields.add(name)
+                    novel.append(name)
+
+    if novel:
+        logger.debug("acp metadata: unconsumed field(s) %s", ", ".join(sorted(novel)))
 
 
 def parse_metadata(params: dict[str, Any]) -> tuple[float | None, float]:
@@ -100,7 +204,16 @@ def parse_metadata(params: dict[str, Any]) -> tuple[float | None, float]:
     ``AcpClient`` and ``AcpSessionHandle`` call this so the credit-capture
     logic has a single source of truth. The caller applies the values to its own
     ``last_prompt_stats`` (credits are accumulated across the turn).
+
+    Fields outside the two consumed keys are reported once each at debug level by
+    :func:`_log_unrecognized_metadata_fields`.
     """
+    try:
+        _log_unrecognized_metadata_fields(params)
+    except Exception:
+        # A diagnostic must never break a turn.
+        logger.debug("acp metadata: field scan failed", exc_info=True)
+
     pct = params.get("contextUsagePercentage")
     try:
         pct_val = float(pct) if pct is not None else None
@@ -215,19 +328,50 @@ def select_tool_title(title: object, raw_input: object) -> str | None:
     return None
 
 
+def is_tool_purpose_key(key: object) -> bool:
+    """True when ``key`` names the reserved tool-purpose argument.
+
+    Matched by SHAPE rather than by an allowlist of literals: any *reserved*
+    (dunder-prefixed) argument whose name ends in ``purpose`` once separators
+    and case are normalized away. The declared spelling is
+    ``__tool_use_purpose``, but the argument reaches us as whatever the model
+    actually emitted, and models paraphrase the name — ``__purpose``,
+    ``__thinking_purpose`` and ``__woohoo_purpose`` all occur in real
+    transcripts. An exact allowlist silently drops every one of them.
+
+    The ``__`` prefix is load-bearing: it keeps a *functional* argument that
+    happens to be called ``purpose`` (a tool legitimately taking a purpose
+    string) out of the match, because only dunder names are reserved. A tool
+    declaring its own dunder ``…purpose`` argument would be read as the purpose
+    line, which is the desired reading anyway — and harmless either way, since
+    this only picks the label and never rewrites the arguments sent to the tool.
+    """
+    if not isinstance(key, str) or not key.startswith("__"):
+        return False
+    return re.sub(r"[^a-z0-9]", "", key.lower()).endswith("purpose")
+
+
 def extract_tool_purpose(raw_input: object) -> str:
     """Pull the agent-authored purpose line out of a tool call's raw params.
 
-    Accepts every spelling in ``TOOL_PURPOSE_KEYS`` because kiro-cli echoes the
-    reserved argument back inconsistently (snake_case as declared in the tool
-    schema, camelCase on some calls). Reading only one literal drops the purpose
-    for the other half of the calls, which shows up as the dashboard's concise
+    The canonical spellings in ``TOOL_PURPOSE_KEYS`` are preferred (kiro-cli
+    echoes the reserved argument back as either the declared snake_case name or
+    a camelCased variant), then any other key matching
+    ``is_tool_purpose_key()``. Reading a fixed set of literals drops the purpose
+    for every paraphrased spelling, which shows up as the dashboard's concise
     tool pill falling back to the literal command line.
+
+    Off-canonical keys are scanned in sorted order so the choice is
+    deterministic when a call somehow carries more than one.
     """
     if not isinstance(raw_input, dict):
         return ""
     for key in TOOL_PURPOSE_KEYS:
         value = raw_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    for key in sorted(k for k in raw_input if is_tool_purpose_key(k)):
+        value = raw_input[key]
         if isinstance(value, str) and value.strip():
             return value
     return ""

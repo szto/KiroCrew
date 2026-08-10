@@ -3,7 +3,7 @@
  *
  * ## Why the catalogs are imported statically
  *
- * Both catalogs are bundled and registered up front, so `t()` is always
+ * Authored catalogs are bundled and registered up front, so `t()` is always
  * SYNCHRONOUS. That is a deliberate correctness choice, not an oversight:
  *
  *  - ~600 components call `t()` during render. With lazily-fetched catalogs
@@ -14,12 +14,15 @@
  *    synchronous `t()` keeps them all valid with no per-test `await`.
  *
  * The cost is bundle size: every language ships to every user (except the
- * pseudolocale, which is DEV-only — see `CATALOGS`). With two catalogs that is
- * small, but it does NOT scale linearly forever.
+ * pseudolocale, which is DEV-only — see `CATALOGS`). At 12 catalogs that is
+ * ~2.0 MB gzip, ~173 KB of it for each language the user will never read, so
+ * this approach does NOT scale indefinitely.
  *
- * ## Lazy-loading seam (when to reach for it)
+ * ## Lazy-loading seam
  *
- * At roughly 6+ languages, switch to `i18next-http-backend` + `Suspense`:
+ * Korean is catalog #12 and the last one that lands in FRONT of the seam;
+ * catalog #13 belongs behind it — switch to
+ * `i18next-http-backend` + `Suspense`:
  * catalogs move to `public/locales/<lng>/<ns>.json` and only the active
  * language is fetched. Nothing in the call sites changes — `useTranslation()`
  * and `t()` keep the same signatures — so this is an isolated swap of THIS
@@ -40,6 +43,8 @@ import bn from './locales/bn.json'
 import pt from './locales/pt.json'
 import ru from './locales/ru.json'
 import de from './locales/de.json'
+import ja from './locales/ja.json'
+import ko from './locales/ko.json'
 import it from './locales/it.json'
 import enXA from './locales/en-XA.json'
 import { DEFAULT_LANGUAGE, SUPPORTED_CODES } from './languages'
@@ -97,6 +102,8 @@ const AUTHORED_CATALOGS: Record<string, { translation: Record<string, unknown> }
   pt: { translation: pt },
   ru: { translation: ru },
   de: { translation: de },
+  ja: { translation: ja },
+  ko: { translation: ko },
   it: { translation: it },
 }
 

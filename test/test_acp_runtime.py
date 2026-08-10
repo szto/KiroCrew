@@ -29,6 +29,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from spawn_test_helpers import strip_spawn_shim
 
+from kiro_crew.acp.client import _OVERSIZE_DRAIN_MAX_BYTES
 from kiro_crew.acp.runtime import (
     _TERMINATE_TIMEOUT,
     AcpRuntime,
@@ -302,6 +303,50 @@ async def test_awaited_response_resolves_pending_future():
 
 
 @pytest.mark.asyncio
+async def test_missing_agent_spec_error_reaches_caller_actionable(tmp_path):
+    """A missing agent spec must not reach the caller as a raw -32603 dict.
+
+    kiro-cli answers ``session/set_mode`` for an agent it cannot resolve with a
+    bare "Internal error" whose data is ``Mode '<name>' not found``. Routed raw,
+    the caller — and the dashboard chat bubble behind it — got the JSON-RPC dict
+    verbatim: an internal ACP concept, no mention of the missing file, and no
+    remedy, on a condition that fails every subsequent turn too.
+
+    This pins the formatting AT THE CALL SITE rather than only unit-testing the
+    helper: the awaited-request branch of the reader is the single path every
+    handshake error (initialize / session/new / session/set_mode) takes, so a
+    regression that unwires the helper is invisible to a helper-only test.
+    """
+    rt, reader, _ = _make_runtime()
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    rt._pending_requests[7] = fut
+    task = await _start_reader(rt)
+    try:
+        with patch("kiro_crew.acp.runtime.kiro_agents_dir", return_value=tmp_path):
+            _feed(
+                reader,
+                {
+                    "id": 7,
+                    "error": {
+                        "code": -32603,
+                        "message": "Internal error",
+                        "data": "Mode 'kirocrew' not found",
+                    },
+                },
+            )
+            with pytest.raises(AcpRuntimeError) as excinfo:
+                await asyncio.wait_for(fut, timeout=1.0)
+    finally:
+        await _stop_reader(task)
+
+    text = str(excinfo.value)
+    assert "'kirocrew.json'" in text  # the file that is missing
+    assert str(tmp_path) in text  # where it was looked for
+    assert "kirocrew setup --agent-only --clean" in text  # the repair
+    assert "-32603" not in text  # no raw protocol frame
+
+
+@pytest.mark.asyncio
 async def test_non_numeric_response_id_dropped_without_killing_demux():
     """The id in a response frame is agent-controlled. int("req-1") raised
     ValueError, which the reader's catch-all turned into _mark_dead — poisoning
@@ -422,6 +467,169 @@ async def test_non_object_json_line_does_not_crash_reader():
         assert not rt._dead  # reader never marked the runtime dead
     finally:
         await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_oversize_stdout_frame_is_dropped_not_fatal():
+    """A single JSON-RPC line over the stdout buffer must cost ONE frame, not
+    the whole runtime.
+
+    Regression: the reader used to _mark_dead on overrun, which poisons every
+    multiplexed session's queue and fails every pending future — users saw
+    "process exited / chat failure" mid-turn after one huge tool result.
+
+    Driven through a REAL StreamReader so this asserts asyncio's actual
+    behaviour, not a mock's.
+    """
+    rt, _, proc = _make_runtime()
+    reader = asyncio.StreamReader(limit=256)
+    proc.stdout = reader
+    q = _register(rt, "sA")
+    task = await _start_reader(rt)
+    try:
+        reader.feed_data(b"X" * 1024 + b"\n")  # oversize, newline present
+        _feed(reader, {"method": "session/update", "params": {"sessionId": "sA"}})
+        msg = await asyncio.wait_for(q["sA"].get(), timeout=5.0)
+        assert msg.params["sessionId"] == "sA"
+        assert not rt._dead
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_unterminated_oversize_stdout_recovers_at_next_frame():
+    """The shape actually observed in the field: an oversize line whose newline
+    has NOT arrived yet, so the reader drains prefix after prefix before the
+    stream is back in sync. It must ride through every step and route the next
+    real frame.
+
+    Asserts the outcome (recovery), not the step count: how many buffer-fulls
+    the reader sees depends on how the feeds interleave with its task.
+    """
+    rt, _, proc = _make_runtime()
+    reader = asyncio.StreamReader(limit=256)
+    proc.stdout = reader
+    q = _register(rt, "sA")
+    task = await _start_reader(rt)
+    try:
+        for _ in range(4):
+            reader.feed_data(b"Y" * 512)  # no newline anywhere
+            await asyncio.sleep(0)
+        reader.feed_data(b"TAIL-OF-OVERSIZE-LINE\n")  # line finally terminates
+        _feed(reader, {"method": "session/update", "params": {"sessionId": "sA"}})
+        msg = await asyncio.wait_for(q["sA"].get(), timeout=5.0)
+        assert msg.params["sessionId"] == "sA"
+        assert not rt._dead
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_oversize_frame_split_mid_multibyte_does_not_kill_demux():
+    """The drained remainder must never reach json.loads.
+
+    Regression for a defect in the second cut of this fix: the drain consumed only
+    the buffered prefix and let the recovered tail through as a line. That tail is
+    a byte-slice cut at an arbitrary offset, so an oversize frame carrying
+    multibyte UTF-8 (CJK, emoji — ordinary in tool output) splits a character;
+    `json.loads` then raises UnicodeDecodeError, which is NOT a
+    json.JSONDecodeError, so it escaped the non-JSON guard into the loop's crash
+    handler and killed EVERY multiplexed session.
+    """
+    rt, _, proc = _make_runtime()
+    reader = asyncio.StreamReader(limit=256)
+    proc.stdout = reader
+    q = _register(rt, "sA")
+    task = await _start_reader(rt)
+    try:
+        # Two conditions make the tail reach the parser, and both are ordinary:
+        #  - the discard boundary must fall mid-character, which the UNTERMINATED
+        #    branch does by construction (it reports `consumed = len(buffer)`, an
+        #    arbitrary byte offset; a newline-terminated overrun instead reports
+        #    the newline's offset, already a character boundary), and
+        #  - the remainder after the last discard must be UNDER the reader limit,
+        #    so readuntil returns it as a normal-looking line instead of
+        #    overrunning again.
+        # Dense CJK, fed in 500-byte slices that are not multiples of 3.
+        blob = ("苹" * 400).encode() + b"\n"  # 1201 bytes
+        assert len(blob) % 3 != 0
+        for off in range(0, 1000, 500):
+            reader.feed_data(blob[off : off + 500])
+            await asyncio.sleep(0)
+        reader.feed_data(blob[1000:])  # 201 bytes < limit → returned as a line
+        _feed(reader, {"method": "session/update", "params": {"sessionId": "sA"}})
+        msg = await asyncio.wait_for(q["sA"].get(), timeout=5.0)
+        assert msg.params["sessionId"] == "sA"
+        assert not rt._dead
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_many_terminated_oversize_frames_never_exhaust_the_budget():
+    """A run of oversize-but-properly-terminated frames must stay survivable.
+
+    Regression for a defect in the first cut of this fix: the guard counted
+    oversize *frames* rather than bytes-without-a-boundary, so a replay of N
+    newline-terminated >limit frames walked straight into runtime death even
+    though every one of them recovered a frame boundary. The budget is now scoped
+    to a single drain call, each of which provably ends on a boundary.
+    """
+    rt, _, proc = _make_runtime()
+    reader = asyncio.StreamReader(limit=256)
+    proc.stdout = reader
+    q = _register(rt, "sA")
+    task = await _start_reader(rt)
+    rounds = 40
+    try:
+        for i in range(rounds):
+            reader.feed_data(b"X" * 4096 + b"\n")
+            _feed(reader, {"method": "session/update", "params": {"sessionId": "sA", "n": i}})
+        for i in range(rounds):
+            msg = await asyncio.wait_for(q["sA"].get(), timeout=5.0)
+            assert msg.params["n"] == i
+        assert not rt._dead
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_unterminated_blob_past_the_byte_budget_marks_runtime_dead():
+    """The escape hatch: a stream that never yields a frame boundary would have
+    the reader draining forever, so exceeding the byte budget must still reach the
+    terminal state.
+
+    The liveness oracle cannot cover this case — it reads CPU/IO movement, and a
+    garbage-spewing stream moves both, so it would be judged WORKING.
+    """
+    rt, _, proc = _make_runtime()
+    reader = asyncio.StreamReader(limit=256)
+    proc.stdout = reader
+    _register(rt, "sA")
+    task = await _start_reader(rt)
+    try:
+        fed = 0
+        while fed <= _OVERSIZE_DRAIN_MAX_BYTES and not rt._dead:
+            reader.feed_data(b"Z" * 65536)  # never a newline
+            fed += 65536
+            await asyncio.sleep(0)
+        await asyncio.wait_for(task, timeout=5.0)
+    except Exception:
+        pass
+    finally:
+        await _stop_reader(task)
+    assert rt._dead
+
+
+def test_runtime_reuses_clients_oversize_drain_helper():
+    """The consume-prefix-and-retry drain must have ONE definition. A second copy
+    is how two read paths drift apart (they already disagreed once, when only one
+    of them killed the process)."""
+    import kiro_crew.acp.client as client_mod
+    import kiro_crew.acp.runtime as runtime_mod
+
+    assert runtime_mod._drain_oversize_line is client_mod._drain_oversize_line
+    assert runtime_mod.OversizeLineUnrecoverable is client_mod.OversizeLineUnrecoverable
 
 
 def test_runtime_uses_clients_augmented_kiro_bin_resolver():
@@ -2984,11 +3192,43 @@ class TestAcpRuntimePidTracking:
         monkeypatch.setattr(rt_mod, "_untrack_session_pid", lambda p: calls["session"].append(p))
         # os.killpg / getpgid on the fake PID would raise — the kill() body
         # already guards those with OSError/ProcessLookupError, so let them fire.
+        #
+        # kill() only untracks once pid_exists() confirms the process is GONE, so
+        # stub that decision instead of betting the fake PID is absent from the
+        # host's process table. It is not a safe bet: Windows recycles PIDs from a
+        # small space, and on a CI runner spawning subprocesses across xdist
+        # workers 4242 was intermittently a REAL live process -- kill() then took
+        # the survivor branch and this asserted `[] == [4242]`.
+        monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda pid: False)
 
         await rt.kill()
 
         assert calls["pid"] == [4242]
         assert calls["session"] == [4242]
+
+    @pytest.mark.asyncio
+    async def test_kill_keeps_pid_tracked_when_the_process_survives(self, monkeypatch):
+        """A survivor must STAY tracked so the orphan sweeps can still reach it.
+
+        The counterpart to the test above, and the reason that one has to stub
+        `pid_exists` rather than rely on the ambient process table: untracking a
+        process that outlived SIGTERM/SIGKILL escalation would leak it until
+        reboot, because the sweep would no longer have a handle on it.
+        """
+        rt, _, proc = _make_runtime()
+        proc.wait = AsyncMock(return_value=0)
+
+        calls: dict[str, list[int]] = {"pid": [], "session": []}
+        import kiro_crew.acp.runtime as rt_mod
+
+        monkeypatch.setattr(rt_mod, "_untrack_pid", lambda p: calls["pid"].append(p))
+        monkeypatch.setattr(rt_mod, "_untrack_session_pid", lambda p: calls["session"].append(p))
+        monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda pid: True)
+
+        await rt.kill()
+
+        assert calls["pid"] == []
+        assert calls["session"] == []
 
 
 class TestAcpRuntimeLoadSession:
@@ -4595,3 +4835,139 @@ class TestToolPurposeExtraction:
         assert (
             extract_tool_purpose({"__tool_use_purpose": "", "__toolUsePurpose": "real"}) == "real"
         )
+
+
+# ── set_mode availableModes guard (regression: "Mode '<agent>' not found") ──
+
+
+def _new_resp(modes: dict | None) -> dict:
+    r: dict = {"sessionId": "s1"}
+    if modes is not None:
+        r["modes"] = modes
+    return r
+
+
+@pytest.mark.asyncio
+async def test_create_session_sets_mode_when_agent_is_advertised():
+    """Happy path: the requested agent is in availableModes → set_mode fires."""
+    rt, _, _ = _make_runtime()
+    rt._finish_session_init = MagicMock(return_value=[])  # type: ignore[method-assign]
+    resp = _new_resp(
+        {"currentModeId": "kirocrew", "availableModes": [{"id": "kirocrew"}, {"id": "ops"}]}
+    )
+    rt._send_and_await = AsyncMock(side_effect=[resp, {}])  # type: ignore[method-assign]
+    with patch.object(AcpSessionHandle, "drain_init", AsyncMock()):
+        handle = await rt.create_session(agent="ops", mcp_servers=[])
+    methods = [c.args[0] for c in rt._send_and_await.call_args_list]
+    assert methods == [METHOD_SESSION_NEW, METHOD_SET_MODE]
+    assert rt._send_and_await.call_args_list[1].args[1] == {
+        "sessionId": "s1",
+        "modeId": "ops",
+    }
+    assert handle.session_id == "s1"
+
+
+@pytest.mark.asyncio
+async def test_create_session_fails_closed_when_agent_not_advertised():
+    """Guard (A): modes advertised but the agent is absent → FAIL CLOSED
+    (terminate + raise), never silently run the backend default. Substituting a
+    broader default for a requested restricted agent would be a privilege
+    escalation."""
+    rt, _, _ = _make_runtime()
+    rt._finish_session_init = MagicMock(return_value=[])  # type: ignore[method-assign]
+    resp = _new_resp({"currentModeId": "default", "availableModes": [{"id": "default"}]})
+    # session/new response, then the terminate roundtrip from the fail-closed path
+    rt._send_and_await = AsyncMock(side_effect=[resp, {}])  # type: ignore[method-assign]
+    with patch.object(AcpSessionHandle, "drain_init", AsyncMock()):
+        with pytest.raises(AcpRuntimeError, match="not available"):
+            await rt.create_session(agent="kirocrew", mcp_servers=[])
+    methods = [c.args[0] for c in rt._send_and_await.call_args_list]
+    assert METHOD_SET_MODE not in methods  # never activated the wrong mode
+    assert METHOD_SESSION_TERMINATE in methods  # created session cleaned up
+    assert "s1" not in rt._session_queues  # unregistered
+
+
+@pytest.mark.asyncio
+async def test_create_session_fails_closed_when_available_modes_empty():
+    """Regression (GPT round 2): an explicitly-empty `availableModes: []` is
+    ADVERTISED (not absent), so it must fail closed — not be treated as
+    "no modes → attempt" and then fault with "Mode not found"."""
+    rt, _, _ = _make_runtime()
+    rt._finish_session_init = MagicMock(return_value=[])  # type: ignore[method-assign]
+    resp = _new_resp({"currentModeId": "kirocrew", "availableModes": []})
+    rt._send_and_await = AsyncMock(side_effect=[resp, {}])  # type: ignore[method-assign]
+    with patch.object(AcpSessionHandle, "drain_init", AsyncMock()):
+        with pytest.raises(AcpRuntimeError, match="not available"):
+            await rt.create_session(agent="kirocrew", mcp_servers=[])
+    methods = [c.args[0] for c in rt._send_and_await.call_args_list]
+    assert METHOD_SET_MODE not in methods
+    assert METHOD_SESSION_TERMINATE in methods
+
+
+@pytest.mark.asyncio
+async def test_create_session_sets_mode_when_no_modes_advertised():
+    """Backward compat: a backend that omits `modes` (older kiro-cli / fake
+    backend) still gets set_mode attempted."""
+    rt, _, _ = _make_runtime()
+    rt._finish_session_init = MagicMock(return_value=[])  # type: ignore[method-assign]
+    resp = _new_resp(None)
+    rt._send_and_await = AsyncMock(side_effect=[resp, {}])  # type: ignore[method-assign]
+    with patch.object(AcpSessionHandle, "drain_init", AsyncMock()):
+        await rt.create_session(agent="kirocrew", mcp_servers=[])
+    methods = [c.args[0] for c in rt._send_and_await.call_args_list]
+    assert METHOD_SET_MODE in methods
+
+
+def test_mode_available_helper():
+    """Unit: the guard predicate. Empty modes ⇒ attempt (True); advertised ⇒
+    membership test."""
+    from kiro_crew.acp.runtime import AcpRuntime
+
+    assert AcpRuntime._mode_available("kirocrew", _new_resp(None)) is True
+    assert (
+        AcpRuntime._mode_available(
+            "kirocrew", _new_resp({"availableModes": [{"id": "kirocrew"}]})
+        )
+        is True
+    )
+    assert (
+        AcpRuntime._mode_available(
+            "kirocrew", _new_resp({"availableModes": [{"id": "default"}]})
+        )
+        is False
+    )
+    # Present-but-empty availableModes → advertised, agent absent → fail closed.
+    assert AcpRuntime._mode_available("kirocrew", _new_resp({"availableModes": []})) is False
+    # A modes dict WITHOUT an availableModes list → not advertised → attempt.
+    assert AcpRuntime._mode_available("kirocrew", _new_resp({"currentModeId": "x"})) is True
+
+
+def test_parse_session_modes_shapes():
+    """The shared parser: absent/odd `modes` ⇒ ([], '', False); a present
+    availableModes list ⇒ advertised=True (even when empty); id read from
+    id → modeId → value fallbacks."""
+    from kiro_crew.acp._dispatch import parse_session_modes
+
+    assert parse_session_modes({}) == ([], "", False)
+    assert parse_session_modes({"modes": "nonsense"}) == ([], "", False)
+    # modes dict but no availableModes list → not advertised (attempt path).
+    assert parse_session_modes({"modes": {"currentModeId": "x"}}) == ([], "x", False)
+    # present but empty → advertised True (fail-closed path).
+    assert parse_session_modes({"modes": {"availableModes": []}}) == ([], "", True)
+    ids, current, advertised = parse_session_modes(
+        {
+            "modes": {
+                "currentModeId": "kirocrew",
+                "availableModes": [
+                    {"id": "kirocrew"},
+                    {"modeId": "ops"},
+                    {"value": "code-reviewer"},
+                    {"name": "no-id-dropped"},
+                    "not-a-dict",
+                ],
+            }
+        }
+    )
+    assert ids == ["kirocrew", "ops", "code-reviewer"]
+    assert current == "kirocrew"
+    assert advertised is True

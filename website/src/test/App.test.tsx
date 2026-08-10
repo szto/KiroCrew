@@ -359,14 +359,39 @@ describe('App routing', () => {
     expect(screen.getByText('Settings')).toBeInTheDocument()
     // The App Store now rides the Apps section header as an accent link.
     expect(screen.getByText('Explore')).toBeInTheDocument()
-    // The bottom-pinned community row: two stacked GitHub links under one mark,
-    // plus the icon-only Discord link. The kiro.dev link was removed.
+    // The bottom-pinned community row: the GitHub mark fronts a "Star us" link
+    // plus a "Report issue" BUTTON (it opens the diagnostics flow rather than
+    // navigating to the issue list), and the icon-only Discord link. The
+    // kiro.dev link was removed.
     expect(screen.getByText('Star us')).toBeInTheDocument()
     expect(screen.getByText('Report issue')).toBeInTheDocument()
     expect(screen.getByLabelText('Star Kiro Crew on GitHub')).toBeInTheDocument()
-    expect(screen.getByLabelText('Report an issue on GitHub')).toBeInTheDocument()
+    expect(
+      screen.getByLabelText(
+        'Report a problem — collects logs and crash reports, secrets removed',
+      ),
+    ).toBeInTheDocument()
+    // The old bare link to the issue list is gone — reporting now goes through
+    // the collector so triage gets logs instead of an empty issue form.
+    expect(screen.queryByLabelText('Report an issue on GitHub')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Kiro Discord community')).toBeInTheDocument()
     expect(screen.queryByLabelText('Kiro website (kiro.dev)')).not.toBeInTheDocument()
+  })
+
+  it('rail "Report issue" opens the diagnostics Report a Problem modal', async () => {
+    // The rail entry used to be an <a> to /issues, which lost exactly what
+    // triage needs. It must now mount the same shared modal as
+    // Settings › About › Support.
+    renderWithProviders(<App />, { route: '/chat' })
+    const trigger = screen.getByLabelText(
+      'Report a problem — collects logs and crash reports, secrets removed',
+    )
+    expect(trigger.tagName).toBe('BUTTON')
+    expect(trigger).not.toHaveAttribute('href')
+
+    fireEvent.click(trigger)
+    expect(await screen.findByText('What happened?')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /create report/i })).toBeInTheDocument()
   })
 
   it('renders the registry-derived Artifacts and Knowledge nav items', () => {
@@ -673,6 +698,69 @@ describe('App routing', () => {
       transition: 'grid-template-columns 150ms cubic-bezier(0.2, 0, 0, 1)',
     })
     localStorage.removeItem('mc-nav')
+  })
+
+  // ── Shell entrance animation is one-shot ──────────────────────────────────
+  // The local pane is hidden (`display:none`), not unmounted, while a remote
+  // instance tab is active. A CSS ANIMATION restarts when an element goes from
+  // `display:none` back to displayed, so leaving `animate-rise` on the shell
+  // replayed the whole dashboard's 350ms fade+lift on every return to the
+  // Local tab. The class must retire itself after it has played once.
+  it('retires the shell entrance animation once it has played', () => {
+    renderWithProviders(<App />, { route: '/chat' })
+
+    const shell = screen.getByTestId('dashboard-shell')
+    expect(shell).toHaveClass('animate-rise')
+
+    fireEvent.animationEnd(shell, { animationName: 'rise' })
+
+    // Re-showing the pane cannot replay an animation that is no longer applied.
+    expect(shell).not.toHaveClass('animate-rise')
+  })
+
+  it('does not retire the shell entrance from a descendant animation', () => {
+    // `animationend` bubbles, and descendants (banners, cards) use the SAME
+    // `rise` keyframe — so an unguarded handler would cut the shell's own
+    // entrance short the first time any child animated.
+    renderWithProviders(<App />, { route: '/chat' })
+
+    const shell = screen.getByTestId('dashboard-shell')
+    expect(shell).toHaveClass('animate-rise')
+
+    const child = document.createElement('div')
+    shell.appendChild(child)
+    fireEvent.animationEnd(child, { animationName: 'rise' })
+
+    expect(shell).toHaveClass('animate-rise')
+  })
+
+  it('keeps the shell entrance applied for an unrelated keyframe on the shell', () => {
+    renderWithProviders(<App />, { route: '/chat' })
+
+    const shell = screen.getByTestId('dashboard-shell')
+    fireEvent.animationEnd(shell, { animationName: 'fade-in' })
+
+    expect(shell).toHaveClass('animate-rise')
+  })
+
+  it('retires the shell entrance even when the animation is interrupted', () => {
+    // An INTERRUPTED animation fires `animationcancel`, not `animationend`, and
+    // React 18 exposes no handler for it — so hiding the pane inside the 350ms
+    // entrance window would strand the class and replay it once. The timer
+    // backstop must latch regardless of any animation event arriving.
+    vi.useFakeTimers()
+    try {
+      renderWithProviders(<App />, { route: '/chat' })
+
+      const shell = screen.getByTestId('dashboard-shell')
+      expect(shell).toHaveClass('animate-rise')
+
+      act(() => { vi.advanceTimersByTime(600) })
+
+      expect(shell).not.toHaveClass('animate-rise')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('hosts the collapse control in the nav menu row and hides the Main group heading', () => {

@@ -1,8 +1,9 @@
 """Unit tests for kiro_crew.platform_compat — the cross-platform shim that lets
 KiroCrew run natively on Windows alongside macOS/Linux.
 
-These exercise the PURE / platform-dispatching surface without spawning real
-processes: the signal constants, the file-lock context managers (POSIX path on
+These exercise the PURE / platform-dispatching surface, spawning a real process
+only where the contract IS an OS behavior (process-session semantics): the
+signal constants, the file-lock context managers (POSIX path on
 this host; the Windows branch is asserted via its dispatch shape), the
 strftime directive translation (the one piece with a deterministic Windows
 output we can assert directly), and the process-helper return contracts.
@@ -11,7 +12,9 @@ output we can assert directly), and the process-helper return contracts.
 from __future__ import annotations
 
 import errno
+import logging
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -22,6 +25,19 @@ import types
 import pytest
 
 from kiro_crew import platform_compat as pc
+
+
+def _fake_windows_bins(monkeypatch):
+    """Resolve Windows system binaries while ``IS_WINDOWS`` is faked on POSIX.
+
+    The Windows branches are deliberately exercised on the Linux CI fleet by
+    flipping ``IS_WINDOWS``. Those branches resolve their binary from the
+    trusted system directories before spawning, which a Linux host cannot
+    satisfy, so the lookup is faked alongside the platform flag — otherwise the
+    spawn reports the tool missing before the branch under test is reached.
+    """
+
+    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: rf"C:\Windows\System32\{name}.exe")
 
 
 class TestPlatformFlags:
@@ -397,8 +413,33 @@ class TestResourceShims:
     def test_proc_rss_bytes_for_pid_none_for_unused_pid(self):
         assert pc.proc_rss_bytes_for_pid(2_000_000_000) is None
 
+    def test_proc_rss_tree_mb_for_pid_windows_only(self):
+        # Windows-only: the lineage-validated tree walk. On POSIX it returns None
+        # (callers keep their /proc or ps route), and it must never raise.
+        result = pc.proc_rss_tree_mb_for_pid(os.getpid())
+        if not pc.IS_WINDOWS:
+            assert result is None
+            return
+        # On Windows self (no children spawned by this test) reads a positive
+        # tree total that is at least the single-process RSS.
+        assert result is not None and result > 0
+        single = pc.proc_rss_bytes_for_pid(os.getpid())
+        assert single is not None
+        assert result >= single / (1024 * 1024) - 1  # -1: sampled microseconds apart
+
+    def test_proc_rss_tree_mb_for_pid_rejects_reserved_pid(self):
+        # A reserved/non-int pid must not anchor a tree walk (recycled-root risk).
+        assert pc.proc_rss_tree_mb_for_pid(1) is None
+        assert pc.proc_rss_tree_mb_for_pid(0) is None
+
     def test_proc_cpu_seconds_nonnegative(self):
         assert pc.proc_cpu_seconds() >= 0.0
+
+    def test_proc_cpu_seconds_is_positive_for_a_running_process(self):
+        # A running interpreter has always consumed some CPU. This must be > 0
+        # on every supported platform: on Windows GetCurrentProcess's handle was
+        # truncated without argtypes, so GetProcessTimes failed and this read 0.0.
+        assert pc.proc_cpu_seconds() > 0.0
 
     def test_raise_nofile_soft_limit_is_safe(self):
         # No-op on Windows; best-effort raise on POSIX. Must never raise.
@@ -419,6 +460,180 @@ class TestChmodShims:
             pc.fchmod_safe(fd, 0o600)   # applies on POSIX, no-op on Windows
         finally:
             os.close(fd)
+
+
+class TestDirLinkShims:
+    """``symlink_or_junction`` / ``is_link_or_junction`` / ``unlink_link_or_junction``.
+
+    These run on every platform: the contract is the same everywhere (a name
+    that means another directory), only the mechanism differs — a symlink on
+    POSIX, a directory junction on Windows, where an ordinary account holds no
+    ``SeCreateSymbolicLinkPrivilege`` and ``os.symlink`` fails with
+    ``WinError 1314``.
+    """
+
+    def test_link_is_created_and_transparent(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "index.html").write_text("hi")
+        link = tmp_path / "link"
+
+        pc.symlink_or_junction(target, link)
+
+        assert pc.is_link_or_junction(link)
+        assert link.is_dir()
+        assert link.resolve() == target.resolve()
+        # Reads go through, and later writes to the target are visible via the
+        # link — the property the dist resolver relies on for rebuild pickup.
+        assert (link / "index.html").read_text(encoding="utf-8") == "hi"
+        (target / "later.txt").write_text("fresh")
+        assert (link / "later.txt").read_text(encoding="utf-8") == "fresh"
+
+    def test_plain_dir_and_file_are_not_links(self, tmp_path):
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        regular = tmp_path / "f.txt"
+        regular.write_text("x")
+
+        assert not pc.is_link_or_junction(plain)
+        assert not pc.is_link_or_junction(regular)
+        assert not pc.is_link_or_junction(tmp_path / "does-not-exist")
+
+    def test_dangling_link_is_still_reported_as_a_link(self, tmp_path):
+        """A link whose target is gone must still answer True.
+
+        The dist resolver's replace path keys off exactly this: ``exists()``
+        follows the link and is already False, so only the link-ness test can
+        tell "stale link to clean up" from "nothing here".
+        """
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        pc.symlink_or_junction(target, link)
+        shutil.rmtree(target)
+
+        assert pc.is_link_or_junction(link)
+        assert not link.exists()
+
+    def test_unlink_removes_the_link_and_spares_the_target(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "keep.txt").write_text("keep")
+        link = tmp_path / "link"
+        pc.symlink_or_junction(target, link)
+
+        pc.unlink_link_or_junction(link)
+
+        assert not pc.is_link_or_junction(link)
+        assert not os.path.lexists(str(link))
+        assert (target / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+    def test_unlink_removes_a_dangling_link(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        pc.symlink_or_junction(target, link)
+        shutil.rmtree(target)
+
+        pc.unlink_link_or_junction(link)
+
+        assert not os.path.lexists(str(link))
+
+    def test_unlink_refuses_a_real_directory(self, tmp_path):
+        """A non-link must raise on both platforms, empty or not.
+
+        POSIX ``os.unlink`` refuses a directory outright, so the Windows
+        ``rmdir`` fallback has to be fenced to reparse points: unfenced it
+        DELETES a real empty directory, so a caller that mis-detects link-ness
+        loses data on Windows only while POSIX raises.
+        """
+        empty = tmp_path / "real-empty"
+        empty.mkdir()
+        full = tmp_path / "real-full"
+        full.mkdir()
+        (full / "keep.txt").write_text("keep")
+
+        with pytest.raises(OSError):
+            pc.unlink_link_or_junction(empty)
+        with pytest.raises(OSError):
+            pc.unlink_link_or_junction(full)
+
+        assert empty.is_dir()
+        assert (full / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="junctions exist only on Windows")
+    def test_windows_link_is_usable_without_elevation(self, tmp_path):
+        """Windows gets a working directory link either way it is made.
+
+        ``symlink_or_junction`` tries ``os.symlink`` FIRST and only falls back to
+        a junction, so which mechanism lands depends on whether the host holds
+        ``SeCreateSymbolicLinkPrivilege`` — GitHub's runners do, an ordinary
+        account does not. Asserting "junction, never symlink" would therefore
+        pin the unprivileged host as if it were universal, and fail on CI.
+
+        What matters to every caller is the same on both paths, so that is what
+        is asserted: the name is a reparse point that ``is_link_or_junction``
+        recognises (an ``is_symlink()``-only test does NOT see a junction, which
+        is the bug this shim exists for), it is transparent to path operations,
+        and ``rmtree`` refuses it — which is why ``unlink_link_or_junction``
+        exists. The junction branch specifically is covered by
+        ``test_junction_is_recognised_and_removable`` below.
+        """
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "f.txt").write_text("hi", encoding="utf-8")
+        link = tmp_path / "link"
+
+        pc.symlink_or_junction(target, link)
+
+        assert pc.is_link_or_junction(link)
+        assert link.is_dir()  # transparent to path operations
+        assert (link / "f.txt").read_text(encoding="utf-8") == "hi"
+        # rmtree refuses any directory link, which is why unlink_link_or_junction exists.
+        with pytest.raises(OSError):
+            shutil.rmtree(str(link))
+        pc.unlink_link_or_junction(link)
+        assert not link.exists()
+        assert target.is_dir(), "removing the link must spare the target"
+
+    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="junctions exist only on Windows")
+    def test_junction_is_recognised_and_removable(self, tmp_path):
+        """A JUNCTION specifically — the form an unprivileged Windows user gets.
+
+        Created directly via ``_winapi.CreateJunction`` rather than through the
+        shim, so this covers the unprivileged branch even on a runner that holds
+        the symlink privilege and would otherwise take the symlink path.
+        """
+        import _winapi
+
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "junction"
+        _winapi.CreateJunction(str(target), str(link))
+
+        # A junction reports is_symlink() False — the whole reason the shim's
+        # detector cannot be an is_symlink() test.
+        assert not link.is_symlink()
+        assert pc.is_link_or_junction(link)
+        # 0xA0000003 = IO_REPARSE_TAG_MOUNT_POINT, spelled literally rather than
+        # read from the module under test (so the assertion is independent of it)
+        # and rather than via os.path.isjunction (3.12+ only; this project
+        # supports 3.10).
+        assert os.lstat(str(link)).st_reparse_tag == 0xA0000003
+        pc.unlink_link_or_junction(link)
+        assert not link.exists()
+        assert target.is_dir()
+
+    @pytest.mark.skipif(not pc.IS_POSIX, reason="POSIX symlink mechanism")
+    def test_posix_link_is_a_symlink(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+
+        pc.symlink_or_junction(target, link)
+
+        assert link.is_symlink()
+        assert os.readlink(str(link)) == str(target)
 
 
 # ---------------------------------------------------------------------------
@@ -597,19 +812,26 @@ class TestProcessIdentityPosix:
         # "Python". Production needles ("kiro-cli", "claude") appear verbatim in
         # the argv they guard, so only the test's choice of needle was fragile.
         token = "kirocrew-procmatch-probe"
+        # Use a readiness pipe: the child signals after exec completes, so we
+        # never race /proc/<pid>/cmdline population on a loaded runner.
         child = subprocess.Popen(
-            [sys.executable, "-c", f"import time; time.sleep(30)  # {token}"],
+            [
+                sys.executable, "-c",
+                f"import sys, time; sys.stdout.write('R'); sys.stdout.flush(); "
+                f"time.sleep(30)  # {token}",
+            ],
             start_new_session=True,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
         try:
-            assert child.poll() is None  # alive
-            # Poll: a just-spawned child's /proc/<pid>/cmdline (or ps output) is
-            # not populated until it finishes exec'ing, so an immediate single
-            # check races the scheduler on a loaded runner. Wait for the match
-            # with a generous deadline rather than asserting once.
+            # Wait for the readiness byte (generous timeout for slow CI).
+            ready = child.stdout.read(1)
+            assert ready == b"R", f"child did not signal readiness: {ready!r}"
+            assert child.poll() is None  # still alive after signalling
             if pc.IS_POSIX:
+                # /proc/<pid>/cmdline is guaranteed populated after exec, but
+                # keep a short retry for edge cases on exotic kernels.
                 deadline = time.monotonic() + 10.0
                 result = pc.process_matches(child.pid, (token,))
                 while not result and time.monotonic() < deadline:
@@ -1041,6 +1263,7 @@ class TestTaskkillErrorMapping:
     def test_taskkill_rc128_maps_to_process_lookup(self, monkeypatch):
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
         monkeypatch.setattr(pc.subprocess, "run",
                             self._fake_run(128, b"process not found"))
         with pytest.raises(ProcessLookupError):
@@ -1051,6 +1274,7 @@ class TestTaskkillErrorMapping:
     def test_taskkill_rc5_maps_to_permission_error(self, monkeypatch):
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
         monkeypatch.setattr(pc.subprocess, "run",
                             self._fake_run(5, b"access denied"))
         with pytest.raises(PermissionError):
@@ -1061,6 +1285,7 @@ class TestTaskkillErrorMapping:
     def test_taskkill_generic_rc_maps_to_oserror(self, monkeypatch):
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
         monkeypatch.setattr(pc.subprocess, "run",
                             self._fake_run(42, b"weird error"))
         with pytest.raises(OSError) as ei:
@@ -1071,6 +1296,7 @@ class TestTaskkillErrorMapping:
     def test_taskkill_success_returns_true_on_windows(self, monkeypatch):
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
         monkeypatch.setattr(pc.subprocess, "run", self._fake_run(0))
         assert pc.kill_pid(99999, pc.SIGKILL) is True
         assert pc.kill_process_tree(99999, pc.SIGKILL) is True
@@ -1078,6 +1304,7 @@ class TestTaskkillErrorMapping:
     def test_taskkill_subprocess_error_wraps_as_oserror(self, monkeypatch):
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
 
         def _boom(*_a, **_kw):
             raise FileNotFoundError(2, "taskkill.exe not found")
@@ -1459,6 +1686,7 @@ class TestFindListeningPidsErrors:
         )
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
         monkeypatch.setattr(pc.subprocess, "check_output", self._fake_netstat(blob))
         assert pc.find_listening_pids(7777) == [12345]
 
@@ -1473,6 +1701,7 @@ class TestFindListeningPidsErrors:
         )
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
         monkeypatch.setattr(pc.subprocess, "check_output", self._fake_netstat(blob))
         assert pc.find_listening_pids(7777) == [99]
 
@@ -1487,6 +1716,7 @@ class TestFindListeningPidsErrors:
         )
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
         monkeypatch.setattr(pc.subprocess, "check_output", self._fake_netstat(blob))
         assert pc.find_listening_pids(7777) == [77]
 
@@ -1500,6 +1730,7 @@ class TestFindListeningPidsErrors:
         )
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
         monkeypatch.setattr(pc.subprocess, "check_output", self._fake_netstat(blob))
         assert pc.find_listening_pids(7777) == [88]
 
@@ -1518,6 +1749,7 @@ class TestFindListeningPidsErrors:
         )
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
         monkeypatch.setattr(pc.subprocess, "check_output", self._fake_netstat(blob))
         assert pc.find_listening_pids(7777) == [44]
 
@@ -1620,6 +1852,7 @@ class TestKillAsyncVariants:
         """
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
 
         # Fake subprocess_executor sentinel — anything hashable-and-truthy.
         sentinel = object()
@@ -1674,6 +1907,7 @@ class TestKillAsyncVariants:
         """Same offload contract as kill_pid_async but for the /T variant."""
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
 
         sentinel = object()
         seen_executors: list[object] = []
@@ -1713,6 +1947,7 @@ class TestKillAsyncVariants:
         """
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        _fake_windows_bins(monkeypatch)
         monkeypatch.setattr(
             pc.subprocess,
             "run",
@@ -1773,6 +2008,88 @@ class TestProcessTokenSid:
     @pytest.mark.skipif(pc.IS_WINDOWS, reason="the off-Windows guard")
     def test_returns_none_off_windows(self) -> None:
         assert pc._process_token_sid() is None
+
+
+class TestWin32StructsAreModuleScoped:
+    """``ctypes.POINTER(T)`` memoises T -> POINTER(T) forever.
+
+    ctypes keeps that memo in a module-level dict with no eviction, so a
+    Structure subclass declared inside a function body pins a fresh pair of type
+    objects on EVERY call. The Windows metrics/enumeration helpers are polled
+    (the dashboard's system-metrics endpoint, the RSS-recycle watchdog, the
+    tree-kill parent-map walk, the MCP pipe's per-connection peer check), which
+    turned that into unbounded growth in a long-running gateway -- measured at
+    ~8 KiB per ``proc_rss_bytes`` call, never reclaimed.
+
+    Asserting on the source keeps this enforceable from the POSIX fleet, where
+    the Windows branches never execute.
+    """
+
+    #: Helpers whose Win32 struct layouts must come from module scope.
+    _WIN32_STRUCT_USERS = (
+        "get_ppid",
+        "_windows_process_parent_map",
+        "_win_process_image_name",
+        "_process_token_sid_unguarded",
+        "proc_rss_bytes",
+        "proc_rss_bytes_for_pid",
+        "system_memory",
+    )
+
+    def test_the_shared_layouts_are_defined_once_at_module_scope(self) -> None:
+        import ctypes
+
+        for name in (
+            "_ProcessEntry32",
+            "_ProcessMemoryCounters",
+            "_MemoryStatusEx",
+            "_SidAndAttributes",
+            "_TokenUser",
+        ):
+            assert issubclass(getattr(pc, name), ctypes.Structure), name
+
+    @pytest.mark.parametrize("func_name", _WIN32_STRUCT_USERS)
+    def test_no_helper_declares_a_structure_in_its_body(self, func_name: str) -> None:
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(pc, func_name))))
+        local_structs = [
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+            and any(
+                isinstance(base, ast.Attribute) and base.attr in ("Structure", "Union")
+                for base in node.bases
+            )
+        ]
+        assert not local_structs, (
+            f"{func_name} declares {local_structs} in its body; each call would pin a new "
+            "type in ctypes' pointer-type memo. Hoist the layout to module scope."
+        )
+
+    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Win32 metrics paths")
+    def test_repeated_metrics_calls_add_no_pointer_memo_entries(self) -> None:
+        """The behavioural half: polling must not grow ctypes' memo at all."""
+        import ctypes
+
+        memo = ctypes._pointer_type_cache  # type: ignore[attr-defined]
+        pid = os.getpid()
+        probes = (
+            pc.proc_rss_bytes,
+            lambda: pc.proc_rss_bytes_for_pid(pid),
+            pc.system_memory,
+            lambda: pc.get_ppid(pid),
+            lambda: pc.process_owner_sid(pid),
+        )
+        for probe in probes:
+            probe()  # a first call may legitimately populate the memo once
+        before = len(memo)
+        for _ in range(25):
+            for probe in probes:
+                probe()
+        assert len(memo) == before
 
 
 class TestLocalUserId:
@@ -1909,3 +2226,395 @@ class TestCurrentUserSidNeverSpawns:
         monkeypatch.setattr(pc.subprocess, "run", self._forbid_spawn)
 
         assert pc.current_user_sid() == "S-1-5-21-9-9-9-500"
+
+
+def test_process_descendants_snapshots_a_new_session_grandchild():
+    """A grandchild in its OWN session is still a descendant.
+
+    This is the case a bare ``killpg`` misses, so the walk that broadens a kill
+    must be able to see it.
+    """
+    from kiro_crew import platform_compat
+
+    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX session semantics
+        pytest.skip("POSIX session semantics")
+
+    grandchild: int | None = None
+    child_code = (
+        "import subprocess,sys,time;"
+        "c=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],"
+        "start_new_session=True);"
+        "print(c.pid,flush=True);time.sleep(30)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_code],
+        stdout=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        assert proc.stdout is not None
+        grandchild = int(proc.stdout.readline().strip())
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if grandchild in platform_compat.process_descendants(proc.pid):
+                break
+            time.sleep(0.05)
+        descendants = platform_compat.process_descendants(proc.pid)
+        assert grandchild in descendants
+        # It is genuinely outside the parent's process group -- otherwise this
+        # test would pass even without the escape it exists to describe.
+        assert os.getpgid(grandchild) != os.getpgid(proc.pid)
+    finally:
+        for pid in (grandchild, proc.pid):
+            if pid is None:
+                continue
+            try:
+                platform_compat.kill_process_tree(pid)
+            except (ProcessLookupError, OSError, ValueError):
+                pass
+        proc.wait(timeout=5)
+
+
+def test_process_descendants_is_best_effort_on_unreadable_table(monkeypatch):
+    """Introspection failure must not raise into a caller's kill path."""
+    from kiro_crew import platform_compat
+
+    monkeypatch.setattr(
+        platform_compat,
+        "_posix_process_parent_map",
+        lambda: (_ for _ in ()).throw(OSError("boom")),
+    )
+    monkeypatch.setattr(
+        platform_compat, "_windows_process_parent_map", lambda: (_ for _ in ()).throw(OSError("boom"))
+    )
+    assert platform_compat.process_descendants(os.getpid()) == []
+
+
+def test_process_descendants_refuses_reserved_pids():
+    from kiro_crew import platform_compat
+
+    assert platform_compat.process_descendants(1) == []
+    assert platform_compat.process_descendants(0) == []
+
+
+def test_parent_map_ignores_a_planted_ps_earlier_on_path(tmp_path, monkeypatch):
+    """A gateway PATH can lead with agent-writable dirs, so PATH is not trusted.
+
+    The shim below would report a bogus tree (and could run any code) if the
+    lookup honored PATH.
+    """
+    from kiro_crew import platform_compat
+
+    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX lookup
+        pytest.skip("POSIX binary resolution")
+
+    shim = tmp_path / "ps"
+    shim.write_text("#!/bin/sh\necho '999999 999998'\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
+
+    parent_map = platform_compat._posix_process_parent_map()
+    assert 999999 not in parent_map, "planted PATH shim was executed"
+    # A real snapshot still came back, so this is not passing by returning {}.
+    assert os.getpid() in parent_map
+
+
+def test_trusted_system_bin_rejects_a_name_not_in_system_dirs(tmp_path, monkeypatch):
+    from kiro_crew import platform_compat
+
+    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX lookup
+        pytest.skip("POSIX binary resolution")
+
+    fake = tmp_path / "definitely-not-a-system-tool"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert platform_compat.trusted_system_bin("definitely-not-a-system-tool") is None
+    assert platform_compat.trusted_system_bin("ps") is not None
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "asserts the POSIX degradation path: neutering trusted_system_bin only "
+        "disarms _posix_process_parent_map, while process_descendants on Windows "
+        "goes through the Win32 snapshot and still reports this process's real "
+        "live children -- so the == [] assertion depends on whether the xdist "
+        "worker happens to have a subprocess alive at that instant"
+    ),
+)
+def test_parent_map_is_empty_when_no_trusted_ps_exists(monkeypatch):
+    """No trusted binary must degrade to best-effort, never fall back to PATH."""
+    from kiro_crew import platform_compat
+
+    monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda name: None)
+    assert platform_compat._posix_process_parent_map() == {}
+    assert platform_compat.process_descendants(os.getpid()) == []
+
+
+def _listening_port(sock):
+    """Bind and listen on an ephemeral loopback port, returning it."""
+
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    return sock.getsockname()[1]
+
+
+def test_listening_pid_lookup_ignores_a_planted_tool_on_path(tmp_path, monkeypatch):
+    """A PATH-planted lsof must never answer the port->PID lookup.
+
+    This lookup feeds ``cli_server._gateway_owns_port``, so a shim that names an
+    attacker-chosen PID as the port holder subverts an ownership gate rather
+    than merely returning bad diagnostics.
+
+    POSIX-only by necessity: a faithful Windows shim would have to be a real
+    ``.exe``, because ``CreateProcess`` appends only that extension when it
+    resolves a bare argv name and so never reaches a planted ``.bat``. The
+    Windows guarantee is covered at the resolution level instead, by
+    ``test_trusted_system_bin_resolves_system32_and_rejects_path_on_windows``.
+    """
+
+    import socket
+
+    if pc.IS_WINDOWS:  # pragma: no cover - POSIX binary resolution
+        pytest.skip("POSIX binary resolution")
+
+    bogus = 999_999
+    tool = pc.listening_pid_tool()
+    shim = tmp_path / tool
+    shim.write_text(f"#!/bin/sh\necho {bogus}\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        pids = pc.find_listening_pids(_listening_port(sock))
+
+    assert bogus not in pids, "planted PATH shim was executed"
+    if pc.trusted_system_bin(tool) is not None:
+        # A trusted tool exists on this host, so an empty list would not be a
+        # real answer — the lookup must still see this process holding the port.
+        # Without this the test could pass simply by returning nothing.
+        assert os.getpid() in pids
+
+
+def test_listening_pid_lookup_still_resolves_the_pinned_tool(tmp_path, monkeypatch):
+    """Pinning must not cost the lookup its real answer, PATH notwithstanding.
+
+    Guards the other direction from the shim test: a pin that resolved nothing
+    would make every port read as unheld, which is silent and fails open into
+    "no gateway is running".
+    """
+
+    import socket
+
+    tool = pc.listening_pid_tool()
+    if pc.trusted_system_bin(tool) is None:  # pragma: no cover - host lacks the tool
+        pytest.skip(f"no trusted {tool} on this host")
+
+    # An empty PATH proves the resolution owes nothing to it.
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        pids = pc.find_listening_pids(_listening_port(sock))
+
+    assert os.getpid() in pids
+
+
+def test_listening_pid_tool_available_ignores_a_planted_tool_on_path(tmp_path, monkeypatch):
+    """The availability probe must agree with the lookup it describes.
+
+    Probing PATH here while the lookup resolves from the trusted directories
+    would let the two disagree: a shim would answer "available" for a tool the
+    lookup refuses to run, and a live gateway would read as stopped.
+    """
+
+    tool = pc.listening_pid_tool()
+    planted = tmp_path / (f"{tool}.exe" if pc.IS_WINDOWS else tool)
+    planted.write_text("")
+    if not pc.IS_WINDOWS:
+        planted.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    # Empty the trusted directories so the only resolvable copy of the tool is
+    # the planted one. A host that genuinely ships the tool would otherwise
+    # answer True for both the pinned and the PATH lookup, and the test could
+    # not tell them apart.
+    monkeypatch.setattr(pc, "_TRUSTED_SYSTEM_BIN_DIRS", ())
+    monkeypatch.setattr(pc, "_windows_system_dirs", lambda: ())
+
+    assert pc.trusted_system_bin(tool) is None
+    assert pc.listening_pid_tool_available() is False
+
+
+def test_listening_pid_lookup_degrades_when_no_trusted_tool_exists(monkeypatch):
+    """No trusted tool must read as "absent", never as a silent empty answer."""
+
+    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: None)
+    assert pc.find_listening_pids(8000) == []
+    assert pc.listening_pid_tool_available() is False
+
+
+def test_process_owner_uid_ignores_a_planted_ps_on_path(tmp_path, monkeypatch):
+    """The uid backing the port-trust gate must not come from a PATH shim.
+
+    ``process_owner_uid`` reads ``/proc`` on Linux and shells out to ``ps`` only
+    on macOS, so the darwin branch is selected explicitly to exercise the spawn
+    on any POSIX host rather than leaving it covered on macOS CI alone.
+    """
+
+    if pc.IS_WINDOWS:  # pragma: no cover - POSIX binary resolution
+        pytest.skip("POSIX binary resolution")
+
+    shim = tmp_path / "ps"
+    shim.write_text("#!/bin/sh\necho 999999\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    assert pc.process_owner_uid(os.getpid()) == os.getuid()
+
+
+def test_process_owner_uid_denies_when_no_trusted_ps_exists(monkeypatch):
+    """An unresolvable ``ps`` must report "unknown owner", which the gate denies on."""
+
+    if pc.IS_WINDOWS:  # pragma: no cover - POSIX binary resolution
+        pytest.skip("POSIX binary resolution")
+
+    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: None)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert pc.process_owner_uid(os.getpid()) is None
+
+
+def test_trusted_system_bin_resolves_system32_and_rejects_path_on_windows(tmp_path, monkeypatch):
+    """Windows argv names must resolve from the real system directory only."""
+
+    if not pc.IS_WINDOWS:  # pragma: no cover - Windows binary resolution
+        pytest.skip("Windows binary resolution")
+
+    planted = tmp_path / "definitely-not-a-system-tool.exe"
+    planted.write_text("")
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    assert pc.trusted_system_bin("definitely-not-a-system-tool") is None
+    # A bare argv name still resolves, extension supplied by the lookup.
+    resolved = pc.trusted_system_bin("taskkill")
+    assert resolved is not None and resolved.lower().endswith("taskkill.exe")
+    assert os.path.isfile(resolved)
+
+
+def test_kill_helpers_fail_loud_when_taskkill_is_unresolvable(monkeypatch):
+    """Windows kills must raise, not silently report success, with no taskkill.
+
+    Callers branch on the exception to escalate; a quiet ``True`` would strand a
+    live process while reporting it terminated.
+    """
+
+    if not pc.IS_WINDOWS:  # pragma: no cover - Windows kill path
+        pytest.skip("Windows kill path")
+
+    # A PID that does not exist, so a regression that reaches the real taskkill
+    # cannot terminate the test runner; ``match`` pins the failure to the
+    # resolution step rather than to taskkill rejecting an unknown PID.
+    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: None)
+    with pytest.raises(OSError, match="trusted system directories"):
+        pc.kill_pid(999_999)
+    with pytest.raises(OSError, match="trusted system directories"):
+        pc.kill_process_tree(999_999)
+
+
+def _plant_on_path(tmp_path, monkeypatch, name):
+    """Make *name* the only thing PATH can resolve, and return its path."""
+
+    planted = tmp_path / (f"{name}.exe" if pc.IS_WINDOWS else name)
+    planted.write_text("")
+    if not pc.IS_WINDOWS:
+        planted.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    return planted
+
+
+def _pin_warnings(caplog):
+    """Only this module's records, so an unrelated warning cannot skew the count."""
+
+    return [r for r in caplog.records if r.name == "kiro_crew.platform_compat"]
+
+
+def test_a_tool_installed_outside_the_trusted_dirs_is_diagnosable(tmp_path, monkeypatch, caplog):
+    """A non-FHS host must learn the pin is why its tool reads as unavailable.
+
+    NixOS and Homebrew/conda prefixes keep a perfectly good ``lsof`` outside the
+    system directories. The pin still refuses it, but without this line the
+    operator sees only ``kirocrew stop`` no-opping and a prompt to install a
+    tool they already have.
+    """
+
+    monkeypatch.setattr(pc, "_UNPINNED_TOOL_PROBED", set())
+    planted = _plant_on_path(tmp_path, monkeypatch, "definitely-not-a-system-tool")
+
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.platform_compat"):
+        assert pc.trusted_system_bin("definitely-not-a-system-tool") is None
+
+    records = _pin_warnings(caplog)
+    assert len(records) == 1
+    message = records[0].getMessage()
+    # Case-insensitive: Windows resolution reports the PATHEXT entry's own
+    # casing (".EXE"), not the casing the file was created with.
+    assert str(planted).casefold() in message.casefold(), "must name where the tool actually is"
+    assert "unavailable" in message
+
+
+def test_the_unpinned_tool_diagnostic_does_not_repeat(tmp_path, monkeypatch, caplog):
+    """One line per name: these lookups run on every teardown and gate check."""
+
+    monkeypatch.setattr(pc, "_UNPINNED_TOOL_PROBED", set())
+    _plant_on_path(tmp_path, monkeypatch, "definitely-not-a-system-tool")
+
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.platform_compat"):
+        for _ in range(3):
+            assert pc.trusted_system_bin("definitely-not-a-system-tool") is None
+
+    assert len(_pin_warnings(caplog)) == 1
+
+
+def test_a_genuinely_absent_tool_is_not_reported_as_misplaced(tmp_path, monkeypatch, caplog):
+    """Nothing on PATH means nothing to explain, so the line must stay quiet.
+
+    Claiming a tool sits outside the trusted directories when it is simply not
+    installed would send the operator hunting for a path that does not exist.
+    """
+
+    monkeypatch.setattr(pc, "_UNPINNED_TOOL_PROBED", set())
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.platform_compat"):
+        assert pc.trusted_system_bin("definitely-not-a-system-tool") is None
+
+    assert _pin_warnings(caplog) == []
+
+
+def test_a_resolvable_tool_is_never_reported_as_sitting_outside_the_pin(monkeypatch):
+    """Nothing to explain when the pinned lookup succeeded."""
+
+    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: os.path.join("/usr/bin", name))
+    assert pc.tool_outside_trusted_dirs("lsof") is None
+
+
+def test_the_unpinned_path_is_reported_so_stop_can_name_it(tmp_path, monkeypatch):
+    """``stop`` needs the real location to tell a NixOS operator what happened."""
+
+    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: None)
+    planted = _plant_on_path(tmp_path, monkeypatch, "definitely-not-a-system-tool")
+
+    found = pc.tool_outside_trusted_dirs("definitely-not-a-system-tool")
+
+    assert found is not None
+    assert found.casefold() == str(planted).casefold()
+
+
+def test_an_absent_tool_reports_no_unpinned_path(tmp_path, monkeypatch):
+    """Absent everywhere must stay ``None``, or ``stop`` would claim a path that
+    does not exist instead of saying the tool is missing."""
+
+    monkeypatch.setattr(pc, "trusted_system_bin", lambda name: None)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    assert pc.tool_outside_trusted_dirs("definitely-not-a-system-tool") is None

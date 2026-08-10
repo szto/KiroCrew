@@ -1,8 +1,14 @@
 """Document text extraction for .docx, .pdf, and .pptx files.
 
-Uses only Python stdlib (zipfile + xml.etree.ElementTree) for .docx and
+Uses stdlib zipfile plus a hardened XML parser (defusedxml) for .docx and
 .pptx since these are ZIP archives containing XML.  PDF extraction uses
 a best-effort binary text scan (no third-party deps required).
+
+The XML comes from user-supplied uploads, so parsing goes through
+defusedxml rather than the stdlib xml.etree parser: the stdlib one resolves
+external entities, exposing an XXE (local-file disclosure / entity-expansion
+DoS) on a crafted document. defusedxml.fromstring is a drop-in that rejects
+DTDs and external entities.
 
 All functions accept a file path and return extracted text as a string.
 They never raise — on failure they return an empty string and log a warning.
@@ -12,10 +18,18 @@ from __future__ import annotations
 
 import logging
 import re
-import xml.etree.ElementTree as ETree
 import zipfile
 import zlib
 from pathlib import Path
+
+# Optional so a stale install (git pull without `pip install -e .`) degrades
+# to "docx/pptx parsing unavailable" instead of killing every CLI entry at
+# import time — this module sits on the gateway's import path. NEVER fall
+# back to stdlib xml.etree: it resolves external entities (XXE).
+try:
+    from defusedxml.ElementTree import fromstring as _xml_fromstring
+except ModuleNotFoundError:  # pragma: no cover — exercised via monkeypatch
+    _xml_fromstring = None  # type: ignore[assignment]
 
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
@@ -73,6 +87,13 @@ def extract_text(path: str, mimetype: str = "", filename: str = "") -> str:
         fmt = {".docx": "docx", ".pptx": "pptx", ".pdf": "pdf"}.get(ext, "")
     if not fmt:
         return ""
+    if fmt in ("docx", "pptx") and _xml_fromstring is None:
+        logger.warning(
+            "Cannot parse %s: defusedxml is not installed (checkout newer "
+            "than installed deps?). Fix: pip install -e .",
+            filename or path,
+        )
+        return ""
     try:
         if fmt == "docx":
             return _extract_docx(path)
@@ -127,6 +148,7 @@ def _extract_docx(path: str) -> str:
 
     Must only be called from extract_text() which enforces is_sensitive_path().
     """
+    assert _xml_fromstring is not None  # extract_text() gates the None case
     if is_sensitive_path(path):
         return ""
     paragraphs: list[str] = []
@@ -136,7 +158,7 @@ def _extract_docx(path: str) -> str:
         data = _read_zip_entry(zf, "word/document.xml")
         if data is None:
             return ""
-        root = ETree.fromstring(data)  # noqa: S314
+        root = _xml_fromstring(data)
         for para in root.iter(f"{_W_NS}p"):
             texts: list[str] = []
             for t_elem in para.iter(f"{_W_NS}t"):
@@ -158,6 +180,7 @@ def _extract_pptx(path: str) -> str:
 
     Must only be called from extract_text() which enforces is_sensitive_path().
     """
+    assert _xml_fromstring is not None  # extract_text() gates the None case
     if is_sensitive_path(path):
         return ""
     slides: list[tuple[int, str]] = []
@@ -171,7 +194,7 @@ def _extract_pptx(path: str) -> str:
             if data is None:
                 continue
             num = int(_SLIDE_RE.match(slide_name).group(1))  # type: ignore[union-attr]
-            root = ETree.fromstring(data)  # noqa: S314
+            root = _xml_fromstring(data)
             texts: list[str] = []
             for t_elem in root.iter(f"{_A_NS}t"):
                 if t_elem.text:
