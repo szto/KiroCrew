@@ -563,6 +563,123 @@ def test_provider_executable_strict_mode_rejects_untrusted_ancestor(
         source._validate_provider_executable(str(executable))
 
 
+def _stat_owned_by(path, uid: int):
+    """The path's real stat_result with only st_uid swapped, so mode bits and
+    the file/dir distinction the validator also reads stay truthful."""
+    fields = list(path.stat())
+    return source.os.stat_result([*fields[:4], uid, *fields[5:]])
+
+
+def test_system_owner_uid_reads_the_filesystem_root(monkeypatch) -> None:
+    """Pin the path, not the value. On a conventional host `/` is uid 0, so
+    comparing against a live stat would also accept a hardcoded 0 or a stat of
+    any other system directory that happens to share the owner."""
+    real_stat = source.os.stat
+    seen: list[str] = []
+
+    def fake_stat(path, *args, **kwargs):
+        seen.append(str(path))
+        result = real_stat(path, *args, **kwargs)
+        if str(path) != "/":
+            return result
+        fields = list(result)
+        return source.os.stat_result([*fields[:4], 4242, *fields[5:]])
+
+    monkeypatch.setattr(source.os, "stat", fake_stat)
+
+    assert source._system_owner_uid() == 4242
+    assert seen == ["/"]
+
+
+def test_provider_executable_accepts_the_uid_that_owns_the_filesystem_root(
+    monkeypatch, tmp_path
+) -> None:
+    """Root-squashed images own `/`, `/usr` and `/usr/local/bin` as an
+    unprivileged uid, and `_path_parents` walks through `/` — so accepting only
+    uid 0 or the gateway uid rejects every candidate and leaves the dashboard
+    telling the user to install a `gh` that is installed and authenticated."""
+    squashed_uid = 65534
+    parent = tmp_path / "provider-bin"
+    parent.mkdir()
+    executable = parent / "gh"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    executable_stat = _stat_owned_by(executable, squashed_uid)
+    parent_stat = _stat_owned_by(parent, squashed_uid)
+    real_stat = source.Path.stat
+
+    def fake_stat(path, *args, **kwargs):
+        if path == executable:
+            return executable_stat
+        if path == parent:
+            return parent_stat
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(source, "_agent_writable_roots", lambda: ())
+    monkeypatch.setattr(source, "_path_parents", lambda _path: [parent])
+    monkeypatch.setattr(source.Path, "stat", fake_stat)
+    monkeypatch.setattr(source, "_system_owner_uid", lambda: squashed_uid)
+
+    assert source._validate_provider_executable(str(executable)) == str(executable.resolve())
+
+
+def test_provider_executable_rejects_a_uid_that_does_not_own_the_filesystem_root(
+    monkeypatch, tmp_path
+) -> None:
+    """The system-root exemption is that ONE uid, not "any third account": a
+    binary owned by an unrelated local user is still untrusted provenance."""
+    parent = tmp_path / "provider-bin"
+    parent.mkdir()
+    executable = parent / "gh"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    executable_stat = _stat_owned_by(executable, 4242)
+    real_stat = source.Path.stat
+
+    def fake_stat(path, *args, **kwargs):
+        if path == executable:
+            return executable_stat
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(source, "_agent_writable_roots", lambda: ())
+    monkeypatch.setattr(source, "_path_parents", lambda _path: [parent])
+    monkeypatch.setattr(source.Path, "stat", fake_stat)
+    monkeypatch.setattr(source, "_system_owner_uid", lambda: 65534)
+
+    with pytest.raises(ValueError, match="owned by another user \\(uid 4242\\)"):
+        source._validate_provider_executable(str(executable))
+
+
+def test_provider_executable_strict_mode_ignores_the_system_root_exemption(
+    monkeypatch, tmp_path
+) -> None:
+    """Strict mode is the explicit "uid 0 only" opt-in for shared hosts, so a
+    squashed root does not relax it."""
+    parent = tmp_path / "provider-bin"
+    parent.mkdir()
+    executable = parent / "gh"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o500)
+    executable_stat = _stat_owned_by(executable, 65534)
+    real_stat = source.Path.stat
+
+    def fake_stat(path, *args, **kwargs):
+        if path == executable:
+            return executable_stat
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setenv("KIROCREW_PROVIDER_BIN_STRICT", "1")
+    monkeypatch.setattr(source, "_path_parents", lambda _path: [parent])
+    monkeypatch.setattr(source.Path, "stat", fake_stat)
+    monkeypatch.setattr(source, "_system_owner_uid", lambda: 65534)
+    monkeypatch.setattr(source.os, "access", lambda _path, mode: mode == source.os.X_OK)
+
+    with pytest.raises(ValueError, match="executable is not root-owned"):
+        source._validate_provider_executable(str(executable))
+
+
 def test_redact_provider_data_recurses_through_external_strings() -> None:
     secret = "ghp_" + "a" * 36
     query = "x" * 80
