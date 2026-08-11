@@ -205,6 +205,27 @@ def _strict_provider_bins() -> bool:
     return os.environ.get(_STRICT_PROVIDER_BIN_ENV, "").strip().lower() in _TRUTHY_ENV_VALUES
 
 
+def _system_owner_uid() -> int:
+    """The uid that owns ``/`` — the account this install treats as system root.
+
+    Container images mounted with root squash (and rootless/userns runtimes) own
+    ``/``, ``/usr`` and ``/usr/local/bin`` as an unprivileged uid — commonly
+    65534/nobody — rather than 0. Since ``_path_parents`` walks through the
+    filesystem root, a policy that accepts only uid 0 or the gateway uid is
+    UNSATISFIABLE on such a host: every candidate is rejected at ``/``, and the
+    dashboard reports "install gh" for a gh that is installed and authenticated.
+
+    Trusting this uid grants nothing it does not already hold: it owns every
+    system path the gateway executes from, including the Python interpreter, so
+    it can already substitute anything the provider CLI check protects. On a
+    conventional host ``/`` is uid 0 and the accepted set is unchanged.
+    """
+    try:
+        return os.stat("/").st_uid
+    except OSError:  # pragma: no cover - unreadable root
+        return 0
+
+
 def _agent_writable_roots() -> tuple[Path, ...]:
     """Trees the agent itself writes: the active project checkout and the LLM
     workspace root (worktrees, venvs, scratch files, downloaded repos).
@@ -245,8 +266,9 @@ def _check_provider_path_component(path: Path, *, label: str, uid: int, strict: 
             raise ValueError(f"{label} is writable by the gateway user")
         return
     # Relaxed policy: the gateway user's own installs are fine; a binary owned
-    # by a third account or writable by the whole host is not.
-    if path_stat.st_uid not in (0, uid):
+    # by a third account or writable by the whole host is not. The uid owning
+    # `/` counts as system root so root-squashed images stay satisfiable.
+    if path_stat.st_uid not in (0, uid, _system_owner_uid()):
         raise ValueError(f"{label} is owned by another user (uid {path_stat.st_uid})")
     if path_stat.st_mode & stat.S_IWOTH:
         # A world-writable DIRECTORY is tolerated when it is sticky (`/tmp`,
@@ -267,7 +289,9 @@ def _validate_provider_executable(candidate: str) -> str:
     into a ``sudo cp`` ritual for a CLI they had already installed and
     authenticated. What stays refused is provenance the user did not choose:
 
-    * a binary (or parent dir) owned by another unprivileged account,
+    * a binary (or parent dir) owned by another unprivileged account — except
+      the uid that owns ``/`` (see ``_system_owner_uid``), which is this
+      install's system root and already owns everything the gateway runs,
     * anything world-writable, e.g. a ``/tmp`` shim (a world-writable *directory*
       is tolerated only when sticky, where the owner check still decides),
     * anything inside the agent's project checkout or workspace root, the one
